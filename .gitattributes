@@ -1,0 +1,5 @@
+# Patches and shell scripts must keep LF: CRLF breaks "git apply" and
+# makes the kernel build choke on the shebang line.
+* text=auto eol=lf
+*.patch -text
+*.bin -text
