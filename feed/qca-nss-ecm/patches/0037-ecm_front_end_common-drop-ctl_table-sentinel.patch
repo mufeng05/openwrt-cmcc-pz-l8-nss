@@ -1,0 +1,22 @@
+ecm_front_end_common: drop the ctl_table sentinel
+
+Since kernel 6.11 sysctl tables are sized with ARRAY_SIZE and an empty
+terminating entry fails the registration check ("sysctl table check
+failed: net/ecm/(null) procname is null"), so the whole net/ecm table
+would silently fail to register.
+
+Rebased onto QSDK 14.0.r9 (win_qsdk.common.1.0.r42), which added the
+sixth_tuple_mode entry after the original patch context.
+
+Originally-by: Julius Bairaktaris <julius@bairaktaris.de>
+---
+--- a/frontends/ecm_front_end_common.c
++++ b/frontends/ecm_front_end_common.c
+@@ -1443,7 +1443,6 @@
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec,
+ 	},
+-	{}
+ };
+ 
+ /*

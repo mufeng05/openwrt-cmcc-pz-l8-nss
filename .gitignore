@@ -1,0 +1,4 @@
+*.pristine*
+*.orig
+*.rej
+*.bak

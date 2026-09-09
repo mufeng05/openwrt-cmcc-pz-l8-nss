@@ -1,0 +1,61 @@
+ath11k: shrink the data-path rings to fit a 256 MB board
+
+ath11k sizes its DP rings and buffer pools from compile-time constants in
+dp.h that are identical for every chip and tuned for IPQ8074/IPQ6018 class
+APs with 512 MB - 1 GB of RAM.  On the 256 MB IPQ5018 in cmcc,pz-l8 that
+costs about 79 MB, measured: MemAvailable drops from 87 MB to 7.7 MB the
+moment both radios finish QMI init, leaving nothing for the rest of the
+system and the board reboots under load.
+
+The cost is the buffer pools rather than the descriptors - every RXDMA ring
+entry is backed by a DP_RX_BUFFER_SIZE skb, so 4096 entries is roughly
+11 MB per radio, and IPQ5018 sets .rxdma1_enable = true so the monitor
+rings are allocated too.
+
+The vendor driver avoids this with a memory profile ath11k has no
+equivalent of: its ring sizes are runtime INI values, and
+lib/wifi/qcawificfg80211.sh picks them from the DT marker MP_256 / MP_512,
+writing dp_nss_comp_ring_size 0x2000 for a 256 MB board against 0x8000 for
+the unmarked default - and 0x8000 is exactly ath11k's hardcoded
+DP_TX_COMP_RING_SIZE.
+
+Values follow openwrt PR #21495 (kmod-ath11k-smallbuffers), which reported
+about 67 MB freed and was not merged because the maintainer does not want
+to carry 256 MB boards.  DP_RXDMA_MONITOR_DESC_RING_SIZE is added here: it
+is another 4096-entry monitor ring that the PR leaves alone.
+
+The monitor rings only serve radiotap capture, which an AP does not do.
+MON_STATUS still feeds rate and RSSI reporting so it is only halved, and
+DP_RXDMA_BUF_RING_SIZE, which bounds in-flight Rx, is the one to raise
+again if the measured headroom allows.
+
+--- a/drivers/net/wireless/ath/ath11k/dp.h
++++ b/drivers/net/wireless/ath/ath11k/dp.h
+@@ -206,7 +206,7 @@
+ #define DP_WBM_RELEASE_RING_SIZE	64
+ #define DP_TCL_DATA_RING_SIZE		512
+ #define DP_TCL_DATA_RING_SIZE_WCN6750	2048
+-#define DP_TX_COMP_RING_SIZE		32768
++#define DP_TX_COMP_RING_SIZE	2048
+ #define DP_TX_IDR_SIZE			DP_TX_COMP_RING_SIZE
+ #define DP_TCL_CMD_RING_SIZE		32
+ #define DP_TCL_STATUS_RING_SIZE		32
+@@ -217,13 +217,13 @@
+ #define DP_REO_EXCEPTION_RING_SIZE	128
+ #define DP_REO_CMD_RING_SIZE		256
+ #define DP_REO_STATUS_RING_SIZE		2048
+-#define DP_RXDMA_BUF_RING_SIZE		4096
++#define DP_RXDMA_BUF_RING_SIZE	1024
+ #define DP_RXDMA_REFILL_RING_SIZE	2048
+ #define DP_RXDMA_ERR_DST_RING_SIZE	1024
+-#define DP_RXDMA_MON_STATUS_RING_SIZE	1024
+-#define DP_RXDMA_MONITOR_BUF_RING_SIZE	4096
+-#define DP_RXDMA_MONITOR_DST_RING_SIZE	2048
+-#define DP_RXDMA_MONITOR_DESC_RING_SIZE	4096
++#define DP_RXDMA_MON_STATUS_RING_SIZE	512
++#define DP_RXDMA_MONITOR_BUF_RING_SIZE	128
++#define DP_RXDMA_MONITOR_DST_RING_SIZE	128
++#define DP_RXDMA_MONITOR_DESC_RING_SIZE	128
+ 
+ #define DP_RX_RELEASE_RING_NUM	3
+ 

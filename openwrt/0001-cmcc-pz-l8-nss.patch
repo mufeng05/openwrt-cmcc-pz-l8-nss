@@ -1,0 +1,489 @@
+diff --git a/package/base-files/files/bin/config_generate b/package/base-files/files/bin/config_generate
+index 18fae054d4..2f23b696b0 100755
+--- a/package/base-files/files/bin/config_generate
++++ b/package/base-files/files/bin/config_generate
+@@ -163,7 +163,7 @@ generate_network() {
+ 		static)
+ 			local ipad netm prefix
+ 			case "$1" in
+-				lan) ipad=${ipaddr:-"192.168.1.1"} ;;
++				lan) ipad=${ipaddr:-"192.168.10.1"} ;;
+ 				*) ipad=${ipaddr:-"192.168.$((addr_offset++)).1"} ;;
+ 			esac
+ 
+diff --git a/package/kernel/qca-ssdk/Makefile b/package/kernel/qca-ssdk/Makefile
+index a5588d5032..d64c8ffdcd 100644
+--- a/package/kernel/qca-ssdk/Makefile
++++ b/package/kernel/qca-ssdk/Makefile
+@@ -21,7 +21,7 @@ define KernelPackage/qca-ssdk
+   CATEGORY:=Kernel modules
+   SUBMENU:=Network Devices
+   TITLE:=Qualcom SSDK switch driver
+-  DEPENDS:=@(TARGET_qualcommax)
++  DEPENDS:=@(TARGET_qualcommax) +kmod-swconfig
+   FILES:=$(PKG_BUILD_DIR)/qca-ssdk.ko
+   AUTOLOAD:=$(call AutoLoad,30,qca-ssdk)
+ endef
+@@ -34,11 +34,48 @@ GCC_VERSION=$(shell echo "$(CONFIG_GCC_VERSION)" | sed 's/[^0-9.]*\([0-9.]*\).*/
+ 
+ LNX_CONFIG_OPTS = LNX_MAKEOPTS='$(KERNEL_MAKEOPTS)' PRJ_PATH=$(PKG_BUILD_DIR) MODULE_TYPE=KSLIB modules
+ 
++# OpenWrt backports upstream v6.16's two-argument .match_phy_device into
++# kernel 6.12, so LINUX_VERSION_CODE cannot tell the two prototypes apart.
++# Ask the kernel tree we are actually building against.  The grep pattern
++# must contain no parentheses: make counts them inside $(shell ...), and a
++# stray ')' closes the call early and leaks the rest into EXTRA_CFLAGS.
++SSDK_MATCH_PHY_DRV := $(shell grep -q 'match_phy_device.*phydev,' \
++	$(LINUX_DIR)/include/linux/phy.h 2>/dev/null && echo -DSSDK_MATCH_PHY_DEVICE_HAS_DRV)
++
+ EXTRA_CFLAGS:= \
+ 	-fno-stack-protector \
+ 	-Wno-missing-prototypes \
+ 	-Wno-missing-declarations \
+-	-I$(STAGING_DIR)/usr/include
++	-I$(STAGING_DIR)/usr/include \
++	$(SSDK_MATCH_PHY_DRV)
++
++# Per-subtarget SSDK feature selection.
++#
++# Upstream hard-disables every chip/PHY driver on the make command line,
++# which overrides ssdk's own ./config (a command-line variable always wins).
++# On ipq50xx that leaves qca-ssdk.ko with zero ISISC symbols, so it cannot
++# drive an external QCA8337 at all - boards like cmcc,pz-l8 were forced onto
++# the mainline qca8k DSA driver, whose 2-byte tag the NSS firmware cannot
++# parse.  Re-enable what ssdk's own config would have selected for MP:
++#   ISISC_ENABLE     - AR8327/AR8337 (QCA8337) chip driver
++#   SWCONFIG_FEATURE - swconfig/UCI front end (config switch / switch_vlan)
++#
++# The PHY drivers stay at their upstream FALSE: this board only needs ssdk
++# for the *external* QCA8337, and enabling IN_MP_PHY / IN_QCA803X_PHY /
++# IN_QCA808X_PHY makes ssdk register phylib drivers that compete with the
++# mainline IPQ5018 GE PHY and qca83xx drivers for the same phy_devices.
++# (IN_MP_PHY also implies IN_QCA808X_PHY, because src/hsl/phy/mpge_phy.c
++# and mpge_led.c call qca808x_phy_* directly - see the qca808x patch.)
++SSDK_SWCONFIG = disable
++SSDK_ISISC = disable
++SSDK_MP_PHY = FALSE
++SSDK_QCA803X_PHY = FALSE
++SSDK_QCA808X_PHY = FALSE
++
++ifeq ($(CONFIG_TARGET_SUBTARGET), "ipq50xx")
++  SSDK_SWCONFIG = enable
++  SSDK_ISISC = enable
++endif
+ 
+ MAKE_FLAGS+= \
+ 	TARGET_NAME=$(CONFIG_TARGET_NAME) \
+@@ -52,10 +89,10 @@ MAKE_FLAGS+= \
+ 	EXTRA_CFLAGS="$(EXTRA_CFLAGS)" \
+ 	SoC=$(CONFIG_TARGET_SUBTARGET) \
+ 	SHELL="$(BASH)" \
+-	PTP_FEATURE=disable SWCONFIG_FEATURE=disable \
+-	ISISC_ENABLE=disable MHT_ENABLE=disable \
+-	IN_QCA803X_PHY=FALSE IN_QCA808X_PHY=FALSE \
+-	IN_MALIBU_PHY=FALSE IN_MP_PHY=FALSE \
++	PTP_FEATURE=disable SWCONFIG_FEATURE=$(SSDK_SWCONFIG) \
++	ISISC_ENABLE=$(SSDK_ISISC) MHT_ENABLE=disable \
++	IN_QCA803X_PHY=$(SSDK_QCA803X_PHY) IN_QCA808X_PHY=$(SSDK_QCA808X_PHY) \
++	IN_MALIBU_PHY=FALSE IN_MP_PHY=$(SSDK_MP_PHY) \
+ 	$(LNX_CONFIG_OPTS)
+ 
+ ifeq ($(CONFIG_TARGET_SUBTARGET), "ipq807x")
+diff --git a/target/linux/generic/files/drivers/net/phy/swconfig_leds.c b/target/linux/generic/files/drivers/net/phy/swconfig_leds.c
+index 1fcd4432b5..9221f8cfeb 100644
+--- a/target/linux/generic/files/drivers/net/phy/swconfig_leds.c
++++ b/target/linux/generic/files/drivers/net/phy/swconfig_leds.c
+@@ -478,6 +478,15 @@ swconfig_led_work_func(struct work_struct *work)
+ 					sw_trig->link_speed[i] =
+ 						SWCONFIG_LED_PORT_SPEED_1000;
+ 					break;
++				default:
++					/*
++					 * 2500/5000/10000 and anything added
++					 * later: this trigger only has a
++					 * "gigabit or faster" bucket.
++					 */
++					sw_trig->link_speed[i] =
++						SWCONFIG_LED_PORT_SPEED_1000;
++					break;
+ 				}
+ 			}
+ 		}
+diff --git a/target/linux/generic/files/include/linux/switch.h b/target/linux/generic/files/include/linux/switch.h
+index 4e6238470d..e0d7fb636d 100644
+--- a/target/linux/generic/files/include/linux/switch.h
++++ b/target/linux/generic/files/include/linux/switch.h
+@@ -45,6 +45,10 @@ enum switch_port_speed {
+ 	SWITCH_PORT_SPEED_10 = 10,
+ 	SWITCH_PORT_SPEED_100 = 100,
+ 	SWITCH_PORT_SPEED_1000 = 1000,
++	/* multi-gig speeds, as used by QSDK/qca-ssdk */
++	SWITCH_PORT_SPEED_2500 = 2500,
++	SWITCH_PORT_SPEED_5000 = 5000,
++	SWITCH_PORT_SPEED_10000 = 10000,
+ };
+ 
+ struct switch_port_link {
+@@ -146,6 +150,16 @@ struct switch_portmap {
+ 	const char *s;
+ };
+ 
++/*
++ * Linked list of name/value option pairs handed to a SWITCH_TYPE_EXT
++ * attribute.  Used by qca-ssdk's "switch_ext" attribute.
++ */
++struct switch_ext {
++	struct switch_ext *next;
++	const char *option_name;
++	const char *option_value;
++};
++
+ struct switch_val {
+ 	const struct switch_attr *attr;
+ 	unsigned int port_vlan;
+@@ -155,6 +169,7 @@ struct switch_val {
+ 		u32 i;
+ 		struct switch_port *ports;
+ 		struct switch_port_link *link;
++		struct switch_ext *ext_val;
+ 	} value;
+ };
+ 
+diff --git a/target/linux/generic/files/include/uapi/linux/switch.h b/target/linux/generic/files/include/uapi/linux/switch.h
+index ea449653fa..3ab2c52fb2 100644
+--- a/target/linux/generic/files/include/uapi/linux/switch.h
++++ b/target/linux/generic/files/include/uapi/linux/switch.h
+@@ -89,6 +89,8 @@ enum switch_val_type {
+ 	SWITCH_TYPE_PORTS,
+ 	SWITCH_TYPE_LINK,
+ 	SWITCH_TYPE_NOVAL,
++	/* QSDK/qca-ssdk extended attribute (switch_val.value.ext_val) */
++	SWITCH_TYPE_EXT,
+ };
+ 
+ /* port nested attributes */
+diff --git a/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq5018-pz-l8.dts b/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq5018-pz-l8.dts
+index a90c6ca8b0..0bf012478b 100644
+--- a/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq5018-pz-l8.dts
++++ b/target/linux/qualcommax/files/arch/arm64/boot/dts/qcom/ipq5018-pz-l8.dts
+@@ -5,6 +5,7 @@
+ #include "ipq5018.dtsi"
+ #include "ipq5018-ess.dtsi"
+ #include "ipq5018-qcn6122.dtsi"
++#include "ipq5018-nss.dtsi"
+ 
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/input/input.h>
+@@ -141,6 +142,16 @@
+ 
+ 	switch_mac_mode = <MAC_MODE_SGMII_CHANNEL0>;
+ 
++	/*
++	 * SerDes common-block reference clock.  ssdk_gcc_clock_init() reads
++	 * this string from the node literally named "ess-switch" and falls
++	 * back to INTERNAL_48MHZ when it is absent - which leaves the uniphy
++	 * SerDes running at the wrong reference, so the port6 <-> uniphy SGMII
++	 * segment never links even though both ends report a forced link up.
++	 * The vendor DT specifies internal_96MHz for this board.
++	 */
++	cmnblk_clk = "internal_96MHz";
++
+ 	qcom,port_phyinfo {
+ 		// MAC0 -> GE Phy --- MDI --- QCA8337 Phy4(Port5)
+ 		port@0 {
+@@ -149,16 +160,95 @@
+ 			phy_address = <7>;
+ 		};
+ 
+-		// MAC1 -> Uniphy --- SGMII --- QCA8337 SerDes(Port6)
++		/*
++		 * MAC1 -> Uniphy --- SGMII --- QCA8337 SerDes(Port6)
++		 *
++		 * Deliberately no mdiobus here, matching the vendor DT.  With
++		 * one, ssdk associates MAC1 with that bus and probes it for a
++		 * PHY - it finds the QCA8337's internal PHY at address 0,
++		 * misreads the ID and configures the port as PHY-attached
++		 * (visible as "uniphy will output clock as 25000000Hz")
++		 * instead of the forced fixed link this SGMII segment is.
++		 */
+ 		port@1 {
+ 			port_id = <2>;
+-			mdiobus = <&mdio1>;
+ 			forced-speed = <1000>;
+ 			forced-duplex = <1>;
+ 		};
+ 	};
+ };
+ 
++/*
++ * The external QCA8337 is driven by qca-ssdk as a second ESS device
++ * (device_id 1, which registers as swconfig "switch1"), the same way the
++ * vendor/NSS stack does it.
++ *
++ * It is deliberately NOT described as a mainline DSA switch: DSA inserts a
++ * 2-byte QCA tag at offset 12 of every frame on the CPU link.  The NSS
++ * firmware then reads 0x80xx as the ethertype, fails to parse L3 and
++ * exceptions 100% of the traffic to the host CPU (eth_rx_unknown_l3_protocol),
++ * and ECM cannot build an interface hierarchy over DSA user ports.  DSA also
++ * binds a single conduit, which left GMAC0/eth0 unused and forced LAN+WAN
++ * through eth1 alone - that is the "WAN cannot work if added" note that used
++ * to sit on port@5 here.
++ *
++ * With ssdk both CPU links stay plain untagged Ethernet, one per GMAC:
++ *   port5 --MDI---- IPQ5018 GE Phy -- GMAC0 -> eth0 -> br-lan   (VLAN 1)
++ *   port6 --SGMII-- uniphy          -- GMAC1 -> eth1 -> wan     (VLAN 2)
++ */
++&ess_instance {
++	num_devices = <2>;
++
++	ess_switch1: ess-switch1@1 {
++		device_id = <1>;
++		compatible = "qcom,ess-switch-qca83xx";
++		switch_access_mode = "mdio";
++		mdio-bus = <&mdio1>;
++
++		switch_cpu_bmp = <0x40>;	/* port 6                */
++		switch_lan_bmp = <0x0e>;	/* ports 1, 2, 3         */
++		switch_wan_bmp = <0x30>;	/* ports 4, 5            */
++
++		/* register/value pairs written verbatim at switch init */
++		qca,ar8327-initvals = <
++			0x04 0x07600000		/* PORT0_PAD_MODE  */
++			0x08 0x01000000		/* PORT5_PAD_MODE  */
++			0x0c 0x00000080		/* PORT6_PAD_MODE  */
++			0x10 0x002613a0		/* POWER_ON_STRAP  */
++			0xe4 0x000aa545		/* MAC_POWER_SEL   */
++			0xe0 0xc74164de		/* SGMII_CTRL      */
++			0x7c 0x0000004e		/* PORT0_STATUS: 1000M/full/rx+tx */
++			0x94 0x0000004e		/* PORT6_STATUS: 1000M/full/rx+tx */
++		>;
++
++		qcom,port_phyinfo {
++			// QCA8337 Port1 <- Phy0 -> LAN3
++			port@0 {
++				port_id = <1>;
++				phy_address = <0>;
++			};
++
++			// QCA8337 Port2 <- Phy1 -> LAN2
++			port@1 {
++				port_id = <2>;
++				phy_address = <1>;
++			};
++
++			// QCA8337 Port3 <- Phy2 -> LAN1
++			port@2 {
++				port_id = <3>;
++				phy_address = <2>;
++			};
++
++			// QCA8337 Port4 <- Phy3 -> WAN
++			port@3 {
++				port_id = <4>;
++				phy_address = <3>;
++			};
++		};
++	};
++};
++
+ // MAC0 -> GE Phy
+ &dp1 {
+ 	status = "okay";
+@@ -220,65 +310,6 @@
+ 	qca8337_4: ethernet-phy@4 {
+ 		reg = <4>;
+ 	};
+-
+-	// QCA8337 switch
+-	switch1: ethernet-switch@17 {
+-		compatible = "qca,qca8337";
+-		reg = <17>;
+-		#address-cells = <1>;
+-		#size-cells = <0>;
+-
+-		ports {
+-			#address-cells = <1>;
+-			#size-cells = <0>;
+-
+-			port@1 {
+-				reg = <1>;
+-				label = "lan3";
+-				phy-handle = <&qca8337_0>;
+-			};
+-
+-			port@2 {
+-				reg = <2>;
+-				label = "lan2";
+-				phy-handle = <&qca8337_1>;
+-			};
+-
+-			port@3 {
+-				reg = <3>;
+-				label = "lan1";
+-				phy-handle = <&qca8337_2>;
+-			};
+-
+-			port@4 {
+-				reg = <4>;
+-				label = "wan";
+-				phy-handle = <&qca8337_3>;
+-			};
+-
+-			/*
+-			 * WAN cannot work if added
+-			 * port@5 {
+-			 * 	reg = <5>;
+-			 * 	phy-handle = <&qca8337_4>;
+-			 * 	phy-mode = "gmii";
+-			 * 	ethernet = <&dp1>;
+-			 * };
+-			 */
+-
+-			port@6 {
+-				reg = <6>;
+-				phy-mode = "sgmii";
+-				ethernet = <&dp2>;
+-				qca,sgmii-enable-pll;
+-
+-				fixed-link {
+-					speed = <1000>;
+-					full-duplex;
+-				};
+-			};
+-		};
+-	};
+ };
+ 
+ &tlmm {
+@@ -354,24 +385,27 @@
+ };
+ 
+ /*
+- * ath11k Wi-Fi consumes too large memory spaces and too few spaces are
+- * available for users. To prevent OOM when using LuCI or other softwares,
+- * disable Wi-Fi related peripherals at the moment.
++ * Upstream disables the radios here with the note that ath11k's memory use
++ * risks OOM on this 168 MB board. Re-enabled for this build: measured free
++ * memory with LuCI + the full NSS stack loaded is ~100 MB, and both radios
++ * already carry qcom,ath11k-fw-memory-mode = <1> (the low-memory profile).
++ * If OOM shows up in practice, flip these three back to "disabled".
+  */
+ &q6v5_wcss {
+-	status = "disabled";
++	status = "okay";
+ };
+ 
+ &wifi {
+ 	// IPQ5018
+ 	qcom,rproc = <&q6_wcss_pd1>;
++	qcom,userpd-subsys-name = "q6v5_wcss_userpd1";
+ 	qcom,ath11k-calibration-variant = "CMCC-PZ-L8";
+ 	qcom,ath11k-fw-memory-mode = <1>;
+ 	qcom,bdf-addr = <0x4c400000>;
+ 
+ 	ieee80211-freq-limit = <2400000 2483000>;
+ 
+-	status = "disabled";
++	status = "okay";
+ };
+ 
+ &wifi1 {
+@@ -385,5 +419,5 @@
+ 
+ 	ieee80211-freq-limit = <5150000 5730000>;
+ 
+-	status = "disabled";
++	status = "okay";
+ };
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds
+index 874e96d489..7b8fd6c6a4 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds
++++ b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/01_leds
+@@ -9,7 +9,13 @@ board_config_update
+ board=$(board_name)
+ 
+ case "$board" in
+-cmcc,pz-l8|\
++cmcc,pz-l8)
++	# The external QCA8337 is driven by qca-ssdk/swconfig, not DSA, so there is
++	# no netdev called "wan" to bind the trigger to: WAN traffic runs over GMAC1
++	# (eth1, switch port 6).  Naming a DSA-style port here leaves device_name
++	# empty and the LED dark.  Only link_1000 exists on this port.
++	ucidef_set_led_netdev "wan" "WAN" "green:wan" "eth1" "tx rx link_1000"
++	;;
+ elecom,wrc-x3000gs2|\
+ iodata,wn-dax3000gr)
+ 	ucidef_set_led_netdev "wan" "WAN" "green:wan" "wan" "tx rx link_10 link_100 link_1000"
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
+index 09a68d7c1e..76dfdd56ef 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
++++ b/target/linux/qualcommax/ipq50xx/base-files/etc/board.d/02_network
+@@ -16,7 +16,16 @@ ipq50xx_setup_interfaces()
+ 	glinet,gl-b3000)
+ 		ucidef_set_interfaces_lan_wan "lan1 lan2" "wan"
+ 		;;
+-	cmcc,pz-l8|\
++	cmcc,pz-l8)
++		# External QCA8337 driven by qca-ssdk/swconfig (device_id 1).
++		# Two *untagged* CPU links, one per GMAC, so that the NSS
++		# firmware sees plain Ethernet frames and can offload:
++		#   vlan 1: switch ports 1 2 3 + 5 -> eth0 -> br-lan
++		#   vlan 2: switch ports 4     + 6 -> eth1 -> wan
++		ucidef_add_switch "switch1" \
++			"5u@eth0" "1:lan:3" "2:lan:2" "3:lan:1" \
++			"6u@eth1" "4:wan"
++		;;
+ 	linksys,mx2000|\
+ 	linksys,mx5500|\
+ 	linksys,spnmx56|\
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/etc/hotplug.d/firmware/11-ath11k-caldata b/target/linux/qualcommax/ipq50xx/base-files/etc/hotplug.d/firmware/11-ath11k-caldata
+index d4a913b9cc..f05084335d 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/etc/hotplug.d/firmware/11-ath11k-caldata
++++ b/target/linux/qualcommax/ipq50xx/base-files/etc/hotplug.d/firmware/11-ath11k-caldata
+@@ -9,6 +9,12 @@ board=$(board_name)
+ case "$FIRMWARE" in
+ "ath11k/IPQ5018/hw1.0/cal-ahb-c000000.wifi.bin")
+ 	case "$board" in
++	cmcc,pz-l8)
++		caldata_extract "0:art" 0x1000 0x20000
++		ath11k_patch_mac $(mtd_get_mac_binary 0:art 0xc) 0
++		ath11k_remove_regdomain
++		ath11k_set_macflag
++		;;
+ 	elecom,wrc-x3000gs2|\
+ 	iodata,wn-dax3000gr|\
+ 	zyxel,scr50axe)
+@@ -54,6 +60,12 @@ case "$FIRMWARE" in
+ 	;;
+ "ath11k/QCN6122/hw1.0/cal-ahb-b00a040.wifi.bin")
+ 	case "$board" in
++	cmcc,pz-l8)
++		caldata_extract "0:art" 0x26800 0x20000
++		ath11k_patch_mac $(mtd_get_mac_binary 0:art 0x12) 0
++		ath11k_remove_regdomain
++		ath11k_set_macflag
++		;;
+ 	elecom,wrc-x3000gs2|\
+ 	iodata,wn-dax3000gr|\
+ 	zyxel,scr50axe)
+diff --git a/target/linux/qualcommax/ipq50xx/base-files/lib/upgrade/platform.sh b/target/linux/qualcommax/ipq50xx/base-files/lib/upgrade/platform.sh
+index c6e8d0fb0d..7f00567659 100644
+--- a/target/linux/qualcommax/ipq50xx/base-files/lib/upgrade/platform.sh
++++ b/target/linux/qualcommax/ipq50xx/base-files/lib/upgrade/platform.sh
+@@ -188,7 +188,15 @@ platform_do_upgrade() {
+ 		[ -z "$delay" ] || [ "$delay" -eq "0" ] && \
+ 			fw_setenv bootdelay 3
+ 
+-		elecom_upgrade_prepare
++		# PZ-L8 has a single rootfs partition. elecom_upgrade_prepare()
++		# expects an A/B pair (rootfs + rootfs_1); on this board
++		# smempart_next_root() fails and nand_do_upgrade_failed() aborts
++		# the flash, so sysupgrade silently reboots without writing.
++		if [ "$(board_name)" = "cmcc,pz-l8" ]; then
++			CI_UBIPART="rootfs"
++		else
++			elecom_upgrade_prepare
++		fi
+ 
+ 		remove_oem_ubi_volume bt_fw
+ 		remove_oem_ubi_volume ubi_rootfs

@@ -1,0 +1,40 @@
+qca-ssdk: match the kernel's .match_phy_device prototype
+
+cmcc,pz-l8 needs IN_MP_PHY=TRUE for the IPQ5018 internal GE PHY, and
+src/hsl/phy/mpge_phy.c / mpge_led.c call qca808x_phy_set_wol_status(),
+qca808x_phy_get_eee_cap() and qca808x_phy_led_ctrl_source_set() directly.
+IN_MP_PHY therefore implies IN_QCA808X_PHY (ssdk's own config sets both for
+CHIP_TYPE=MP), which builds src/hsl/phy/qca808x.c - and that still uses the
+single-argument .match_phy_device prototype.
+
+Upstream changed the op to take the candidate phy_driver in v6.16, and
+OpenWrt backports it into 6.12 (generic/backport-6.12/782-01-v6.16-net-phy-
+pass-PHY-driver-to-.match_phy_device-OP.patch), so LINUX_VERSION_CODE cannot
+distinguish the two.  The package Makefile greps include/linux/phy.h and
+defines SSDK_MATCH_PHY_DEVICE_HAS_DRV accordingly.
+
+The body is unchanged: it only looks at phydev->phy_id and phydev->drv,
+whose meaning during matching is the same under both prototypes.
+
+--- a/src/hsl/phy/qca808x.c
++++ b/src/hsl/phy/qca808x.c
+@@ -600,7 +600,19 @@
+ 	return err;
+ }
+ 
++/*
++ * OpenWrt backports upstream v6.16's two-argument .match_phy_device into
++ * kernel 6.12 (generic/backport-6.12/782-01-v6.16-net-phy-pass-PHY-driver-
++ * to-.match_phy_device-OP.patch), so LINUX_VERSION_CODE cannot tell the two
++ * prototypes apart.  The package Makefile greps include/linux/phy.h and
++ * defines SSDK_MATCH_PHY_DEVICE_HAS_DRV when the tree has the new form.
++ */
++#ifdef SSDK_MATCH_PHY_DEVICE_HAS_DRV
++int qca808x_match_phy_device(struct phy_device *phydev,
++			     const struct phy_driver *phydrv)
++#else
+ int qca808x_match_phy_device(struct phy_device *phydev)
++#endif
+ {
+ 	a_uint32_t phy_id = 0;
+ 

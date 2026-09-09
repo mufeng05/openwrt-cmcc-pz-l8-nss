@@ -1,0 +1,31 @@
+From: pzl8-nss project
+Subject: [PATCH] nss_core: make file-local helpers static
+
+nss_core_handle_nss_status_pkt() and nss_skb_reuse() are only referenced
+from nss_core.c and are not exported, but were defined with external
+linkage and no prototype. OpenWrt builds the kernel with
+-Wmissing-prototypes (scripts/Makefile.extrawarn) escalated to an error,
+so this breaks the build on 6.12. Give both functions internal linkage.
+
+Signed-off-by: pzl8-nss
+---
+--- a/nss_core.c
++++ b/nss_core.c
+@@ -401,7 +401,7 @@
+  * nss_core_handle_nss_status_pkt()
+  *	Handle the metadata/status packet.
+  */
+-void nss_core_handle_nss_status_pkt(struct nss_ctx_instance *nss_ctx, struct sk_buff *nbuf)
++static void nss_core_handle_nss_status_pkt(struct nss_ctx_instance *nss_ctx, struct sk_buff *nbuf)
+ {
+ 	struct nss_cmn_msg *ncm;
+ 	uint32_t expected_version = NSS_HLOS_MESSAGE_VERSION;
+@@ -2850,7 +2850,7 @@
+  * NOTE: This function does any necessary reference count dropping, and
+  * cleans up the skbuff as if its allocated fresh.
+  */
+-void nss_skb_reuse(struct sk_buff *nbuf)
++static void nss_skb_reuse(struct sk_buff *nbuf)
+ {
+ 	struct skb_shared_info *shinfo;
+ 

@@ -1,0 +1,94 @@
+#!/bin/sh /etc/rc.common
+# Bring up the NSS offload stack at boot.
+#
+# START=99 puts this after S95done, so the overlay is already committed as
+# healthy before anything here runs: a hang cannot cost the rootfs_data volume.
+#
+# The load order matters and is the one verified on hardware:
+#   1. qca-nss-drv        - boots the UBI32 core; nss-dp's data plane override
+#                           closes and reopens eth0/eth1 through NSS
+#   2. the N2H buffer tuning, which needs the core already up (the sysctl
+#      handlers send a synchronous message and return -EINVAL on timeout)
+#   3. the ECM stack, with qca-mcs strictly before ecm
+#
+# Self-disarm: boot() arms /etc/nss-boot-pending before loading and a delayed
+# check clears it once eth0 has carrier again.  A boot that hangs, or that
+# leaves the LAN dead, never clears it - so the next boot sees the flag still
+# armed, writes /etc/nss-disabled and skips the load.  One bad boot disarms
+# the feature without needing a working uplink to notice.  Re-arm with
+#   rm /etc/nss-disabled && reboot
+START=99
+STOP=10
+
+FLAG=/etc/nss-boot-pending
+DISABLED=/etc/nss-disabled
+PBUF_EXTRA=800000        # vendor MP_256 value; 256 MB board
+PBUF_HIGH_WATER=16336    # (high_water - 11720 NSS+OCM buffers) * 160 B/pbuf
+
+nss_log() { logger -t nss-offload "$@"; }
+
+nss_load() {
+	lsmod | grep -q '^qca_nss_drv' && return 0
+
+	insmod qca-nss-drv || { nss_log "insmod qca-nss-drv failed"; return 1; }
+
+	# The core answers messages only once it has finished booting; the pbuf
+	# sysctls below are synchronous and fail with -EINVAL if it has not.
+	local i=0
+	while [ $i -lt 30 ]; do
+		[ -d /sys/kernel/debug/qca-nss-drv/stats ] && break
+		i=$((i + 1)); sleep 1
+	done
+	sleep 8
+
+	echo $PBUF_EXTRA > /proc/sys/dev/nss/n2hcfg/extra_pbuf_core0 2>/dev/null
+	echo $PBUF_HIGH_WATER > /proc/sys/dev/nss/n2hcfg/n2h_high_water_core0 2>/dev/null
+	nss_log "pbuf: extra=$(cat /proc/sys/dev/nss/n2hcfg/extra_pbuf_core0 2>/dev/null) high_water=$(cat /proc/sys/dev/nss/n2hcfg/n2h_high_water_core0 2>/dev/null)"
+
+	# qca-mcs must be in place before ecm: ecm's multicast front end binds to
+	# it at init and silently loses multicast acceleration otherwise.
+	for m in qca-mcs qca-nss-pppoe qca-nss-vlan qca-nss-qdisc ecm; do
+		insmod $m 2>/dev/null || nss_log "insmod $m failed (continuing)"
+	done
+
+	nss_log "loaded: $(lsmod | awk 'NR>1{print $1}' | grep -cE 'nss|ecm|mcs') modules"
+	return 0
+}
+
+nss_confirm() {
+	# Runs detached.  eth0 carrying again is the thing that actually broke
+	# when the data plane handover failed, and unlike an uplink ping it does
+	# not depend on anything outside the box.
+	( sleep 25
+	  if [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "1" ]; then
+		rm -f "$FLAG"; sync
+		nss_log "confirmed: eth0 has carrier, offload kept"
+	  else
+		nss_log "eth0 has no carrier after loading NSS - leaving the flag armed, next boot will disarm"
+	  fi ) &
+}
+
+boot() {
+	if [ -f "$DISABLED" ]; then
+		nss_log "disabled (/etc/nss-disabled); rm it and reboot to re-arm"
+		return 0
+	fi
+
+	if [ -f "$FLAG" ]; then
+		touch "$DISABLED"; rm -f "$FLAG"; sync
+		nss_log "the previous boot loaded NSS and never confirmed it - disabling"
+		return 0
+	fi
+
+	touch "$FLAG"; sync
+	nss_load && nss_confirm
+}
+
+start() {
+	# Manual start: no arming, no self-disarm - the operator is watching.
+	nss_load
+}
+
+stop() {
+	rm -f "$FLAG"; sync
+}

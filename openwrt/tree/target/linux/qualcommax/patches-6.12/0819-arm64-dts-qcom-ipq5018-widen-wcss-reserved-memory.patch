@@ -1,0 +1,35 @@
+From: pzl8-nss project
+Subject: [PATCH] arm64: dts: qcom: ipq5018: widen the Q6/WCSS reserved region
+
+ath11k hands the firmware raw physical addresses for the board data and the
+m3 dump (qcom,bdf-addr / qcom,m3-dump-addr). On PZ-L8 those are 0x4c400000
+for the built-in radio and 0x4d100000 / 0x4df00000 for the QCN6122, but
+wcss@4b000000 only spans 0x4b000000-0x4cb00000, so the QCN6122 addresses are
+outside any reserved region and the built-in radio gets 7 MiB where the
+firmware wants 13 MiB. Both radios then fail BDF download with -ENOMEM:
+
+    ath11k c000000.wifi: failed to load board data file: -12
+    ath11k b00a040.wifi: failed to load board data file: -12
+
+The vendor firmware for this exact board (nwrt, kernel 5.4) reserves
+0x4b000000-0x4f100000 as q6_mem_regions, with q6_ipq5018_data at 0x4c400000
+(13 MiB), m3_dump at 0x4d100000 and the QCN6122 data regions above that.
+Match that span so both radios have their windows.
+
+Costs ~38 MiB of system RAM, which is why upstream disabled the radios here
+instead; 0818 gives 8 MiB of that back by trimming the NSS region to the size
+the vendor firmware actually uses.
+
+Signed-off-by: pzl8-nss
+---
+--- a/arch/arm64/boot/dts/qcom/ipq5018.dtsi
++++ b/arch/arm64/boot/dts/qcom/ipq5018.dtsi
+@@ -161,7 +161,7 @@
+ 		};
+ 
+ 		q6_region: wcss@4b000000 {
+-			reg = <0x0 0x4b000000 0x0 0x1b00000>;
++			reg = <0x0 0x4b000000 0x0 0x4100000>;
+ 			no-map;
+ 		};
+ 	};

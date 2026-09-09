@@ -1,0 +1,58 @@
+qca-ssdk: re-apply the uniphy forced speed after the port reset
+
+adpt_mp_uniphy_mode_configure() sets ch0_force_speed in
+UNIPHY_CHANNEL0_INPUT_OUTPUT_4 via adpt_mp_uniphy_mode_ctrl_set(), and
+then calls adpt_mp_gcc_uniphy_port_reset() which power-cycles the uniphy
+port.  That returns the register to its 0x844 reset default, clearing the
+bit that was just set - confirmed by reading it back on cmcc,pz-l8, where
+it holds exactly 0x844 with ch0_force_speed = 0 after a full init.
+
+It only matters when the SGMII peer is forced too.  Here the peer is a
+QCA8337 whose port 6 qca,ar8327-initvals forces to 1000/full, so it sends
+no SGMII auto-negotiation code words while the uniphy waits for one:
+both ends report a link up and no frame ever crosses the segment.  The
+switch-side registers all read back exactly as programmed, and the
+port 6 MAC counters increment on transmit, so the break is purely the
+SerDes never completing.
+
+Re-apply the setting once the port reset, calibration and clock enable
+are all done.
+
+--- a/src/adpt/mp/adpt_mp_uniphy.c
++++ b/src/adpt/mp/adpt_mp_uniphy.c
+@@ -381,6 +381,35 @@
+ 		ssdk_mp_raw_clock_set(index + 1, UNIPHY_TX, clock);
+ 	}
+ 
++	/*
++	 * Re-apply the forced-speed selection.
++	 *
++	 * adpt_mp_uniphy_mode_ctrl_set() above sets ch0_force_speed in
++	 * UNIPHY_CHANNEL0_INPUT_OUTPUT_4, but adpt_mp_gcc_uniphy_port_reset()
++	 * right after it power-cycles the uniphy port, which returns that
++	 * register to its 0x844 reset default and clears the bit again.
++	 *
++	 * When the SGMII peer is itself forced, nothing then brings the link up:
++	 * on cmcc,pz-l8 the peer is a QCA8337 whose port 6 is forced to
++	 * 1000/full by qca,ar8327-initvals, so it never sends SGMII
++	 * auto-negotiation code words, while the uniphy is left waiting for an
++	 * auto-negotiation that never arrives.  Both ends report a link and not
++	 * one frame is exchanged.
++	 */
++	if (hsl_port_feature_get(dev_id, SSDK_PHYSICAL_PORT2, PHY_F_FORCE)) {
++		union uniphy_channel0_input_output_4_u force_ctrl;
++
++		memset(&force_ctrl, 0, sizeof(force_ctrl));
++		rv = hppe_uniphy_channel0_input_output_4_get(dev_id, index,
++			&force_ctrl);
++		SW_RTN_ON_ERROR (rv);
++		force_ctrl.bf.newaddedfromhere_ch0_force_speed_25m =
++			UNIPHY_FORCE_SPEED_ENABLE;
++		rv = hppe_uniphy_channel0_input_output_4_set(dev_id, index,
++			&force_ctrl);
++		SW_RTN_ON_ERROR (rv);
++	}
++
+ 	if (mode == PORT_WRAPPER_SGMII_CHANNEL0) {
+ 		SSDK_DEBUG("mp uniphy %d sgmii configuration is done!\n", index);
+ 	} else {

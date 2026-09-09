@@ -1,0 +1,173 @@
+qca-ssdk: reach an MDIO-attached switch without QSDK's mdio driver hook
+
+qca_mii_raw_read()/_write()/_update() call sw_read()/sw_write() out of
+struct qca_mdio_data, which is QSDK's own qca-mdio driver private data.
+OpenWrt builds CONFIG_MDIO_IPQ4019=y, so bus->priv is a 32-byte
+struct ipq4019_mdio_data with no such members: fetching the hooks at
+offsets 168/176 reads far past the allocation and then calls whatever is
+there as a function pointer, holding bus->mdio_lock.  MDIO wedges, the
+watchdog procd armed before preinit fires, and the board reboot-loops.
+
+On cmcc,pz-l8 (IPQ5018 + external QCA8337 on mdio1) that meant a ~73 s
+reboot loop with no link on any port.  Device 0, the internal ESS, is
+unaffected because it uses switch_access_mode = "local bus".  This is
+also why upstream ships ISISC_ENABLE=disable - with the mainline MDIO
+driver ssdk cannot reach an MDIO-attached switch at all.
+
+Implement the register protocol directly, as mainline
+drivers/net/dsa/qca/qca8k-8xxx.c does for the same silicon: the 32-bit
+register address splits into a page (written to PHY 0x18 register 0) plus
+a PHY/register pair, and the value moves as two 16-bit halves, low first.
+bus->read/bus->write are the raw accessors, matching the locking contract
+already in this file - qca_mii_read()/qca_mii_write() hold bus->mdio_lock
+around these helpers, __qca_mii_read()/__qca_mii_write() do not.
+
+The register-type tag qca_mii_reg_convert() puts in bits 31:28 is masked
+off and the QCA8337 protocol used unconditionally: the tag is 0 both for
+QCA8386 and for CHIP_UNSPECIFIED (the first read, during chip
+identification), and MHT_ENABLE is disabled in this build so no QCA8386
+is present.
+
+--- a/src/init/ssdk_plat.c
++++ b/src/init/ssdk_plat.c
+@@ -36,6 +36,7 @@
+ #include <linux/module.h>
+ #include <linux/phy.h>
+ #include <linux/platform_device.h>
++#include <linux/delay.h>
+ #include <linux/types.h>
+ //#include <asm/mach-types.h>
+ #include <generated/autoconf.h>
+@@ -287,47 +288,109 @@
+ 	}
+ }
+ 
++/*
++ * The MDIO register path below deliberately does NOT use the sw_read()/
++ * sw_write() hooks in struct qca_mdio_data.  Those belong to QSDK's own
++ * qca-mdio driver; OpenWrt builds CONFIG_MDIO_IPQ4019=y, whose bus->priv is a
++ * 32-byte struct ipq4019_mdio_data.  Reading the hooks (at offsets 168/176)
++ * off that allocation is an out-of-bounds read, and calling the result as a
++ * function pointer - while holding bus->mdio_lock - wedges MDIO and lets the
++ * watchdog reboot the board in a loop.
++ *
++ * Talk to the switch directly instead, the same way mainline
++ * drivers/net/dsa/qca/qca8k-8xxx.c does for this silicon.
++ */
++static void qca_mii_split_addr(a_uint32_t regaddr, a_uint16_t *r1,
++		a_uint16_t *r2, a_uint16_t *page)
++{
++	regaddr >>= 1;
++	*r1 = regaddr & 0x1e;
++
++	regaddr >>= 5;
++	*r2 = regaddr & 0x7;
++
++	regaddr >>= 3;
++	*page = regaddr & 0x3ff;
++}
++
++static sw_error_t qca_mii_set_page(struct mii_bus *bus, a_uint16_t page)
++{
++	if (bus->write(bus, 0x18, 0, page) < 0)
++		return SW_FAIL;
++
++	/*
++	 * The page latch has to settle before the data cycles.  udelay() rather
++	 * than usleep_range() because the __qca_mii_* accessors are not
++	 * guaranteed to run in sleepable context.
++	 */
++	udelay(1000);
++
++	return SW_OK;
++}
++
+ sw_error_t qca_mii_raw_read(struct mii_bus *bus, a_uint32_t reg, a_uint32_t *val)
+ {
+-	struct qca_mdio_data *mdio_priv = bus->priv;
++	a_uint16_t r1 = 0, r2 = 0, page = 0;
++	int lo, hi;
+ 
+-	if (mdio_priv && mdio_priv->sw_read) {
+-		*val = mdio_priv->sw_read(bus, reg);
+-		return SW_OK;
+-	}
++	/*
++	 * Strip the register-type tag qca_mii_reg_convert() adds in bits 31:28.
++	 * It is 0 for QCA8386 and for CHIP_UNSPECIFIED - the latter being the
++	 * case for the first read, during chip identification - and 1 for
++	 * QCA8337.  Only the QCA8337 protocol is implemented; MHT_ENABLE is
++	 * disabled in this build so no QCA8386 can be present.
++	 */
++	reg &= ~((a_uint32_t)SSDK_SWITCH_REG_TYPE_MASK);
++	qca_mii_split_addr(reg, &r1, &r2, &page);
++
++	if (qca_mii_set_page(bus, page) != SW_OK)
++		return SW_FAIL;
++
++	lo = bus->read(bus, 0x10 | r2, r1);
++	if (lo < 0)
++		return SW_FAIL;
++
++	hi = bus->read(bus, 0x10 | r2, r1 + 1);
++	if (hi < 0)
++		return SW_FAIL;
+ 
+-	return SW_FAIL;
++	*val = ((a_uint32_t)(hi & 0xffff) << 16) | (a_uint32_t)(lo & 0xffff);
++
++	return SW_OK;
+ }
+ 
+ sw_error_t qca_mii_raw_write(struct mii_bus *bus, a_uint32_t reg, a_uint32_t val)
+ {
+-	struct qca_mdio_data *mdio_priv = bus->priv;
++	a_uint16_t r1 = 0, r2 = 0, page = 0;
+ 
+-	if (mdio_priv && mdio_priv->sw_write) {
+-		mdio_priv->sw_write(bus, reg, val);
+-		return SW_OK;
+-	}
++	reg &= ~((a_uint32_t)SSDK_SWITCH_REG_TYPE_MASK);
++	qca_mii_split_addr(reg, &r1, &r2, &page);
++
++	if (qca_mii_set_page(bus, page) != SW_OK)
++		return SW_FAIL;
++
++	/* low half first: the switch latches the 32-bit value on the high half */
++	if (bus->write(bus, 0x10 | r2, r1, val & 0xffff) < 0)
++		return SW_FAIL;
++
++	if (bus->write(bus, 0x10 | r2, r1 + 1, (val >> 16) & 0xffff) < 0)
++		return SW_FAIL;
+ 
+-	return SW_FAIL;
++	return SW_OK;
+ }
+ 
+ sw_error_t qca_mii_raw_update(struct mii_bus *bus, a_uint32_t reg,
+ 		a_uint32_t clear, a_uint32_t set)
+ {
+-	struct qca_mdio_data *mdio_priv = bus->priv;
+-
+-	if (mdio_priv && mdio_priv->sw_read && mdio_priv->sw_write) {
+-		a_uint32_t val;
++	a_uint32_t val = 0;
+ 
+-		val = mdio_priv->sw_read(bus, reg);
+-		val &= ~clear;
+-		val |= set;
+-		mdio_priv->sw_write(bus, reg, val);
++	if (qca_mii_raw_read(bus, reg, &val) != SW_OK)
++		return SW_FAIL;
+ 
+-		return SW_OK;
+-	}
++	val &= ~clear;
++	val |= set;
+ 
+-	return SW_FAIL;
++	return qca_mii_raw_write(bus, reg, val);
+ }
+ 
+ a_uint32_t __qca_mii_read(a_uint32_t dev_id, a_uint32_t reg)

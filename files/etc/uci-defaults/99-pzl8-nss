@@ -1,0 +1,3 @@
+#!/bin/sh
+/etc/init.d/nss-offload enable
+exit 0

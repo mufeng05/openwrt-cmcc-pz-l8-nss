@@ -1,0 +1,51 @@
+nss_meminfo: map the block table non-cacheable
+
+The meminfo block table is the structure that tells the firmware where
+its rings and heap live. The host writes it before the core is released
+from reset, and the core reads it through its own view of DDR, so the
+two sides only agree if the host's writes have actually reached memory.
+
+Patch 0004 ("rework NSS_CORE_DMA_CACHE_MAINT ops") removed the cache
+maintenance around that table without putting anything in its place -
+what is left in nss_meminfo_init_block_lists() is a bare NSS_CORE_DSB(),
+which orders accesses but does not clean the D-cache. With the table
+mapped ioremap_cache(), whatever part of it is still sitting in a dirty
+cache line when the core starts is simply not there as far as the core
+is concerned.
+
+Mapping the table write-combining removes the dependency on the cache
+state entirely, which is what the flush used to guarantee. The table is
+touched once at init and never on a hot path, so there is nothing to
+lose by giving up cacheability here.
+
+Found and measured by Adriel Santos on IPQ5018 with the 12.5 firmware
+line: over 33 cold boots, roughly half came up, a quarter coredumped
+(and nss_fw_coredump_notify() then panics the kernel, producing a reboot
+loop that clears itself once a boot happens to land well) and the rest
+never signalled at all; with the table mapped ioremap_wc it was 21 clean
+boots out of 21. The 12.2 line carries the same meminfo layout - 25
+blocks, identical sizes and alignments - and the same feed patch 0004,
+so the hazard is identical here.
+
+Link: https://github.com/ADCDS/openwrt-xiaomi-ax3000t-rd03v2
+Signed-off-by: Stanislaw Pal <kuncy7@gmail.com>
+
+--- a/nss_meminfo.c
++++ b/nss_meminfo.c
+@@ -752,7 +752,15 @@ static bool nss_meminfo_init_block_lists(
+ 	}
+
+ 	map = &mem_ctx->meminfo_map;
+-	map->start = (uint32_t *)ioremap_cache(meminfo_start[1], NSS_MEMINFO_MAP_SIZE);
++
++	/*
++	 * Non-cacheable: the core reads this table through its own view of
++	 * DDR before it runs a single instruction of firmware, and patch
++	 * 0004 removed the cache clean that used to make the host's writes
++	 * visible to it. The table is written once at init and never read
++	 * on a hot path, so write-combining costs nothing here.
++	 */
++	map->start = (uint32_t *)ioremap_wc(meminfo_start[1], NSS_MEMINFO_MAP_SIZE);
+ 	if (!map->start) {
+ 		nss_info_always("%px: failed to remap meminfo map\n", nss_ctx);
+ 		return false;

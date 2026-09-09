@@ -1,0 +1,49 @@
+nss_n2h: refuse the extra-pbuf sysctls before the core is up
+
+Writing dev.nss.n2hcfg.extra_pbuf_core0 with the NSS core not brought up
+takes the kernel down:
+
+  (NULL device *): Configuring additional NSS pbufs
+  Unable to handle kernel access to user memory outside uaccess routines
+    at virtual address 0000000000000210
+  Internal error: Oops: 0000000096000005 [#1] SMP
+
+nss_ctx points into nss_top_main, so it is never NULL and the handler
+walks straight into nss_n2h_buf_pool_cfg() with a context whose message
+plumbing does not exist yet. It is easy to reach: qca-nss-pbuf writes
+that sysctl from its init script at boot, and on a board where nothing
+armed the data plane the core is still down when it runs (reported on
+the OpenWrt forum, thread 253014, on a GL-B3000 built without
+nss-tools-dwmac).
+
+Guard both handlers the way the rest of the driver does before it uses a
+context, and say so rather than dying.
+
+Signed-off-by: Stanislaw Pal <kuncy7@gmail.com>
+
+--- a/nss_n2h.c
++++ b/nss_n2h.c
+@@ -1361,6 +1361,11 @@ static int nss_n2h_buf_cfg_core0_handler
+ 		return ret;
+ 	}
+ 
++	if (unlikely(nss_ctx->state != NSS_CORE_STATE_INITIALIZED)) {
++		nss_warning("%px: core 0 is not up, cannot add pbufs\n", nss_ctx);
++		return -EAGAIN;
++	}
++
+ 	if (nss_ctx->buf_sz_allocated) {
+ 		nss_n2h_core0_add_buf_pool_size = nss_ctx->buf_sz_allocated;
+ 		return -EPERM;
+@@ -1400,6 +1405,11 @@ static int nss_n2h_buf_cfg_core1_handler
+ 		return ret;
+ 	}
+ 
++	if (unlikely(nss_ctx->state != NSS_CORE_STATE_INITIALIZED)) {
++		nss_warning("%px: core 1 is not up, cannot add pbufs\n", nss_ctx);
++		return -EAGAIN;
++	}
++
+ 	if (nss_ctx->buf_sz_allocated) {
+ 		nss_n2h_core1_add_buf_pool_size = nss_ctx->buf_sz_allocated;
+ 		return -EPERM;
