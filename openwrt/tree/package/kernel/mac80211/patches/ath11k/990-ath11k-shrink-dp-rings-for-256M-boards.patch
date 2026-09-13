@@ -29,18 +29,32 @@ MON_STATUS still feeds rate and RSSI reporting so it is only halved, and
 DP_RXDMA_BUF_RING_SIZE, which bounds in-flight Rx, is the one to raise
 again if the measured headroom allows.
 
+
+Two of these are raised again, above upstream in one case, because the NSS
+wifili offload needs the depth: the firmware reaps the Tx completion and Rx
+release rings itself and the vendor sizes them 8192 and 4096.  Measured with
+them at the shrunk values, the NSS core trapped under sustained traffic; at
+these values it does not.  The monitor rings stay small - an AP does not do
+radiotap capture - and DP_RXDMA_BUF_RING_SIZE stays at 1024, which is what
+bounds the resident Rx buffer pool and therefore the memory this patch exists
+to save.
+
 --- a/drivers/net/wireless/ath/ath11k/dp.h
 +++ b/drivers/net/wireless/ath/ath11k/dp.h
-@@ -206,7 +206,7 @@
+@@ -206,24 +206,24 @@
  #define DP_WBM_RELEASE_RING_SIZE	64
  #define DP_TCL_DATA_RING_SIZE		512
  #define DP_TCL_DATA_RING_SIZE_WCN6750	2048
 -#define DP_TX_COMP_RING_SIZE		32768
-+#define DP_TX_COMP_RING_SIZE	2048
++#define DP_TX_COMP_RING_SIZE	8192
  #define DP_TX_IDR_SIZE			DP_TX_COMP_RING_SIZE
  #define DP_TCL_CMD_RING_SIZE		32
  #define DP_TCL_STATUS_RING_SIZE		32
-@@ -217,13 +217,13 @@
+ #define DP_REO_DST_RING_MAX		4
+ #define DP_REO_DST_RING_SIZE		2048
+ #define DP_REO_REINJECT_RING_SIZE	32
+-#define DP_RX_RELEASE_RING_SIZE		1024
++#define DP_RX_RELEASE_RING_SIZE		4096
  #define DP_REO_EXCEPTION_RING_SIZE	128
  #define DP_REO_CMD_RING_SIZE		256
  #define DP_REO_STATUS_RING_SIZE		2048

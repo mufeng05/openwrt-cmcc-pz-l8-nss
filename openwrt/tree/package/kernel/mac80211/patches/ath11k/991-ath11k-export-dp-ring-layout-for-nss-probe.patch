@@ -1,0 +1,2114 @@
+ath11k: export the data-path ring layout for an NSS wifili probe
+
+NSS's wifili offload wants the WLAN data-path rings described to it -
+physical base, geometry and register bases for the TCL, TX completion,
+REO destination, exception, release and reinject rings - so the UBI32
+core can drive them directly instead of the host.
+
+struct hal_srng already carries every field struct
+nss_wifili_hal_srng_info asks for, down to HAL_SRNG_NUM_REG_GRP and
+NSS_WIFILI_MAX_SRNG_REG_GROUPS_MSG both being 2.  Export a flat,
+read-only copy of it so a separate module can build the init message
+and find out whether the firmware accepts this description.
+
+ath11k's behaviour is unchanged: the new file only reads rings that are
+already set up, and the hook in core.c only records which ath11k_base
+instances exist.  Keeping the translation out of tree avoids coupling
+the backports build to qca-nss-drv's exports.
+
+Diagnostic aid for bring-up, not for shipping as-is.
+
+--- a/drivers/net/wireless/ath/ath11k/Makefile
++++ b/drivers/net/wireless/ath/ath11k/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: BSD-3-Clause-Clear
+ obj-$(CPTCFG_ATH11K) += ath11k.o
+ ath11k-y += core.o \
++	     nss_export.o \
+ 	    hal.o \
+ 	    hal_tx.o \
+ 	    hal_rx.o \
+--- a/drivers/net/wireless/ath/ath11k/ahb.c
++++ b/drivers/net/wireless/ath/ath11k/ahb.c
+@@ -951,6 +951,7 @@
+ 
+ 	ab->mem = mem;
+ 	ab->mem_len = resource_size(mem_res);
++	ab->mem_pa = mem_res->start;
+ 
+ 	return 0;
+ }
+--- a/drivers/net/wireless/ath/ath11k/core.c
++++ b/drivers/net/wireless/ath/ath11k/core.c
+@@ -2086,6 +2086,13 @@
+ 		goto err_pdev_debug;
+ 	}
+ 
++	/* Every data-path ring now exists, mac80211 has not been told the
++	 * radio does, and ath11k_hif_irq_enable() has not run.  Nothing can
++	 * deliver into these rings, which is the one condition the handover
++	 * to NSS needs and the one a script cannot arrange after the fact.
++	 */
++	ath11k_nss_dp_ready(ab);
++
+ 	ret = ath11k_mac_register(ab);
+ 	if (ret) {
+ 		ath11k_err(ab, "failed register the radio with mac80211: %d\n", ret);
+@@ -2761,6 +2768,8 @@
+ 		return ret;
+ 	}
+ 
++	ath11k_nss_register_soc(ab);
++
+ 	ret = ath11k_core_soc_create(ab);
+ 	if (ret) {
+ 		ath11k_err(ab, "failed to create soc core: %d\n", ret);
+--- a/drivers/net/wireless/ath/ath11k/core.h
++++ b/drivers/net/wireless/ath/ath11k/core.h
+@@ -931,6 +931,7 @@
+ 	void __iomem *mem;
+ 	void __iomem *mem_ce;
+ 	unsigned long mem_len;
++	phys_addr_t mem_pa;
+ 
+ 	struct {
+ 		enum ath11k_bus bus;
+@@ -1360,4 +1361,26 @@
+ 
+ void ath11k_core_pm_notifier_unregister(struct ath11k_base *ab);
+ 
++
++/* NSS wifili probe: read-only export of the data-path ring layout, plus the
++ * gates that keep ath11k off a data path NSS owns.
++ */
++struct dp_rxdma_ring;
++void ath11k_nss_register_soc(struct ath11k_base *ab);
++void ath11k_nss_unregister_soc(struct ath11k_base *ab);
++void ath11k_nss_peer_event(struct ath11k *ar, struct ieee80211_vif *vif,
++			   struct ieee80211_sta *sta, bool create);
++extern bool ath11k_nss_coherent_rings;
++void ath11k_nss_dp_drain_dst_ring(struct ath11k_base *ab, int ring_id);
++bool ath11k_nss_dp_owned(struct ath11k_base *ab);
++bool ath11k_nss_dp_refill_owned(struct ath11k_base *ab, int mac_id,
++				struct dp_rxdma_ring *rx_ring);
++typedef int (*ath11k_nss_tx_fn)(void *ctx, struct sk_buff *skb, u32 vdev_id);
++struct ath11k_vif;
++int ath11k_nss_dp_tx(struct ath11k_vif *arvif, struct sk_buff *skb,
++			 bool eth_encap);
++void ath11k_nss_dp_ready(struct ath11k_base *ab);
++void ath11k_nss_vif_event(struct ath11k *ar, struct ieee80211_vif *vif,
++			  bool add);
++
+ #endif /* _CORE_H_ */
+--- a/drivers/net/wireless/ath/ath11k/dp.c
++++ b/drivers/net/wireless/ath/ath11k/dp.c
+@@ -239,7 +239,32 @@
+ 
+ 	ring->size = (num_entries * entry_sz) + HAL_RING_BASE_ALIGN - 1;
+ 
+-	if (ab->hw_params.alloc_cacheable_memory) {
++	/*
++	 * The REO destination and WBM2SW release rings are the ones a
++	 * co-processor also reads.  IPQ5018 sets alloc_cacheable_memory,
++	 * so ath11k would take dma_alloc_noncoherent() for exactly those
++	 * two and keep them coherent by hand with dma_sync_single_for_cpu()
++	 * before each read - which works only while the host is the sole
++	 * reader.  NSS is not: it reads and writes the same rings from
++	 * another processor with no coherency against the ARM caches, so a
++	 * dirty line written back at any moment lands on top of an entry
++	 * the hardware just produced.
++	 *
++	 * That is the shape the firmware traps had: non-deterministic, on
++	 * the first frame after a station associates, with nothing in the
++	 * firmware log because it had followed a descriptor that was
++	 * whatever the cache happened to hold.  It happened with host Tx
++	 * disabled too, which is what pointed at the Rx rings.
++	 *
++	 * Ring memory is allocated at hardware init, long before the
++	 * offload mask can be written, so this cannot key off
++	 * ath11k_nss_dp_owned().  It is its own load-time parameter, and it
++	 * defaults to coherent: the cacheable path is a host-side
++	 * optimisation, and a tree built to run NSS offload should not pay
++	 * for it with a class of corruption that is invisible until it is
++	 * fatal.
++	 */
++	if (ab->hw_params.alloc_cacheable_memory && !ath11k_nss_coherent_rings) {
+ 		/* Allocate the reo dst and tx completion rings from cacheable memory */
+ 		switch (type) {
+ 		case HAL_REO_DST:
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@ -355,6 +355,13 @@
+ 	u32 cookie;
+ 	dma_addr_t paddr;
+ 
++	/* NSS owns this refill ring: it posts its own buffers with its own
++	 * cookies, and a host buffer in there would be resolved against the
++	 * wrong descriptor pool by whichever side reaps it.
++	 */
++	if (ath11k_nss_dp_refill_owned(ab, mac_id, rx_ring))
++		return 0;
++
+ 	req_entries = min(req_entries, rx_ring->bufs_max);
+ 
+ 	srng = &ab->hal.srng_list[rx_ring->refill_buf_ring.ring_id];
+@@ -2639,6 +2646,9 @@
+ 	u32 cookie;
+ 	int i;
+ 
++	if (ath11k_nss_dp_owned(ab))
++		return 0;
++
+ 	for (i = 0; i < MAX_RADIOS; i++)
+ 		__skb_queue_head_init(&msdu_list[i]);
+ 
+@@ -3831,6 +3841,9 @@
+ 	bool is_frag;
+ 	u8 drop = 0;
+ 
++	if (ath11k_nss_dp_owned(ab))
++		return 0;
++
+ 	tot_n_bufs_reaped = 0;
+ 	quota = budget;
+ 
+@@ -4138,6 +4151,9 @@
+ 	int total_num_buffs_reaped = 0;
+ 	int ret, i;
+ 
++	if (ath11k_nss_dp_owned(ab))
++		return 0;
++
+ 	for (i = 0; i < ab->num_radios; i++)
+ 		__skb_queue_head_init(&msdu_list[i]);
+ 
+@@ -4263,6 +4279,19 @@
+ 	int buf_id;
+ 
+ 	ar = ab->pdevs[ath11k_hw_mac_id_to_pdev_id(&ab->hw_params, mac_id)].ar;
++
++	if (ath11k_nss_dp_owned(ab)) {
++		/* Drain rather than return before the ring is ever
++		 * touched: its interrupt is still wired to this host,
++		 * and nothing else consumes it - NSS was never told
++		 * the ring exists.
++		 */
++		ath11k_nss_dp_drain_dst_ring(ab,
++			ar->dp.rxdma_err_dst_ring[
++				ath11k_hw_mac_id_to_srng_id(&ab->hw_params,
++					    mac_id)].ring_id);
++		return 0;
++	}
+ 	err_ring = &ar->dp.rxdma_err_dst_ring[ath11k_hw_mac_id_to_srng_id(&ab->hw_params,
+ 									  mac_id)];
+ 	rx_ring = &ar->dp.rx_refill_buf_ring;
+--- a/drivers/net/wireless/ath/ath11k/dp_tx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_tx.c
+@@ -102,6 +102,16 @@
+ 	if (unlikely(test_bit(ATH11K_FLAG_CRASH_FLUSH, &ar->ab->dev_flags)))
+ 		return -ESHUTDOWN;
+ 
++	/* The TCL rings belong to NSS, including the descriptor cookies in
++	 * them, so a host frame cannot be submitted here.  Hand it to NSS
++	 * instead: with frame_mode=2 this is an 802.3 frame, which is what
++	 * NSS vdev Tx takes, and NSS does the 802.11 encapsulation itself.
++	 */
++	if (unlikely(ath11k_nss_dp_owned(ab)))
++		return ath11k_nss_dp_tx(arvif, skb,
++					   !!(skb_cb->flags &
++					      ATH11K_SKB_HW_80211_ENCAP));
++
+ 	if (unlikely(!(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
+ 		     !ieee80211_is_data(hdr->frame_control)))
+ 		return -EOPNOTSUPP;
+@@ -697,6 +707,9 @@
+ 	u32 msdu_id;
+ 	u8 mac_id;
+ 
++	if (ath11k_nss_dp_owned(ab))
++		return;
++
+ 	spin_lock_bh(&status_ring->lock);
+ 
+ 	ath11k_hal_srng_access_begin(ab, status_ring);
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -6984,6 +6984,11 @@
+ 		ath11k_reg_handle_chan_list(ab, reg_info, IEEE80211_REG_LPI_AP);
+ 	}
+ 
++	/* The vdev exists and its self peer with it.  Still under
++	 * conf_mutex, so the callee must not ask ath11k for the vif list.
++	 */
++	ath11k_nss_vif_event(ar, vif, true);
++
+ 	mutex_unlock(&ar->conf_mutex);
+ 
+ 	return 0;
+@@ -7038,6 +7043,9 @@
+ 	ath11k_dbg(ab, ATH11K_DBG_MAC, "remove interface (vdev %d)\n",
+ 		   arvif->vdev_id);
+ 
++	/* While the vdev id is still valid. */
++	ath11k_nss_vif_event(ar, vif, false);
++
+ 	ret = ath11k_spectral_vif_stop(arvif);
+ 	if (ret)
+ 		ath11k_warn(ab, "failed to stop spectral for vdev %i: %d\n",
+@@ -9802,6 +9810,9 @@
+ 				    sta->addr, arvif->vdev_id);
+ 	} else if ((old_state == IEEE80211_STA_NONE &&
+ 		    new_state == IEEE80211_STA_NOTEXIST)) {
++		/* Before ath11k forgets the peer id NSS needs to name it. */
++		ath11k_nss_peer_event(ar, vif, sta, false);
++
+ 		ret = ath11k_mac_station_remove(ar, vif, sta);
+ 		if (ret)
+ 			ath11k_warn(ar->ab, "Failed to remove station: %pM for VDEV: %d\n",
+@@ -9830,6 +9841,16 @@
+ 		if (ret)
+ 			ath11k_warn(ar->ab, "Failed to associate station: %pM\n",
+ 				    sta->addr);
++		else
++			/* Hand the peer to NSS here.  Not at NOTEXIST->NONE: the
++			 * WMI peer exists by then but has not been associated, and
++			 * a peer handed over that early takes the firmware down on
++			 * the first frame - measured, against a run that created
++			 * the same peer two seconds later and was stable.  This is
++			 * still before the station is authorised, so still before
++			 * it can get a data frame forwarded.
++			 */
++			ath11k_nss_peer_event(ar, vif, sta, true);
+ 
+ 		spin_lock_bh(&ar->data_lock);
+ 		/* Set arsta bw and prev bw */
+@@ -9846,6 +9867,13 @@
+ 
+ 		spin_unlock_bh(&ar->ab->base_lock);
+ 
++		/* NSS keeps its own authorised flag per peer and gates
++		 * forwarding on it, so it has to be told as well.  Same
++		 * call as at association; the callee sees the flag set
++		 * this time and sends the update.
++		 */
++		ath11k_nss_peer_event(ar, vif, sta, true);
++
+ 		if (vif->type == NL80211_IFTYPE_STATION && arvif->is_up) {
+ 			ret = ath11k_wmi_set_peer_param(ar, sta->addr,
+ 							arvif->vdev_id,
+--- a/drivers/net/wireless/ath/ath11k/qmi.c
++++ b/drivers/net/wireless/ath/ath11k/qmi.c
+@@ -2202,6 +2202,13 @@
+ 
+ 	ab->mem = bar_addr_va;
+ 	ab->mem_len = resp.bar_size;
++	/*
++	 * Keep the physical base too.  For a hybrid-bus radio this is the
++	 * only place it ever appears - it is not in the device tree and not
++	 * a platform resource - and a co-processor being handed the ring
++	 * register addresses needs it.
++	 */
++	ab->mem_pa = resp.bar_addr;
+ 
+ 	if (!ab->hw_params.ce_remap)
+ 		ab->mem_ce = ab->mem;
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/ath11k_nss_export.h
+@@ -0,0 +1,374 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * Read-only view of ath11k's data-path ring layout, for the NSS wifili probe.
++ *
++ * This exists so the probe module does not have to be built against ath11k's
++ * private headers, and so ath11k itself does not have to be built against
++ * qca-nss-drv's exports.  ath11k fills a flat struct; the probe translates it
++ * into an NSS_WIFILI_INIT_MSG.
++ *
++ * The field set is dictated by struct nss_wifili_hal_srng_info and
++ * struct nss_wifili_hal_srng_soc_msg in qca-nss-drv/exports/nss_wifili_if.h,
++ * and by what the vendor driver actually puts in them - see the notes on
++ * hwreg_base, rx_buf_len and nss_target_type, all three of which were wrong
++ * when derived from the headers alone.
++ */
++#ifndef ATH11K_NSS_EXPORT_H
++#define ATH11K_NSS_EXPORT_H
++
++#include <linux/types.h>
++#include <linux/device.h>
++#include <linux/if_ether.h>
++
++/*
++ * The probe includes this header but cannot see ath11k's private types, and
++ * only ever handles pointers to them.
++ */
++struct ath11k_base;
++struct ath11k_vif;
++struct sk_buff;
++
++#define ATH11K_NSS_MAX_TCL_RINGS	4
++#define ATH11K_NSS_MAX_REO_RINGS	4
++#define ATH11K_NSS_NUM_REG_GRP		2	/* == HAL_SRNG_NUM_REG_GRP */
++#define ATH11K_NSS_MAX_PDEV		3
++
++/*
++ * NSS speaks Qualcomm's TARGET_TYPE numbering, which has nothing to do with
++ * ath11k's hw_rev enum - IPQ5018 is hw_rev 7 and TARGET_TYPE 29.  The firmware
++ * indexes hardware tables by it, so passing hw_rev through, as the first
++ * version of this did, has it read the wrong table.
++ *
++ * The values are pinned by the vendor driver's own dispatch: it rejects
++ * anything outside {20,24,25,26,29,30}, sends {20,24,25,29} to the internal
++ * wifili interface and {26,30} to an external one, and takes a
++ * QCA5018-specific branch on 29.
++ */
++#define ATH11K_NSS_TARGET_TYPE_QCA8074		20
++#define ATH11K_NSS_TARGET_TYPE_QCA8074V2	24
++#define ATH11K_NSS_TARGET_TYPE_QCA6018		25
++#define ATH11K_NSS_TARGET_TYPE_QCN9000		26
++#define ATH11K_NSS_TARGET_TYPE_QCA5018		29
++#define ATH11K_NSS_TARGET_TYPE_QCN6122		30
++
++/*
++ * One hardware ring, in the terms NSS asks for.  Mirrors struct hal_srng
++ * closely enough that the translation is nearly a field copy.
++ *
++ * hwreg_base needs one adjustment the field names do not hint at: ath11k
++ * stores an offset from the ioremap()ed WLAN window and dereferences it as
++ * ab->mem + hwreg_base, while NSS wants the register's physical address.  The
++ * vendor driver computes exactly that - hwreg_virtual - dev_base_virtual +
++ * dev_base_physical - so the consumer has to add dev_base_paddr.  Sending the
++ * bare offset points the firmware at physical 0x00a4xxxx instead of
++ * 0x0ca4xxxx, which is nothing to do with the WLAN block.
++ *
++ * hwreg_base is zero for the LMAC (RXDMA) rings and that is correct, not
++ * missing data: ath11k_hal_srng_setup() returns before srng_hw_init() for an
++ * lmac_ring, so the host never programs those registers at all.  Their head
++ * pointer lives in the shadow write-pointer block instead, at
++ * shadow_wrptr + (ring_id - lmac_rings_start_id), and the ring itself is
++ * configured in hardware by the WLAN firmware over HTT.  NSS is handed
++ * shadow_wrptr_paddr and lmac_rings_start_id so it can compute the same thing.
++ */
++struct ath11k_nss_srng {
++	u8	valid;
++	u8	ring_id;
++	u32	ring_base_paddr;
++	u32	num_entries;
++	u32	entry_size;
++	u32	flags;
++	u32	ring_dir;		/* 0 = source, 1 = destination */
++	u32	hwreg_base[ATH11K_NSS_NUM_REG_GRP];	/* offsets, not addresses */
++};
++
++/*
++ * Per-radio state, for struct nss_wifili_pdev_init_msg.  The RXDMA refill ring
++ * is the one NSS needs to own if it is to receive; the ids come from ath11k's
++ * own mac/pdev mapping rather than being guessed.
++ */
++struct ath11k_nss_pdev {
++	u8	valid;
++	u32	radio_id;
++	u32	lmac_id;
++	u32	target_pdev_id;
++	u32	num_rx_swdesc;		/* refill_buf_ring bufs_max */
++	struct ath11k_nss_srng rxdma_ring;
++};
++
++struct ath11k_nss_dp_info {
++	/* struct nss_wifili_hal_srng_soc_msg */
++	u32	dev_base_paddr;		/* physical base of the WLAN MMIO window */
++	u32	shadow_rdptr_paddr;
++	u32	shadow_wrptr_paddr;
++	/* The same two blocks as the host sees them.  Hardware publishes a
++	 * dst ring's head at rdptr[ring_id] and a src ring's tail at the
++	 * same index, while the host writes an lmac src ring's head at
++	 * wrptr[ring_id - lmac_rings_start_id].  Reading those three tells
++	 * whether the hardware is producing at all, which no counter on
++	 * either side of the handover can answer on its own.
++	 */
++	u32	*shadow_rdptr_vaddr;
++	u32	*shadow_wrptr_vaddr;
++	u32	lmac_rings_start_id;
++
++	/*
++	 * struct nss_wifili_rx_init_param.  rx_buf_len is the usable data
++	 * length, not the buffer size: the vendor driver pairs tlv_size 256
++	 * with rx_buf_len 1792 on a 2048-byte buffer, and ath11k's own Rx path
++	 * uses DP_RX_BUFFER_SIZE - hal_desc_sz for the same quantity.  Sending
++	 * the full 2048 would have the firmware write past every skb.
++	 */
++	u16	rx_tlv_size;		/* hw_params.hal_desc_sz */
++	u16	rx_buf_len;		/* DP_RX_BUFFER_SIZE - rx_tlv_size */
++
++	u32	nss_target_type;	/* ATH11K_NSS_TARGET_TYPE_*, not hw_rev */
++	u8	num_tcl_data_rings;
++	u8	num_reo_dest_rings;
++	u8	num_radios;
++
++	struct ath11k_nss_srng tcl_ring[ATH11K_NSS_MAX_TCL_RINGS];
++	struct ath11k_nss_srng tx_comp_ring[ATH11K_NSS_MAX_TCL_RINGS];
++	struct ath11k_nss_srng reo_dest_ring[ATH11K_NSS_MAX_REO_RINGS];
++	struct ath11k_nss_srng reo_exception_ring;
++	struct ath11k_nss_srng rx_rel_ring;
++	struct ath11k_nss_srng reo_reinject_ring;
++
++	struct ath11k_nss_pdev pdev[ATH11K_NSS_MAX_PDEV];
++
++	/*
++	 * The DMA-capable device behind this SoC.  A caller that has to
++	 * allocate memory for NSS must use it: a dummy netdev's struct
++	 * device has no dma_mask and dma_alloc_coherent() fails on it.
++	 */
++	struct device *dma_dev;
++};
++
++/*
++ * ath11k_nss_get_dp_info()
++ *	Fill in the ring layout of the idx'th ath11k SoC.
++ *
++ * Returns 0 on success, -ENODEV if no such SoC is up.  Read-only: it takes no
++ * locks and changes nothing, so it is safe to call at any time after the data
++ * path has been allocated.
++ */
++int ath11k_nss_get_dp_info(unsigned int idx, struct ath11k_nss_dp_info *info);
++
++/*
++ * ath11k_nss_dp_quiesce()
++ *	Stop or restart ath11k's servicing of the data-path rings.
++ *
++ * NSS cannot be handed rings that ath11k's NAPI is still reaping.  This
++ * disables the ext interrupt groups and their NAPI contexts, which is the DP
++ * path only - the copy engines carrying WMI and HTT keep running, so the
++ * firmware link, peer/vdev lifecycle and management frames are unaffected.
++ *
++ * Diagnostic lever for bring-up: it stops ath11k reading the rings, but does
++ * not hand over the buffers already posted in them.
++ */
++int ath11k_nss_dp_quiesce(unsigned int idx, bool quiesce);
++
++/*
++ * ath11k_nss_dp_reo_to_ring0()
++ *	Send every REO hash bucket to destination ring 0.
++ *
++ * NSS reaps ring 0 only.  Call this before describing the rings to firmware,
++ * or ath11k's four-way hash split leaves most frames in rings nothing
++ * services - visible as REO head pointers climbing while reo_reaped stays at
++ * zero, and as Rx that works or not depending on a flow's hash.
++ */
++int ath11k_nss_dp_reo_to_ring0(unsigned int slot);
++
++/*
++ * Hand an excepted EAPOL frame to mac80211 rather than to the bridge.
++ *
++ * hostapd talks to the kernel over nl80211 and the wiphy advertises
++ * CONTROL_PORT_OVER_NL80211, so EAPOL reaches it only through
++ * cfg80211_rx_control_port(), which lives inside mac80211's receive path.
++ * Injecting the frame straight into the AP netdev therefore delivers it to the
++ * bridge and to nobody else: the station's message 2 arrives, hostapd never
++ * sees it, and the four-way handshake retries until it gives up.  Measured -
++ * all twenty excepted frames were EAPOL-Key with the replay counter climbing.
++ *
++ * NSS hands up an 802.3 frame, and ath11k's own decap-offload path deliberately
++ * does not set RX_FLAG_8023 for EAPOL, converting back to 802.11 instead so
++ * that mac80211 takes the slow path - fast_rx expects an authorised station,
++ * which during a handshake is exactly what this is not.  So do the same.
++ *
++ * Returns 0 if the frame was consumed, -ENOENT if it is not EAPOL and the
++ * caller should deliver it the ordinary way.
++ */
++int ath11k_nss_dp_rx_eapol(unsigned int slot, u32 radio_id,
++			   struct sk_buff *skb);
++
++
++
++#define ATH11K_NSS_MAX_VIF	4
++#define ATH11K_NSS_MAX_PEER	16
++
++/*
++ * NSS opmode values come from QSDK's enum wlan_op_mode, which is not ath11k's
++ * enum wmi_vdev_type - they happen to agree on AP being 1 and disagree on the
++ * rest, so translate rather than pass through.
++ */
++#define ATH11K_NSS_OPMODE_UNKNOWN	0
++#define ATH11K_NSS_OPMODE_AP		1
++#define ATH11K_NSS_OPMODE_IBSS		2
++#define ATH11K_NSS_OPMODE_STA		3
++#define ATH11K_NSS_OPMODE_MONITOR	4
++
++/*
++ * One virtual device, in the terms struct nss_wifi_vdev_config_msg asks for.
++ * radio_id picks the pdev; the caller pairs it with the radio interface it
++ * allocated for that pdev, which is what NSS wants in radio_ifnum.
++ */
++struct ath11k_nss_vif {
++	u8	valid;
++	u8	mac_addr[ETH_ALEN];
++	u32	vdev_id;
++	u32	nss_opmode;		/* ATH11K_NSS_OPMODE_*, not wmi_vdev_type */
++	u8	is_up;
++	u32	radio_id;
++	/*
++	 * The vif's own netdev.  NSS wants it at registration for two
++	 * reasons: an excepted frame has to be handed back to the stack on
++	 * the interface it arrived on, or the bridge never sees it, and ECM
++	 * maps a netdev to an NSS interface number through exactly this
++	 * registration - which is what a wifi vdev needs to be accelerated
++	 * at all.  Registering a dummy netdev instead makes both silently
++	 * fail rather than error.
++	 */
++	struct net_device *netdev;
++};
++
++/*
++ * One peer, for struct nss_wifili_peer_msg.  ast_hash goes in tx_ast_hash and
++ * hw_peer_id in hw_ast_idx; the 1600-byte block NSS keeps its own peer state
++ * in is the caller's to allocate, so it is not described here.
++ */
++struct ath11k_nss_peer {
++	u8	valid;
++	u8	mac_addr[ETH_ALEN];
++	u32	peer_id;
++	u32	vdev_id;
++	u32	ast_hash;
++	u32	hw_peer_id;
++	u8	is_authorized;
++};
++
++/*
++ * ath11k_nss_get_vifs()
++ *	List the virtual devices on the idx'th SoC.
++ *
++ * Returns the number filled in, or -EBUSY if ar->conf_mutex is held - the lock
++ * that protects ar->arvifs.  A probe would rather report that than block
++ * behind mac80211.
++ */
++int ath11k_nss_get_vifs(unsigned int idx, struct ath11k_nss_vif *out,
++			unsigned int max);
++
++/*
++ * ath11k_nss_get_peers()
++ *	List the peers on the idx'th SoC.  Returns the number filled in.
++ */
++int ath11k_nss_get_peers(unsigned int idx, struct ath11k_nss_peer *out,
++			 unsigned int max);
++/*
++ * The peer lifecycle hook.
++ *
++ * NSS must know a peer before the first frame from it is reaped, and "before"
++ * here is not a matter of being prompt: a frame reaped for a peer NSS has
++ * never heard of takes the firmware down hard, within milliseconds of the
++ * station associating and with an empty firmware log ring - no warning, no
++ * error path, just a trap.  Measured three times: with a peer the SoC reaps
++ * and delivers happily, without one it dies at association.
++ *
++ * So this cannot be polled.  It is called from ath11k's sta_state handler in
++ * process context, right after ath11k_mac_station_add() has returned with the
++ * peer id known and while the station is still in state NONE, unable to send
++ * a data frame - and right before ath11k_mac_station_remove() on the way out.
++ * Sleeping is allowed; the caller holds ar->conf_mutex, so do not call back
++ * into ath11k_nss_get_vifs(), which would find it locked.
++ *
++ * The vdev has to exist by then.  A real implementation creates it from the
++ * vif-up path for the same reason peers are created here.
++ */
++typedef int (*ath11k_nss_peer_fn)(void *ctx,
++				  const struct ath11k_nss_peer *peer,
++				  bool create);
++
++void ath11k_nss_set_peer_hook(unsigned int slot, ath11k_nss_peer_fn fn,
++			      void *ctx);
++
++
++/*
++ * ath11k_nss_tx_fn
++ *	Hand one frame to NSS for transmission.
++ *
++ * ath11k lives in backports and must not link against qca-nss-drv, so the
++ * module that talks to NSS registers this and ath11k calls it.  Return 0 when
++ * NSS has taken the skb - ath11k then leaves it alone, exactly as it would for
++ * a frame queued to TCL - and non-zero to have the caller free it.
++ *
++ * NSS's vdev Tx wants an 802.3 frame: osif_nss_ol_vap_xmit() checks
++ * skb->len > ETH_HLEN and hands it straight to nss_wifi_vdev_tx_buf(), with
++ * the 802.11 encapsulation done inside NSS.  That is what ath11k produces when
++ * it is loaded with frame_mode=2 (ATH11K_HW_TXRX_ETHERNET), which is also what
++ * turns on TX_ENCAP_OFFLOAD and RX_DECAP_OFFLOAD in mac80211.  A frame that is
++ * A frame that is not 802.3 still arrives here: mac80211 sends control-port
++ * frames - the EAPOL of a WPA2 handshake - as 802.11 data even when encap
++ * offload is on for the vif.  Those are converted in place with
++ * ieee80211_data_to_8023() rather than dropped, because dropping them means
++ * the handshake never completes and no station ever becomes authorised.
++ */
++typedef int (*ath11k_nss_tx_fn)(void *ctx, struct sk_buff *skb, u32 vdev_id);
++
++void ath11k_nss_dp_set_tx_hook(unsigned int idx, ath11k_nss_tx_fn fn,
++			       void *ctx);
++
++/*
++ * ath11k_nss_dp_tx()
++ *	Route a frame to NSS when NSS owns this SoC's data path.
++ *
++ * Returns 0 if NSS took it, or a negative error for the caller to drop on.
++ */
++int ath11k_nss_dp_tx(struct ath11k_vif *arvif, struct sk_buff *skb,
++		     bool eth_encap);
++
++
++/*
++ * The lifecycle hooks.
++ *
++ * These exist so the handover is driven by ath11k's own bring-up rather than
++ * by a script poking debugfs after the fact.  The module that talks to NSS
++ * registers them; ath11k calls them at the two points where the answer is
++ * unambiguous.
++ *
++ * dp_ready is called once per SoC from ath11k_core_pdev_create(), after every
++ * data-path ring has been allocated and before mac80211 is told the radio
++ * exists or the data-path interrupts are unmasked.  Return 0 once NSS owns the
++ * rings; anything else drops the SoC out of the offload mask and leaves ath11k
++ * driving its own data path, which is a working board rather than a dead one.
++ * Sleeping is expected - this is the QMI worker and the whole sequence of
++ * INIT, PDEV_INIT and START is synchronous.
++ *
++ * vif is called from add_interface and remove_interface with ar->conf_mutex
++ * held, so it must not call ath11k_nss_get_vifs().  Everything the callee
++ * needs, including the netdev, is in the struct.
++ */
++typedef int (*ath11k_nss_dp_ready_fn)(void *ctx, unsigned int slot);
++typedef int (*ath11k_nss_vif_fn)(void *ctx, const struct ath11k_nss_vif *vif,
++				 bool add);
++
++void ath11k_nss_set_dp_ready_hook(ath11k_nss_dp_ready_fn fn, void *ctx);
++void ath11k_nss_set_vif_hook(unsigned int slot, ath11k_nss_vif_fn fn,
++			     void *ctx);
++
++/*
++ * Re-send the HTT ring configuration for the RXDMA refill ring, after NSS
++ * has taken it over.  Diagnostic for the QCN6122, whose receive path goes
++ * quiet at the handover while management frames keep working.
++ */
++int ath11k_nss_dp_htt_refill_setup(unsigned int slot);
++
++#endif /* ATH11K_NSS_EXPORT_H */
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/nss_export.c
+@@ -0,0 +1,1420 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * Read-only export of ath11k's data-path ring layout for the NSS wifili probe,
++ * plus one lever that does change behaviour: ath11k_nss_dp_quiesce().
++ *
++ * The read side walks the rings ath11k has already set up and copies their
++ * parameters into a flat struct, so a separate module can translate them into
++ * an NSS_WIFILI_INIT_MSG and find out whether the NSS firmware accepts this
++ * hardware description.
++ *
++ * The interesting parameters live in two places: struct dp_srng knows the ring
++ * id and DMA address, and ab->hal.srng_list[ring_id] - the struct hal_srng -
++ * knows the geometry and register bases.  Both are needed for each ring.
++ *
++ * Two values are translated rather than copied, because NSS does not mean by
++ * them what ath11k's field names suggest: see nss_target_type and rx_buf_len.
++ */
++
++#include <linux/bitfield.h>
++#include <linux/module.h>
++#include <linux/unaligned.h>
++#include <linux/platform_device.h>
++
++#include "core.h"
++#include "dp_rx.h"
++#include "dp.h"
++#include "hal.h"
++#include "hif.h"
++#include "debug.h"
++#include "peer.h"
++#include "dp_tx.h"
++#include "hal_rx.h"
++#include "pcic.h"
++#include <linux/wait.h>
++#include "ath11k_nss_export.h"
++
++/*
++ * ath11k has no global registry of SoCs, and the probe needs one.  Two entries
++ * covers this platform: the IPQ5018 internal radio and the QCN6122.
++ */
++#define ATH11K_NSS_MAX_SOC	2
++
++static struct ath11k_base *ath11k_nss_soc[ATH11K_NSS_MAX_SOC];
++static bool ath11k_nss_quiesced[ATH11K_NSS_MAX_SOC];
++static DEFINE_MUTEX(ath11k_nss_soc_lock);
++
++void ath11k_nss_register_soc(struct ath11k_base *ab)
++{
++	int i;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	for (i = 0; i < ATH11K_NSS_MAX_SOC; i++) {
++		if (!ath11k_nss_soc[i]) {
++			ath11k_nss_soc[i] = ab;
++			ath11k_nss_quiesced[i] = false;
++			break;
++		}
++	}
++	mutex_unlock(&ath11k_nss_soc_lock);
++}
++
++void ath11k_nss_unregister_soc(struct ath11k_base *ab)
++{
++	int i;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	for (i = 0; i < ATH11K_NSS_MAX_SOC; i++) {
++		if (ath11k_nss_soc[i] == ab) {
++			ath11k_nss_soc[i] = NULL;
++			ath11k_nss_quiesced[i] = false;
++			break;
++		}
++	}
++	mutex_unlock(&ath11k_nss_soc_lock);
++}
++
++/*
++ * Which SoCs have handed their data path to NSS.
++ *
++ * A bitmask over the registration index, so nss_offload_mask=1 gives NSS the
++ * IPQ5018 internal radio and 2 gives it the QCN6122.  Writable at runtime: the
++ * refill gate is consulted on every replenish, so setting the mask and then
++ * bouncing wifi is enough to bring the data path up with the ring never
++ * filled by the host - no reboot needed.
++ *
++ * This exists because the ring entry's cookie indexes the descriptor pool of
++ * whoever posted the buffer, and both sides number theirs from zero.  With
++ * ath11k's skbs and NSS's buffers in one ring, a REO descriptor carrying an
++ * NSS cookie resolves against a stale ath11k skb of the same buf_id - a buffer
++ * the hardware never wrote - and ath11k then parses its TLVs.  The vendor
++ * driver avoids this by not posting at all when the radio is offloaded:
++ * dp_rx_pdev_desc_pool_init() returns immediately with "skip Rx refil".
++ */
++/*
++ * Whether the REO destination and WBM2SW release rings are allocated coherent
++ * rather than cacheable.  Read at ring allocation, which is why it is separate
++ * from the offload mask: rings exist long before the mask can be written.
++ */
++bool ath11k_nss_coherent_rings = true;
++EXPORT_SYMBOL(ath11k_nss_coherent_rings);
++module_param_named(nss_coherent_rings, ath11k_nss_coherent_rings, bool, 0444);
++MODULE_PARM_DESC(nss_coherent_rings,
++		 "allocate the rings NSS also reads as coherent, not cacheable");
++
++static unsigned int ath11k_nss_offload_mask;
++module_param_named(nss_offload_mask, ath11k_nss_offload_mask, uint, 0644);
++
++/*
++ * Slots whose Rx refill ring the host must never fill, independent of the
++ * offload mask.
++ *
++ * The offload mask is set from userspace, long after ath11k_dp_pdev_alloc()
++ * has already filled the refill ring with host buffers at core start.  NSS
++ * later overwrites that ring with its own, and the ring then reads back as
++ * pure NSS - but the RXDMA hardware has already cached sixteen of the host's
++ * entries, and it spends them on the first sixteen frames it receives.  Those
++ * sixteen carry RBM 6 and host cookies, NSS cannot resolve them against its
++ * own descriptor pool, and it drops them - which is the whole of the 5 GHz
++ * four-failed-associations behaviour - and frees them into its own pool,
++ * which is what later trips the Tx free path over a NULL buffer.
++ *
++ * Setting this at module load (/etc/modules.d, 'ath11k nss_refill_hold=2')
++ * leaves the ring empty from the start, so there is nothing for the hardware
++ * to cache.  Doing the same by moving nss_offload_mask to load time does not
++ * work: that makes ath11k_nss_dp_owned() true for the whole of core start, so
++ * ath11k_dp_tx() hands every frame to a hook that does not exist yet, and the
++ * board wedges.  This gate touches the refill path and nothing else.
++ */
++static unsigned int ath11k_nss_refill_hold;
++module_param_named(nss_refill_hold, ath11k_nss_refill_hold, uint, 0644);
++MODULE_PARM_DESC(nss_offload_mask,
++		 "bitmask of ath11k SoCs whose data path NSS owns, by stable"
++		 " slot: bit 0 the internal radio, bit 1 the QCN6122");
++
++/*
++ * ath11k_nss_soc_slot()
++ *	The stable index for a SoC, by what it is rather than when it probed.
++ *
++ * Probe order is not stable across boots on this board: the IPQ5018 internal
++ * radio and the QCN6122 come up about 2.5 s apart and either can win, which
++ * also renames phy0/phy1 under the AP.  Indexing the offload mask by probe
++ * order therefore means that on some boots the mask gates one chip's rings
++ * while the probe hands the other chip's rings to NSS - one silicon's data
++ * path stopped, the other's described to firmware that is not driving it.  The
++ * run that ended in a firmware trap had exactly that shape, with the station
++ * associated on phy1-ap0.
++ *
++ * NSS's own target types are already a stable identity, and the vendor's
++ * dispatch splits on the same line: internal radios go to the internal wifili
++ * interface and the QCN6122 to an external one.  So slot 0 is the internal
++ * radio and slot 1 the external one, on every boot.
++ */
++static u32 ath11k_nss_target_type(struct ath11k_base *ab);
++
++static int ath11k_nss_soc_slot(struct ath11k_base *ab)
++{
++	switch (ath11k_nss_target_type(ab)) {
++	case ATH11K_NSS_TARGET_TYPE_QCA5018:
++	case ATH11K_NSS_TARGET_TYPE_QCA8074:
++	case ATH11K_NSS_TARGET_TYPE_QCA6018:
++		return 0;
++	case ATH11K_NSS_TARGET_TYPE_QCN6122:
++	case ATH11K_NSS_TARGET_TYPE_QCN9000:
++		return 1;
++	default:
++		return -1;
++	}
++}
++
++/*
++ * ath11k_nss_soc_by_slot()
++ *	The registered SoC occupying a stable slot, or NULL.
++ */
++static struct ath11k_base *ath11k_nss_soc_by_slot(unsigned int slot)
++{
++	int i;
++
++	for (i = 0; i < ATH11K_NSS_MAX_SOC; i++)
++		if (ath11k_nss_soc[i] &&
++		    ath11k_nss_soc_slot(ath11k_nss_soc[i]) == (int)slot)
++			return ath11k_nss_soc[i];
++
++	return NULL;
++}
++
++/*
++ * ath11k_nss_dp_reo_to_ring0()
++ *	Send every REO hash bucket to destination ring 0.
++ *
++ * ath11k spreads Rx over REO rings 0..3 by flow hash, which is right for a
++ * host with four NAPI contexts.  NSS reaps ring 0 only, so under the default
++ * map three quarters of the traffic lands in rings nothing services: the
++ * hardware head pointers climb - 816, 256 and 480 on one measured run - while
++ * reo_reaped stays at zero, and whether a given flow works at all comes down
++ * to which bucket its hash falls in.  That is what made Rx look intermittent
++ * rather than simply broken.
++ *
++ * Done here, at handover, rather than in the hw_ops reo_setup: that runs from
++ * hardware init, so covering it there means setting the mask before ath11k
++ * probes - and a boot with the mask already on never gets its AP up, the
++ * self-peer create timing out at -110.  REO is UMAC hardware the host
++ * programs directly, so it is reprogrammable while the target is running.
++ *
++ * Only the four hash-map registers are touched.  Everything else reo_setup
++ * wrote - the fragment destination, aging thresholds - is left alone.
++ */
++static ath11k_nss_peer_fn ath11k_nss_peer_hook[ATH11K_NSS_MAX_SOC];
++static void *ath11k_nss_peer_hook_ctx[ATH11K_NSS_MAX_SOC];
++
++void ath11k_nss_set_peer_hook(unsigned int slot, ath11k_nss_peer_fn fn,
++			      void *ctx)
++{
++	if (slot >= ATH11K_NSS_MAX_SOC)
++		return;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	ath11k_nss_peer_hook[slot] = fn;
++	ath11k_nss_peer_hook_ctx[slot] = ctx;
++	mutex_unlock(&ath11k_nss_soc_lock);
++}
++EXPORT_SYMBOL(ath11k_nss_set_peer_hook);
++
++/*
++ * ath11k_nss_peer_event()
++ *	Tell NSS about a station appearing or going away.
++ *
++ * Called from ath11k_mac_op_sta_state().  On the way in the ath11k peer
++ * already exists - ath11k_mac_station_add() waits for the firmware's peer map
++ * before returning - so peer_id, ast_hash and hw_peer_id can be read straight
++ * out of it, which is what the NSS peer-create message needs.
++ */
++void ath11k_nss_peer_event(struct ath11k *ar, struct ieee80211_vif *vif,
++			   struct ieee80211_sta *sta, bool create)
++{
++	struct ath11k_base *ab = ar->ab;
++	struct ath11k_nss_peer info = {};
++	struct ath11k_vif *arvif;
++	struct ath11k_peer *peer;
++	ath11k_nss_peer_fn fn;
++	void *ctx;
++	int slot, ret;
++
++	if (!ath11k_nss_dp_owned(ab))
++		return;
++
++	slot = ath11k_nss_soc_slot(ab);
++	if (slot < 0)
++		return;
++
++	fn = ath11k_nss_peer_hook[slot];
++	ctx = ath11k_nss_peer_hook_ctx[slot];
++	if (!fn)
++		return;
++
++	arvif = ath11k_vif_to_arvif(vif);
++
++	spin_lock_bh(&ab->base_lock);
++	peer = ath11k_peer_find(ab, arvif->vdev_id, sta->addr);
++	if (peer) {
++		info.valid	 = 1;
++		info.peer_id	 = peer->peer_id;
++		info.vdev_id	 = peer->vdev_id;
++		info.ast_hash	 = peer->ast_hash;
++		info.hw_peer_id	 = peer->hw_peer_id;
++		/*
++		 * NSS keeps its own authorised flag and gates forwarding on
++		 * it.  Leaving this at zero - which is what the first
++		 * version did - makes the AUTHORIZED callback send an
++		 * explicit "not authorised", and the station then associates
++		 * with a working four-way handshake and no data path at all:
++		 * measured, DHCP never completing while the downlink
++		 * counters climbed.
++		 */
++		info.is_authorized = peer->is_authorized;
++		ether_addr_copy(info.mac_addr, peer->addr);
++	}
++	spin_unlock_bh(&ab->base_lock);
++
++	if (!info.valid) {
++		ath11k_warn(ab, "nss: no peer for %pM on vdev %d, not handing over\n",
++			    sta->addr, arvif->vdev_id);
++		return;
++	}
++
++	ret = fn(ctx, &info, create);
++	if (ret)
++		ath11k_warn(ab, "nss: peer %s for %pM failed (%d)\n",
++			    create ? "create" : "delete", sta->addr, ret);
++}
++EXPORT_SYMBOL(ath11k_nss_peer_event);
++
++int ath11k_nss_dp_rx_eapol(unsigned int slot, u32 radio_id,
++			   struct sk_buff *skb)
++{
++	struct ieee80211_rx_status *rx_status;
++	struct ath11k_base *ab;
++	struct ath11k_vif *arvif = NULL, *iter;
++	struct ieee80211_hdr_3addr *hdr;
++	struct ath11k *ar;
++	u8 da[ETH_ALEN], sa[ETH_ALEN];
++	__be16 ethertype;
++	u8 *llc;
++	int i;
++
++	if (skb->len < ETH_HLEN)
++		return -ENOENT;
++
++	ethertype = ((struct ethhdr *)skb->data)->h_proto;
++	if (ethertype != htons(ETH_P_PAE))
++		return -ENOENT;
++
++	ab = ath11k_nss_soc_by_slot(slot);
++	if (!ab)
++		return -ENODEV;
++
++	ar = NULL;
++	for (i = 0; i < ab->num_radios; i++)
++		if (ab->pdevs[i].ar && ab->pdevs[i].ar->pdev_idx == radio_id) {
++			ar = ab->pdevs[i].ar;
++			break;
++		}
++	if (!ar)
++		ar = ab->pdevs[0].ar;
++	if (!ar)
++		return -ENODEV;
++
++	/* The BSSID for the reconstructed header is the AP vif's own address. */
++	if (!mutex_trylock(&ar->conf_mutex))
++		return -EBUSY;
++	list_for_each_entry(iter, &ar->arvifs, list)
++		if (iter->vif && iter->vdev_type == WMI_VDEV_TYPE_AP) {
++			arvif = iter;
++			break;
++		}
++	mutex_unlock(&ar->conf_mutex);
++	if (!arvif)
++		return -ENODEV;
++
++	ether_addr_copy(da, ((struct ethhdr *)skb->data)->h_dest);
++	ether_addr_copy(sa, ((struct ethhdr *)skb->data)->h_source);
++	skb_pull(skb, ETH_HLEN);
++
++	if (skb_headroom(skb) < sizeof(*hdr) + 8 &&
++	    pskb_expand_head(skb, sizeof(*hdr) + 8, 0, GFP_ATOMIC))
++		return -ENOMEM;
++
++	/* RFC1042 SNAP, then the 802.11 header this frame arrived under. */
++	llc = skb_push(skb, 8);
++	llc[0] = 0xaa; llc[1] = 0xaa; llc[2] = 0x03;
++	llc[3] = 0x00; llc[4] = 0x00; llc[5] = 0x00;
++	memcpy(llc + 6, &ethertype, 2);
++
++	hdr = skb_push(skb, sizeof(*hdr));
++	memset(hdr, 0, sizeof(*hdr));
++	/* Uplink from a station to the AP: to-DS, addr1 BSSID, addr2 SA, addr3 DA. */
++	hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_DATA |
++					 IEEE80211_STYPE_DATA |
++					 IEEE80211_FCTL_TODS);
++	ether_addr_copy(hdr->addr1, arvif->vif->addr);
++	ether_addr_copy(hdr->addr2, sa);
++	ether_addr_copy(hdr->addr3, da);
++
++	rx_status = IEEE80211_SKB_RXCB(skb);
++	memset(rx_status, 0, sizeof(*rx_status));
++	rx_status->band = ar->rx_channel ? ar->rx_channel->band :
++					   NL80211_BAND_2GHZ;
++	rx_status->freq = ar->rx_channel ? ar->rx_channel->center_freq : 0;
++	rx_status->encoding = RX_ENC_LEGACY;
++	rx_status->rate_idx = 0;
++	/*
++	 * No RX_FLAG_DECRYPTED: during a handshake the EAPOL that carries it is
++	 * in the clear, and mac80211 lets an unprotected EAPOL through for a
++	 * station that is not yet authorised.  No RX_FLAG_8023 either - the
++	 * frame is 802.11 again by now, which is the point.
++	 */
++	ieee80211_rx_napi(ar->hw, NULL, skb, NULL);
++	return 0;
++}
++EXPORT_SYMBOL(ath11k_nss_dp_rx_eapol);
++
++int ath11k_nss_dp_reo_to_ring0(unsigned int slot)
++{
++	u32 reo_base = HAL_SEQ_WCSS_UMAC_REO_REG;
++	struct ath11k_base *ab;
++	u32 map;
++	int i;
++	static const u32 ix[] = {
++		HAL_REO1_DEST_RING_CTRL_IX_0, HAL_REO1_DEST_RING_CTRL_IX_1,
++		HAL_REO1_DEST_RING_CTRL_IX_2, HAL_REO1_DEST_RING_CTRL_IX_3,
++	};
++
++	ab = ath11k_nss_soc_by_slot(slot);
++	if (!ab)
++		return -ENODEV;
++
++	/* One nibble per hash bucket, as ath11k_hw_ipq5018_reo_setup() lays
++	 * them out, every one of them naming SW1 - which is REO destination
++	 * ring 0.
++	 */
++	map = HAL_HASH_ROUTING_RING_SW1 << 0 |
++	      HAL_HASH_ROUTING_RING_SW1 << 4 |
++	      HAL_HASH_ROUTING_RING_SW1 << 8 |
++	      HAL_HASH_ROUTING_RING_SW1 << 12 |
++	      HAL_HASH_ROUTING_RING_SW1 << 16 |
++	      HAL_HASH_ROUTING_RING_SW1 << 20 |
++	      HAL_HASH_ROUTING_RING_SW1 << 24 |
++	      HAL_HASH_ROUTING_RING_SW1 << 28;
++
++	/* Written raw, exactly as ath11k_hw_ipq5018_reo_setup() does: on this
++	 * target the whole 32-bit register is the map, unlike the IPQ8074
++	 * layout where it sits in a FIELD_PREP'd sub-field.
++	 */
++	for (i = 0; i < (int)ARRAY_SIZE(ix); i++)
++		ath11k_hif_write32(ab, reo_base + ix[i], map);
++
++	ath11k_info(ab, "nss: REO hash map narrowed to ring 0\n");
++	return 0;
++}
++EXPORT_SYMBOL(ath11k_nss_dp_reo_to_ring0);
++
++/*
++ * ath11k_nss_dp_drain_dst_ring()
++ *	Consume a destination ring's entries without interpreting them.
++ *
++ * A gate that returns before ath11k_hal_srng_access_begin() never acknowledges
++ * the ring, so a ring whose interrupt is still wired to the host re-fires for
++ * ever.  Measured: with the data path handed over, every ring's interrupt count
++ * stood still except rxdma2host-destination-ring-mac1, which climbed about 95 a
++ * second.  Worse than the wasted cycles, nothing consumes the ring - this side
++ * is gated off and NSS was never told it exists, since nss_wifili_init_msg has
++ * no field for it and pdev_init carries only the refill ring - so it fills, and
++ * a full ring leaves the hardware nowhere to post the next error descriptor.
++ *
++ * QSDK keeps these rings on the host: NSS_WIFILI_LINK_DESC_INFO_MSG travels
++ * firmware to host precisely so the host can return a link descriptor by
++ * address.  Doing that properly means returning descriptors and buffers; this
++ * drains the ring so the interrupt clears and the hardware sees space, and
++ * leaks what the entries point at.  A leak is the right trade against a stall
++ * while the question is whether the stall is what kills the firmware.
++ */
++/* Histogram of hal_reo_entr_rxdma_ecode values seen while draining. */
++static u32 ath11k_nss_rxdma_ecode[32];
++
++/*
++ * How many times the gate has run at all, as against how many entries it
++ * found.  The ring interrupt climbs about 97 a second with the data path
++ * handed over, yet every drain comes back empty - which is either the handler
++ * never running, or the hardware asserting on an empty ring.  Counting calls
++ * separates the two.
++ */
++static u32 ath11k_nss_drain_calls;
++
++void ath11k_nss_dp_drain_dst_ring(struct ath11k_base *ab, int ring_id)
++{
++	struct hal_srng *srng;
++	unsigned int n = 0;
++	void *desc;
++
++	if (ring_id < 0 || ring_id >= HAL_SRNG_RING_ID_MAX)
++		return;
++
++	srng = &ab->hal.srng_list[ring_id];
++
++	spin_lock_bh(&srng->lock);
++	ath11k_hal_srng_access_begin(ab, srng);
++	while ((desc = ath11k_hal_srng_dst_get_next_entry(ab, srng))) {
++		struct hal_reo_entrance_ring *entr = desc;
++		u32 code = FIELD_GET(HAL_REO_ENTR_RING_INFO1_RXDMA_ERROR_CODE,
++				     entr->info1);
++
++		if (code < ARRAY_SIZE(ath11k_nss_rxdma_ecode))
++			ath11k_nss_rxdma_ecode[code]++;
++		n++;
++	}
++	ath11k_hal_srng_access_end(ab, srng);
++	spin_unlock_bh(&srng->lock);
++
++	/*
++	 * Draining exists because the ring's interrupt is still wired to this
++	 * host while nothing consumes it - NSS was never told the ring exists.
++	 * The error histogram was how the rate was traced back to a baseline
++	 * that predates NSS (73-76/s with the offload mask clear), so it is not
++	 * an NSS symptom at all.  Keep the counters, but only say anything when
++	 * an entry was actually there: at 70 calls a second an unconditional
++	 * line buries every other message in the log.
++	 */
++	ath11k_nss_drain_calls++;
++
++	if (n && net_ratelimit()) {
++		char buf[128];
++		int len = 0, i;
++
++		for (i = 0; i < (int)ARRAY_SIZE(ath11k_nss_rxdma_ecode); i++)
++			if (ath11k_nss_rxdma_ecode[i])
++				len += scnprintf(buf + len, sizeof(buf) - len,
++					 " %d=%u", i,
++					 ath11k_nss_rxdma_ecode[i]);
++
++		ath11k_warn(ab, "nss: ring %d drained %u entr%s (calls=%u) ecode:%s\n",
++			    ring_id, n, n == 1 ? "y" : "ies",
++			    ath11k_nss_drain_calls, len ? buf : " none");
++	}
++}
++EXPORT_SYMBOL(ath11k_nss_dp_drain_dst_ring);
++
++bool ath11k_nss_dp_owned(struct ath11k_base *ab)
++{
++	int idx;
++
++	if (!ath11k_nss_offload_mask)
++		return false;
++
++	idx = ath11k_nss_soc_slot(ab);
++
++	return idx >= 0 && (ath11k_nss_offload_mask & BIT(idx));
++}
++EXPORT_SYMBOL(ath11k_nss_dp_owned);
++
++/*
++ * ath11k_nss_dp_refill_owned()
++ *	Is this the offloaded pdev's Rx refill ring?
++ *
++ * Only the main RXDMA refill ring goes to NSS.  The monitor rings share
++ * ath11k_dp_rxbufs_replenish() but have their own descriptor pools, so
++ * identify the ring by pointer rather than gating the whole function.
++ */
++bool ath11k_nss_dp_refill_owned(struct ath11k_base *ab, int mac_id,
++				struct dp_rxdma_ring *rx_ring)
++{
++	struct ath11k *ar;
++	int idx;
++
++	idx = ath11k_nss_soc_slot(ab);
++	if (idx < 0)
++		return false;
++
++	if (!ath11k_nss_dp_owned(ab) &&
++	    !(ath11k_nss_refill_hold & BIT(idx)))
++		return false;
++
++	ar = ath11k_ab_to_ar(ab, mac_id);
++	if (!ar)
++		return false;
++
++	return rx_ring == &ar->dp.rx_refill_buf_ring;
++}
++EXPORT_SYMBOL(ath11k_nss_dp_refill_owned);
++
++/*
++ * ath11k_nss_target_type()
++ *	ath11k's hw_rev in the numbering NSS expects.
++ *
++ * Only the two parts on this board are mapped with any confidence; the rest
++ * are the vendor driver's accepted set, listed so a different board fails
++ * loudly on an unmapped part rather than quietly sending zero.
++ */
++static u32 ath11k_nss_target_type(struct ath11k_base *ab)
++{
++	switch (ab->hw_rev) {
++	case ATH11K_HW_IPQ5018_HW10:
++		return ATH11K_NSS_TARGET_TYPE_QCA5018;
++	case ATH11K_HW_QCN6122_HW10:
++		return ATH11K_NSS_TARGET_TYPE_QCN6122;
++	case ATH11K_HW_IPQ8074:
++		return ATH11K_NSS_TARGET_TYPE_QCA8074;
++	case ATH11K_HW_IPQ6018_HW10:
++		return ATH11K_NSS_TARGET_TYPE_QCA6018;
++	case ATH11K_HW_QCN9074_HW10:
++		return ATH11K_NSS_TARGET_TYPE_QCN9000;
++	default:
++		ath11k_warn(ab, "nss probe: no NSS target type for hw_rev %d\n",
++			    ab->hw_rev);
++		return 0;
++	}
++}
++
++/*
++ * ath11k_nss_fill_srng()
++ *	Copy one ring's parameters out of dp_srng + hal_srng.
++ *
++ * A dp_srng with a zero DMA address was never allocated - the caller asked for
++ * more rings than this hardware has - and is reported as invalid rather than
++ * as a ring at address zero.
++ *
++ * mac_id and low_threshold are deliberately not exported: the vendor driver
++ * leaves both zero in the message, and matching it removes two places where a
++ * plausible-looking value could differ from what the firmware expects.
++ */
++static u32 ath11k_nss_mmio_paddr(struct ath11k_base *ab);
++
++/*
++ * ath11k_nss_reg_phys()
++ *	The physical address of a ring register, the way this radio reaches it.
++ *
++ * For a radio with a window of its own the mapping is flat: the internal
++ * QCA5018 has 16 MB at 0x0c000000 and a REO register at offset 0x00a381ec is
++ * simply 0x0ca381ec.
++ *
++ * The QCN6122 has no such window.  Its BAR arrives over QMI and is
++ * ATH11K_QMI_DEVICE_BAR_SIZE - **2 MB** - while the UMAC registers live at
++ * offset 0x00a38000, ten megabytes past its end.  ath11k reaches them through
++ * a static aperture instead (ath11k_pcic_read32 with
++ * config_static_window_qcn6122): UMAC space is mapped at
++ * ATH11K_PCI_WINDOW_START inside the BAR and indexed by the low 19 bits of the
++ * offset.
++ *
++ * Handing NSS base + offset for that radio therefore points it ten megabytes
++ * past a 2 MB window.  Nothing complains at setup - INIT, PDEV_INIT, START,
++ * the vdev and the peer are all accepted - and about 400 ms after the peer is
++ * created, when the data path is first driven, the WLAN Q6 takes a fatal
++ * error:
++ *
++ *   qcom-q6-mpd cd00000.remoteproc: fatal error received: err_smem_ver.2.1
++ *   remoteproc0: crash detected in cd00000.remoteproc: type fatal error
++ *
++ * Both radios are user PDs of that one Q6, so it takes the internal radio with
++ * it - every WMI command after that returns -108.  That is what the quiet
++ * "hardware never starts" actually was.
++ */
++static u32 ath11k_nss_reg_phys(struct ath11k_base *ab, u32 offset)
++{
++	u32 base = ath11k_nss_mmio_paddr(ab);
++
++	if (!base || !offset)
++		return 0;
++
++	/* bits 31:28 select the register space, they are not address */
++	offset &= ATH11K_REG_OFFSET_MASK;
++
++	if (!ab->hw_params.static_window_map)
++		return base + offset;
++
++	if (offset < ATH11K_PCI_WINDOW_START)
++		return base + offset;
++
++	/*
++	 * The window slots the QCN6122 co-processor uses are NOT the ones the
++	 * host CPU uses.  hal_get_window_address_6122() in the vendor driver,
++	 * decompiled from nwrt qca_ol.ko, maps the UMAC region (0xA00000) to
++	 * BAR + 0x180000 and the CE region (0x3B80000) to BAR + 0x100000 - i.e.
++	 * UMAC is the *third* 0x80000 slot, not the first.  ath11k reaches the
++	 * same registers through its own static window at 0x80000 (which is why
++	 * a CPU read-back of the ring base matched there), but NSS is a different
++	 * master and expects the vendor layout.  Giving it 0x80000 put every
++	 * ring register 1 MB low; the first frame drove the data path there and
++	 * the WLAN Q6 took a fatal error.
++	 */
++	/*
++	 * UMAC window. The vendor hal_get_window_address_6122() returns
++	 * base+0x180000 for this region, but relative to its own dev_base;
++	 * from the QMI BAR this board uses, a CPU read-back of RING_BASE_LSB
++	 * matches at 0x80000 and reads 0xffffffff at 0x180000, so 0x80000 is
++	 * the physically-backed address here. (Neither window prevents the
++	 * QCN6122 Q6 fatal at first frame - the blocker is not the mapping.)
++	 */
++	if ((offset ^ HAL_SEQ_WCSS_UMAC_OFFSET) < ATH11K_PCI_WINDOW_RANGE_MASK)
++		return base + ATH11K_PCI_WINDOW_START +
++		       (offset & ATH11K_PCI_WINDOW_RANGE_MASK);
++
++	if ((offset ^ HAL_CE_WFSS_CE_REG_BASE) < ATH11K_PCI_WINDOW_RANGE_MASK)
++		return base + 2 * ATH11K_PCI_WINDOW_START +
++		       (offset & ATH11K_PCI_WINDOW_RANGE_MASK);
++
++	ath11k_warn(ab, "nss: register offset %08x is in no static window\n",
++		    offset);
++	return 0;
++}
++
++static void ath11k_nss_fill_srng(struct ath11k_base *ab,
++				 const struct dp_srng *dp,
++				 struct ath11k_nss_srng *out)
++{
++	const struct hal_srng *srng;
++	int i;
++
++	memset(out, 0, sizeof(*out));
++
++	if (!dp || !dp->paddr || dp->ring_id >= HAL_SRNG_RING_ID_MAX)
++		return;
++
++	srng = &ab->hal.srng_list[dp->ring_id];
++	if (!srng->initialized)
++		return;
++
++	out->valid		= 1;
++	out->ring_id		= srng->ring_id;
++	out->ring_base_paddr	= lower_32_bits(srng->ring_base_paddr);
++	out->num_entries	= srng->num_entries;
++	out->entry_size		= srng->entry_size;
++	out->flags		= srng->flags;
++	out->ring_dir		= (srng->ring_dir == HAL_SRNG_DIR_SRC) ? 0 : 1;
++
++	for (i = 0; i < ATH11K_NSS_NUM_REG_GRP && i < HAL_SRNG_NUM_REG_GRP; i++)
++		/* Absolute physical address, translated per radio - see above. */
++		out->hwreg_base[i] = ath11k_nss_reg_phys(ab, srng->hwreg_base[i]);
++}
++
++/*
++ * ath11k_nss_mmio_paddr()
++ *	Physical base of the WLAN register window.
++ *
++ * ath11k keeps only the ioremap()ed pointer, so go back to the platform
++ * resource for the address NSS needs - both to program into the UBI32 and as
++ * the base every ring's hwreg_base offset is relative to.
++ */
++/*
++ * ath11k_nss_mmio_paddr()
++ *	The physical base the ring register offsets are relative to.
++ *
++ * For a radio with its own window this is simply the platform resource, and
++ * the internal QCA5018 gives 0x0c000000 over 16 MB.
++ *
++ * The QCN6122 has no window of its own.  ath11k_ahb_setup_resources() returns
++ * early for a hybrid-bus radio and never ioremaps a memory resource, so its
++ * platform resource is a zero-length placeholder - this board's device tree
++ * says reg = <0xb00a040 0x0>, and taking that as a register base points NSS at
++ * an address that is not the WLAN block at all.  Everything that does not
++ * touch a register still succeeds: INIT, PDEV_INIT, START, the vdev and the
++ * peer are all accepted, and the firmware dies on the first frame reaped for
++ * that peer, which is the first time it follows one of these addresses.
++ *
++ * The vendor device tree names the answer.  It gives both radios the same unit
++ * address and no reg for the second:
++ *
++ *   wifi@c000000  { compatible = "qcom,cnss-qca5018"; reg = <0xc000000 0x1000000>;
++ *                   qcom,userpd-subsys-name = "q6v5_wcss_userpd1"; };
++ *   wifi1@c000000 { compatible = "qcom,cnss-qcn6122";
++ *                   qcom,userpd-subsys-name = "q6v5_wcss_userpd2"; };
++ *
++ * The QCN6122 is a second user PD inside the same WCSS block and its data path
++ * lives in the same register window.  So fall back to the window of whichever
++ * registered SoC actually has one.
++ */
++#define ATH11K_NSS_MIN_WINDOW	SZ_1M
++
++static u32 ath11k_nss_window_of(struct ath11k_base *ab)
++{
++	struct platform_device *pdev;
++	struct resource *res;
++
++	if (!ab || !ab->dev || !dev_is_platform(ab->dev))
++		return 0;
++
++	pdev = to_platform_device(ab->dev);
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res || resource_size(res) < ATH11K_NSS_MIN_WINDOW)
++		return 0;
++
++	return lower_32_bits(res->start);
++}
++
++static u32 ath11k_nss_mmio_paddr(struct ath11k_base *ab)
++{
++	u32 base;
++
++	/*
++	 * ab->mem_pa is filled in wherever ab->mem is: from the platform
++	 * resource for a radio with its own window, and from the QMI device
++	 * info response for a hybrid-bus one, which is the only place the
++	 * QCN6122 base ever appears.  ath11k itself only keeps the virtual
++	 * mapping, so the field is added by this patch.
++	 */
++	if (ab && ab->mem_pa)
++		return lower_32_bits(ab->mem_pa);
++
++	base = ath11k_nss_window_of(ab);
++	if (base)
++		return base;
++
++	ath11k_warn(ab, "nss: no register window found for this radio\n");
++	return 0;
++}
++
++int ath11k_nss_get_dp_info(unsigned int idx, struct ath11k_nss_dp_info *info)
++{
++	struct ath11k_base *ab;
++	struct ath11k_dp *dp;
++	int i;
++
++	if (idx >= ATH11K_NSS_MAX_SOC || !info)
++		return -EINVAL;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	ab = ath11k_nss_soc_by_slot(idx);
++	mutex_unlock(&ath11k_nss_soc_lock);
++
++	if (!ab)
++		return -ENODEV;
++
++	dp = &ab->dp;
++	memset(info, 0, sizeof(*info));
++
++	info->dev_base_paddr	 = ath11k_nss_mmio_paddr(ab);
++	info->shadow_rdptr_paddr = lower_32_bits(ab->hal.rdp.paddr);
++	info->shadow_wrptr_paddr = lower_32_bits(ab->hal.wrp.paddr);
++	info->shadow_rdptr_vaddr = ab->hal.rdp.vaddr;
++	info->shadow_wrptr_vaddr = ab->hal.wrp.vaddr;
++	info->lmac_rings_start_id = HAL_SRNG_RING_ID_LMAC1_ID_START;
++
++	info->rx_tlv_size	= ab->hw_params.hal_desc_sz;
++	info->rx_buf_len	= DP_RX_BUFFER_SIZE - ab->hw_params.hal_desc_sz;
++	info->nss_target_type	= ath11k_nss_target_type(ab);
++	info->num_radios	= ab->num_radios;
++
++	info->num_tcl_data_rings = min_t(u8, DP_TCL_NUM_RING_MAX,
++					 ATH11K_NSS_MAX_TCL_RINGS);
++	info->num_reo_dest_rings = min_t(u8, DP_REO_DST_RING_MAX,
++					 ATH11K_NSS_MAX_REO_RINGS);
++
++	for (i = 0; i < info->num_tcl_data_rings; i++) {
++		ath11k_nss_fill_srng(ab, &dp->tx_ring[i].tcl_data_ring,
++				     &info->tcl_ring[i]);
++		ath11k_nss_fill_srng(ab, &dp->tx_ring[i].tcl_comp_ring,
++				     &info->tx_comp_ring[i]);
++	}
++
++	for (i = 0; i < info->num_reo_dest_rings; i++)
++		ath11k_nss_fill_srng(ab, &dp->reo_dst_ring[i],
++				     &info->reo_dest_ring[i]);
++
++	ath11k_nss_fill_srng(ab, &dp->reo_except_ring,
++			     &info->reo_exception_ring);
++	ath11k_nss_fill_srng(ab, &dp->rx_rel_ring, &info->rx_rel_ring);
++	ath11k_nss_fill_srng(ab, &dp->reo_reinject_ring,
++			     &info->reo_reinject_ring);
++
++	/*
++	 * Per-radio state.  ath11k allocates the RXDMA refill ring per pdev and
++	 * numbers it by mac_id, which is not the same as the pdev index on
++	 * hardware with an offset - use ath11k's own mapping rather than
++	 * assuming they coincide.
++	 */
++	for (i = 0; i < ab->num_radios && i < ATH11K_NSS_MAX_PDEV; i++) {
++		struct ath11k *ar = ab->pdevs[i].ar;
++		struct ath11k_nss_pdev *p = &info->pdev[i];
++
++		if (!ar)
++			continue;
++
++		p->valid	  = 1;
++		p->radio_id	  = i;
++		p->lmac_id	  = ar->dp.mac_id;
++		p->target_pdev_id = ab->pdevs[i].pdev_id;
++		p->num_rx_swdesc  = ar->dp.rx_refill_buf_ring.bufs_max;
++
++		ath11k_nss_fill_srng(ab, &ar->dp.rx_refill_buf_ring.refill_buf_ring,
++				     &p->rxdma_ring);
++	}
++
++	info->dma_dev = ab->dev;
++
++	return 0;
++}
++EXPORT_SYMBOL(ath11k_nss_get_dp_info);
++
++/*
++ * ath11k_nss_opmode()
++ *	ath11k's vdev type in the numbering NSS expects.
++ */
++static u32 ath11k_nss_opmode(u32 vdev_type)
++{
++	switch (vdev_type) {
++	case WMI_VDEV_TYPE_AP:
++		return ATH11K_NSS_OPMODE_AP;
++	case WMI_VDEV_TYPE_STA:
++		return ATH11K_NSS_OPMODE_STA;
++	case WMI_VDEV_TYPE_IBSS:
++		return ATH11K_NSS_OPMODE_IBSS;
++	case WMI_VDEV_TYPE_MONITOR:
++		return ATH11K_NSS_OPMODE_MONITOR;
++	default:
++		return ATH11K_NSS_OPMODE_UNKNOWN;
++	}
++}
++
++int ath11k_nss_get_vifs(unsigned int idx, struct ath11k_nss_vif *out,
++			unsigned int max)
++{
++	struct ath11k_base *ab;
++	unsigned int n = 0;
++	int i;
++
++	if (idx >= ATH11K_NSS_MAX_SOC || !out || !max)
++		return -EINVAL;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	ab = ath11k_nss_soc_by_slot(idx);
++	mutex_unlock(&ath11k_nss_soc_lock);
++
++	if (!ab)
++		return -ENODEV;
++
++	for (i = 0; i < ab->num_radios && n < max; i++) {
++		struct ath11k *ar = ab->pdevs[i].ar;
++		struct ath11k_vif *arvif;
++
++		if (!ar)
++			continue;
++
++		/*
++		 * ar->arvifs is protected by conf_mutex, which mac80211 holds
++		 * across its own operations.  Report a busy lock rather than
++		 * block a debugfs write behind it.
++		 */
++		if (!mutex_trylock(&ar->conf_mutex))
++			return -EBUSY;
++
++		list_for_each_entry(arvif, &ar->arvifs, list) {
++			if (n >= max)
++				break;
++			if (!arvif->vif)
++				continue;
++
++			memset(&out[n], 0, sizeof(out[n]));
++			out[n].valid	   = 1;
++			ether_addr_copy(out[n].mac_addr, arvif->vif->addr);
++			out[n].vdev_id	   = arvif->vdev_id;
++			out[n].nss_opmode  = ath11k_nss_opmode(arvif->vdev_type);
++			out[n].is_up	   = arvif->is_up;
++			out[n].netdev	   = arvif->vif ?
++				ieee80211_vif_to_wdev(arvif->vif)->netdev : NULL;
++			out[n].radio_id	   = i;
++			n++;
++		}
++
++		mutex_unlock(&ar->conf_mutex);
++	}
++
++	return n;
++}
++EXPORT_SYMBOL(ath11k_nss_get_vifs);
++
++int ath11k_nss_get_peers(unsigned int idx, struct ath11k_nss_peer *out,
++			 unsigned int max)
++{
++	struct ath11k_base *ab;
++	struct ath11k_peer *peer;
++	unsigned int n = 0;
++
++	if (idx >= ATH11K_NSS_MAX_SOC || !out || !max)
++		return -EINVAL;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	ab = ath11k_nss_soc_by_slot(idx);
++	mutex_unlock(&ath11k_nss_soc_lock);
++
++	if (!ab)
++		return -ENODEV;
++
++	spin_lock_bh(&ab->base_lock);
++	list_for_each_entry(peer, &ab->peers, list) {
++		if (n >= max)
++			break;
++
++		memset(&out[n], 0, sizeof(out[n]));
++		out[n].valid	     = 1;
++		ether_addr_copy(out[n].mac_addr, peer->addr);
++		out[n].peer_id	     = peer->peer_id;
++		out[n].vdev_id	     = peer->vdev_id;
++		out[n].ast_hash	     = peer->ast_hash;
++		out[n].hw_peer_id    = peer->hw_peer_id;
++		out[n].is_authorized = peer->is_authorized;
++		n++;
++	}
++	spin_unlock_bh(&ab->base_lock);
++
++	return n;
++}
++EXPORT_SYMBOL(ath11k_nss_get_peers);
++
++/*
++ * The Tx hook, and counters for the frames ath11k could not hand over.  A
++ * frame arriving here that is not 802.3 means the radio is not in Ethernet
++ * frame mode, which is a configuration problem rather than a per-packet one -
++ * hence the rate-limited warning rather than a counter nobody reads.
++ */
++static ath11k_nss_tx_fn ath11k_nss_tx_hook[ATH11K_NSS_MAX_SOC];
++static void *ath11k_nss_tx_hook_ctx[ATH11K_NSS_MAX_SOC];
++
++void ath11k_nss_dp_set_tx_hook(unsigned int idx, ath11k_nss_tx_fn fn, void *ctx)
++{
++	if (idx >= ATH11K_NSS_MAX_SOC)
++		return;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	ath11k_nss_tx_hook[idx] = fn;
++	ath11k_nss_tx_hook_ctx[idx] = ctx;
++	mutex_unlock(&ath11k_nss_soc_lock);
++}
++EXPORT_SYMBOL(ath11k_nss_dp_set_tx_hook);
++
++/*
++ * ath11k_nss_80211_to_8023()
++ *	Rewrite an 802.11 data frame as 802.3, in place.
++ *
++ * cfg80211's ieee80211_data_to_8023() is an Rx helper: its AP branch expects a
++ * ToDS frame, and a frame an AP is transmitting is FromDS, so it rejects these
++ * outright.  Doing it directly also makes the address mapping explicit -
++ * ieee80211_get_DA/SA already know which of addr1..3 to use in each direction.
++ *
++ * The trick with the ethertype: after pulling the 802.11 header and the first
++ * six bytes of the RFC 1042 header, skb->data sits on the two ethertype bytes,
++ * so pushing twelve bytes of addresses in front of them completes an Ethernet
++ * header with no copying of the payload.
++ */
++static int ath11k_nss_80211_to_8023(struct sk_buff *skb)
++{
++	static const u8 rfc1042[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
++	struct ieee80211_hdr *hdr = (void *)skb->data;
++	u8 da[ETH_ALEN], sa[ETH_ALEN];
++	unsigned int hdrlen, payload;
++	bool snap;
++	u8 *eth;
++
++	hdrlen = ieee80211_hdrlen(hdr->frame_control);
++	if (skb->len < hdrlen)
++		return -EINVAL;
++
++	payload = skb->len - hdrlen;
++	snap = payload >= 8 &&
++	       !memcmp(skb->data + hdrlen, rfc1042, sizeof(rfc1042));
++
++	ether_addr_copy(da, ieee80211_get_DA(hdr));
++	ether_addr_copy(sa, ieee80211_get_SA(hdr));
++
++	if (snap) {
++		/*
++		 * RFC1042: drop the SNAP header and let the two ethertype
++		 * bytes that follow it become the ethernet type field.
++		 */
++		skb_pull(skb, hdrlen + sizeof(rfc1042));
++	} else {
++		/*
++		 * A plain 802.2 frame, which is what mac80211's
++		 * ieee80211_send_layer2_update() sends when a station joins a
++		 * bridged AP: destination broadcast, source the station, and
++		 * six bytes of LLC XID - 00 01 af 81 01 00.  Its purpose is to
++		 * make bridges relearn the station's port at once, so dropping
++		 * it costs exactly the thing this whole path is for.
++		 *
++		 * In 802.3 such a frame carries the payload length where an
++		 * ethertype would be, which is what ieee80211_data_to_8023()
++		 * does for a non-SNAP payload.  Build the same.
++		 */
++		if (payload > ETH_DATA_LEN)
++			return -EINVAL;
++
++		skb_pull(skb, hdrlen);
++	}
++
++	if (skb_headroom(skb) < 2 * ETH_ALEN + (snap ? 0 : 2))
++		return -ENOMEM;
++
++	if (!snap)
++		put_unaligned_be16(payload, skb_push(skb, 2));
++
++	eth = skb_push(skb, 2 * ETH_ALEN);
++	ether_addr_copy(eth, da);
++	ether_addr_copy(eth + ETH_ALEN, sa);
++
++	return 0;
++}
++
++int ath11k_nss_dp_tx(struct ath11k_vif *arvif, struct sk_buff *skb,
++		     bool eth_encap)
++{
++	struct ath11k_base *ab;
++	ath11k_nss_tx_fn fn;
++	void *ctx;
++	int idx, ret;
++
++	if (!arvif || !arvif->ar || !arvif->vif)
++		return -ENODEV;
++
++	ab = arvif->ar->ab;
++	idx = ath11k_nss_soc_slot(ab);
++	if (idx < 0)
++		return -ENODEV;
++
++	fn = ath11k_nss_tx_hook[idx];
++	ctx = ath11k_nss_tx_hook_ctx[idx];
++	if (!fn)
++		return -ESHUTDOWN;
++
++	if (!eth_encap) {
++		struct ieee80211_hdr *hdr = (void *)skb->data;
++
++		/*
++		 * mac80211 sends control-port frames as 802.11 data even with
++		 * encap offload on, so the EAPOL of a WPA2 handshake lands
++		 * here.  Convert rather than drop: dropping it means no
++		 * station ever gets authorised, and an unauthorised peer is
++		 * one whose traffic NSS is supposed to refuse.
++		 *
++		 * Management frames never reach this path - ath11k sends them
++		 * over WMI - so anything else here is not something to guess
++		 * about.
++		 */
++		if (!ieee80211_is_data(hdr->frame_control))
++			return -EOPNOTSUPP;
++
++		/*
++		 * A null-data frame is a frame with no payload: mac80211 sends
++		 * them to probe a station and to drive power save, and there
++		 * is nothing in one to convert or to forward.  NSS runs its own
++		 * power-save handling for the peers it owns, so swallow these -
++		 * reporting failure instead just fills the log with -EINVAL
++		 * from the length check below, once per station poll.
++		 */
++		if (ieee80211_is_nullfunc(hdr->frame_control) ||
++		    ieee80211_is_qos_nullfunc(hdr->frame_control)) {
++			dev_kfree_skb_any(skb);
++			return 0;
++		}
++
++		ret = ath11k_nss_80211_to_8023(skb);
++		if (ret) {
++			/*
++			 * Log this loudly, not at debug level.  Every firmware
++			 * trap so far has been preceded by one of these twenty
++			 * to forty milliseconds earlier, and every run without
++			 * one has been stable - across a dozen runs.  The frame
++			 * is rejected here and never reaches NSS, so it should
++			 * not be able to cause the trap, which makes knowing
++			 * exactly what it is worth the log line.
++			 */
++			if (net_ratelimit()) {
++				ath11k_warn(ab,
++					    "nss: tx convert failed %d fc=%04x len=%u hdrlen=%u\n",
++					    ret, le16_to_cpu(hdr->frame_control),
++					    skb->len,
++					    ieee80211_hdrlen(hdr->frame_control));
++				print_hex_dump(KERN_WARNING, "ath11k nss tx: ",
++					       DUMP_PREFIX_OFFSET, 16, 1,
++					       skb->data,
++					       min_t(unsigned int, skb->len, 32u),
++					       false);
++			}
++			return ret;
++		}
++	}
++
++	return fn(ctx, skb, arvif->vdev_id);
++}
++EXPORT_SYMBOL(ath11k_nss_dp_tx);
++
++int ath11k_nss_dp_quiesce(unsigned int idx, bool quiesce)
++{
++	struct ath11k_base *ab;
++	int ret = 0;
++
++	if (idx >= ATH11K_NSS_MAX_SOC)
++		return -EINVAL;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++
++	ab = ath11k_nss_soc_by_slot(idx);
++	if (!ab) {
++		ret = -ENODEV;
++		goto out;
++	}
++
++	if (ath11k_nss_quiesced[idx] == quiesce)
++		goto out;
++
++	/*
++	 * ath11k_hif_irq_disable() maps to the ext irq groups, which carry the
++	 * REO, TCL completion and RXDMA interrupts and their NAPI contexts.
++	 * The copy engines are a separate set of ops and keep running, so WMI
++	 * and HTT survive this - which they must, since the WLAN firmware still
++	 * owns peer and vdev state.
++	 */
++	if (quiesce)
++		ath11k_hif_irq_disable(ab);
++	else
++		ath11k_hif_irq_enable(ab);
++
++	ath11k_nss_quiesced[idx] = quiesce;
++	ath11k_info(ab, "nss probe: data path %s\n",
++		    quiesce ? "quiesced" : "resumed");
++
++out:
++	mutex_unlock(&ath11k_nss_soc_lock);
++	return ret;
++}
++EXPORT_SYMBOL(ath11k_nss_dp_quiesce);
++
++/*
++ * ---------------------------------------------------------------------------
++ * Lifecycle: driving the handover from ath11k rather than from a script.
++ *
++ * The handover has one hard ordering constraint, learned the expensive way:
++ * every ring NSS is going to own must be described to it while nothing can
++ * deliver into them.  Doing it after the radio is up leaves a window between
++ * "ath11k's rings are live" and "NSS owns the refill ring", and whether a
++ * frame lands in that window depends on ambient RF traffic - which is why the
++ * same configuration used to succeed one run and trap the firmware the next.
++ *
++ * ath11k_core_pdev_create() closes that window by construction.  It runs after
++ * ath11k_dp_pdev_alloc(), so every ring exists, and before ath11k_mac_register()
++ * and ath11k_hif_irq_enable(), so mac80211 has never seen the radio and the
++ * data-path interrupts are still masked.  There is no earlier or quieter point.
++ */
++static ath11k_nss_dp_ready_fn ath11k_nss_ready_hook;
++static void *ath11k_nss_ready_ctx;
++static DECLARE_WAIT_QUEUE_HEAD(ath11k_nss_ready_wq);
++
++/*
++ * How long to wait for the module that talks to NSS to register.
++ *
++ * Generous on purpose.  The NSS core is brought up from an init script, not
++ * from modules.d: it insmods qca-nss-drv, waits for the core to finish
++ * booting, and only then loads the clients - so the module that answers this
++ * hook cannot exist until well after ath11k's QMI worker gets here.  Waiting
++ * costs a late phy registration; not waiting costs the handover.
++ */
++#define ATH11K_NSS_READY_WAIT_MS	90000
++
++void ath11k_nss_set_dp_ready_hook(ath11k_nss_dp_ready_fn fn, void *ctx)
++{
++	mutex_lock(&ath11k_nss_soc_lock);
++	ath11k_nss_ready_hook = fn;
++	ath11k_nss_ready_ctx = ctx;
++	mutex_unlock(&ath11k_nss_soc_lock);
++
++	wake_up_all(&ath11k_nss_ready_wq);
++}
++EXPORT_SYMBOL(ath11k_nss_set_dp_ready_hook);
++
++/*
++ * ath11k_nss_dp_ready()
++ *	The data path of this SoC is built and untouchable.  Hand it over.
++ *
++ * Called from ath11k_core_pdev_create() with ab->core_lock held.  Blocking is
++ * fine here - this is the QMI worker, and nothing downstream of it can run
++ * until it returns.
++ *
++ * On any failure the SoC's bit is cleared from the offload mask, which puts
++ * every gate in the Rx and Tx paths back on the host side.  A board whose
++ * offload could not be set up comes up as a plain ath11k board rather than
++ * with a data path nobody is driving.
++ */
++void ath11k_nss_dp_ready(struct ath11k_base *ab)
++{
++	ath11k_nss_dp_ready_fn fn;
++	void *ctx;
++	int slot, ret;
++
++	slot = ath11k_nss_soc_slot(ab);
++	if (slot < 0 || !(ath11k_nss_offload_mask & BIT(slot)))
++		return;
++
++	/*
++	 * Wait rather than race.  This is the QMI worker; blocking it delays
++	 * ath11k_mac_register() and nothing else, and the radio does not exist
++	 * for userspace until that returns - which is exactly the property the
++	 * handover needs.
++	 */
++	if (!READ_ONCE(ath11k_nss_ready_hook))
++		ath11k_info(ab, "nss: waiting for the offload module before registering slot %d\n",
++			    slot);
++
++	if (!READ_ONCE(ath11k_nss_ready_hook) &&
++	    !wait_event_timeout(ath11k_nss_ready_wq,
++				READ_ONCE(ath11k_nss_ready_hook) != NULL,
++				msecs_to_jiffies(ATH11K_NSS_READY_WAIT_MS))) {
++		ath11k_warn(ab, "nss: no offload module registered after %u ms; slot %d stays on the host path\n",
++			    ATH11K_NSS_READY_WAIT_MS, slot);
++		ath11k_nss_offload_mask &= ~BIT(slot);
++		return;
++	}
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	fn = ath11k_nss_ready_hook;
++	ctx = ath11k_nss_ready_ctx;
++	mutex_unlock(&ath11k_nss_soc_lock);
++
++	ath11k_info(ab, "nss: handing the data path of slot %d over\n", slot);
++
++	ret = fn ? fn(ctx, slot) : -ENODEV;
++	if (ret) {
++		ath11k_warn(ab, "nss: handover of slot %d failed (%d); falling back to the host data path\n",
++			    slot, ret);
++		ath11k_nss_offload_mask &= ~BIT(slot);
++		return;
++	}
++
++	ath11k_info(ab, "nss: slot %d data path is NSS-owned\n", slot);
++}
++EXPORT_SYMBOL(ath11k_nss_dp_ready);
++
++/*
++ * ---------------------------------------------------------------------------
++ * The vdev half.
++ */
++static ath11k_nss_vif_fn ath11k_nss_vif_hook[ATH11K_NSS_MAX_SOC];
++static void *ath11k_nss_vif_hook_ctx[ATH11K_NSS_MAX_SOC];
++
++void ath11k_nss_set_vif_hook(unsigned int slot, ath11k_nss_vif_fn fn, void *ctx)
++{
++	if (slot >= ATH11K_NSS_MAX_SOC)
++		return;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	ath11k_nss_vif_hook[slot] = fn;
++	ath11k_nss_vif_hook_ctx[slot] = ctx;
++	mutex_unlock(&ath11k_nss_soc_lock);
++}
++EXPORT_SYMBOL(ath11k_nss_set_vif_hook);
++
++/*
++ * ath11k_nss_vif_event()
++ *	Tell NSS about a virtual device appearing or going away.
++ *
++ * Called from ath11k_mac_op_add_interface() once the vdev exists and its self
++ * peer has been created, and from ath11k_mac_op_remove_interface() before the
++ * vdev is deleted.  ar->conf_mutex is held both times, so the callee must not
++ * call back into ath11k_nss_get_vifs() - everything it needs is here.
++ *
++ * The netdev matters as much as the vdev id.  An excepted frame has to be
++ * handed back on the interface it arrived on or the bridge never sees it, and
++ * ECM maps a netdev to an NSS interface number through this registration,
++ * which is the prerequisite for a wifi flow being accelerated at all.
++ */
++void ath11k_nss_vif_event(struct ath11k *ar, struct ieee80211_vif *vif,
++			  bool add)
++{
++	struct ath11k_base *ab = ar->ab;
++	struct ath11k_vif *arvif;
++	struct ath11k_nss_vif out;
++	struct wireless_dev *wdev;
++	ath11k_nss_vif_fn fn;
++	void *ctx;
++	int slot, i;
++
++	slot = ath11k_nss_soc_slot(ab);
++	if (slot < 0 || !(ath11k_nss_offload_mask & BIT(slot)))
++		return;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	fn = ath11k_nss_vif_hook[slot];
++	ctx = ath11k_nss_vif_hook_ctx[slot];
++	mutex_unlock(&ath11k_nss_soc_lock);
++
++	if (!fn || !vif)
++		return;
++
++	arvif = ath11k_vif_to_arvif(vif);
++	wdev = ieee80211_vif_to_wdev(vif);
++
++	memset(&out, 0, sizeof(out));
++	out.valid = 1;
++	ether_addr_copy(out.mac_addr, vif->addr);
++	out.vdev_id = arvif->vdev_id;
++	out.nss_opmode = ath11k_nss_opmode(arvif->vdev_type);
++	out.is_up = arvif->is_up;
++	out.netdev = wdev ? wdev->netdev : NULL;
++
++	out.radio_id = 0;
++	for (i = 0; i < ab->num_radios; i++)
++		if (ab->pdevs[i].ar == ar) {
++			out.radio_id = i;
++			break;
++		}
++
++	ath11k_dbg(ab, ATH11K_DBG_MAC, "nss: vif %s vdev %u opmode %u dev %s\n",
++		   add ? "add" : "del", out.vdev_id, out.nss_opmode,
++		   out.netdev ? out.netdev->name : "(none)");
++
++	fn(ctx, &out, add);
++}
++EXPORT_SYMBOL(ath11k_nss_vif_event);
++
++/*
++ * ath11k_nss_dp_htt_refill_setup()
++ *	Tell the WLAN firmware where the RXDMA refill ring is, again.
++ *
++ * ath11k announces it once, from ath11k_dp_rx_pdev_alloc(), long before the
++ * handover.  On the QCN6122 the receive path is dead afterwards in a very
++ * specific way: management frames still arrive - a station reaches
++ * "associated" over WMI on the copy engines - while no data frame ever reaches
++ * RXDMA, the hardware tail never moves and REO produces nothing.  Everything
++ * about the ring description is identical to the internal radio's, which does
++ * work, so the difference is not what NSS was told but what that radio's
++ * firmware still believes.
++ *
++ * Re-sending the HTT ring configuration is the cheapest way to find out
++ * whether it simply needs telling again once the ring changed hands.
++ */
++int ath11k_nss_dp_htt_refill_setup(unsigned int slot)
++{
++	struct ath11k_base *ab;
++	int i, ret = 0;
++
++	mutex_lock(&ath11k_nss_soc_lock);
++	ab = ath11k_nss_soc_by_slot(slot);
++	mutex_unlock(&ath11k_nss_soc_lock);
++
++	if (!ab)
++		return -ENODEV;
++
++	for (i = 0; i < ab->num_radios; i++) {
++		struct ath11k *ar = ab->pdevs[i].ar;
++		int ring_id;
++
++		if (!ar)
++			continue;
++
++		ring_id = ar->dp.rx_refill_buf_ring.refill_buf_ring.ring_id;
++		ret = ath11k_dp_tx_htt_srng_setup(ab, ring_id, ar->dp.mac_id,
++						  HAL_RXDMA_BUF);
++		ath11k_info(ab, "nss: re-announced refill ring %d (mac %d) -> %d\n",
++			    ring_id, ar->dp.mac_id, ret);
++		if (ret)
++			break;
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL(ath11k_nss_dp_htt_refill_setup);

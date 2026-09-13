@@ -1,0 +1,24 @@
+# ath11k parameters that must be in place before the driver probes.
+#
+# nss_refill_hold  bitmask of NSS slots whose Rx refill ring ath11k must never
+#                  fill.  ath11k fills it in ath11k_dp_pdev_alloc(), at core
+#                  start, long before anything sets nss_offload_mask from
+#                  userspace, and the RXDMA hardware caches sixteen of those
+#                  host buffers and spends them on the first sixteen frames it
+#                  receives.  NSS cannot resolve a host cookie against its own
+#                  descriptor pool, so it drops those frames - which costs four
+#                  failed associations - and frees them into its own pool, which
+#                  later trips its Tx free path over a NULL buffer and traps the
+#                  core.  Holding the ring empty leaves nothing to cache.
+#                  3 = both radios.  A held radio cannot receive until NSS takes
+#                  the ring over, so its boot-time AP fails and comes up on the
+#                  arm script instead.
+#
+# frame_mode=2     Ethernet encap/decap rather than native wifi.  The probe
+#                  tells NSS DECAP_TYPE=2, and with native wifi the frames NSS
+#                  received were 802.11 + RFC1042 SNAP, which it cannot parse -
+#                  so it matched no rule and excepted every one of them to
+#                  Linux.  Measured: 138 Mbit/s at 41% CPU before, 121-152 at
+#                  2.8% after, and host deliveries per 268 MB fell from 131343
+#                  to 11.
+ath11k nss_refill_hold=3 frame_mode=2

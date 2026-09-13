@@ -13,13 +13,22 @@ CPU is the two Cortex-A53 host cores; the NSS UBI32 core is separate.
 |---|---|---|---|
 | **Wired → WAN** | **944 / 949 Mbps @ 0 % CPU** | 924 / 926 @ 4 % | 502 @ 100 % (DSA) |
 | WiFi link itself (HE80 2×2) | 641 / 470 Mbps | — | — |
-| WiFi → WAN | 92 Mbps | ~624 Mbps | 308 Mbps |
+| **WiFi 5 GHz → WAN** | **226–337 / 121–197 Mbps @ 3–4.5 % CPU** | ~624 Mbps | 308 Mbps |
+| **WiFi 2.4 GHz → WAN** | **74 / 69 Mbps @ 3.1 % CPU** | – | – |
 | MemAvailable, everything up | 18–20 MB | 36 MB | — |
 
 Wired forwarding runs at line rate with the host CPU **completely idle** — the
-packets never enter Linux. WiFi forwarding does not, and
-[docs/FINDINGS.md](docs/FINDINGS.md) explains exactly why; it is a structural
-consequence of ath11k not being an NSS-managed interface, not a tuning problem.
+packets never enter Linux. **WiFi forwarding now does too**, on both radios and
+in both directions: the host sees about a hundred frames per gigabyte and the
+rest is forwarded inside the NSS core.
+
+An earlier version of this file said WiFi offload was a structural consequence
+of ath11k not being an NSS-managed interface and could not be fixed by tuning.
+That was wrong. It is fixed; [docs/WIFILI.md](docs/WIFILI.md) is what it took
+and what is still open. The numbers above are the forwarded path only — a client
+on WiFi, through the router with NAT, to a wired host — because traffic sourced
+on the router itself measures its own userspace and says nothing about the
+offload.
 
 ## What works
 
