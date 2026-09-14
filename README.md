@@ -6,16 +6,23 @@ built from Qualcomm's own QSDK 14.0 sources rather than a vendor SDK fork.
 
 ## Measured on hardware
 
-Forwarding is LAN/WiFi → router → WAN, iperf3, 4 streams.
+Forwarding is LAN/WiFi → router → WAN, iperf3 `-P 4`, 15 s per direction.
 CPU is the two Cortex-A53 host cores; the NSS UBI32 core is separate.
 
 | Path | This build | nwrt (vendor stack) | Stock OpenWrt |
 |---|---|---|---|
-| **Wired → WAN** | **944 / 949 Mbps @ 0 % CPU** | 924 / 926 @ 4 % | 502 @ 100 % (DSA) |
+| **Wired ↔ WAN** | **949 up / 949 down Mbps, +0 % CPU** | 924 / 926 @ 4 % | 502 @ 100 % (DSA) |
 | WiFi link itself (HE80 2×2) | 641 / 470 Mbps | — | — |
-| **WiFi 5 GHz → WAN** | **226–337 / 121–197 Mbps @ 3–4.5 % CPU** | ~624 Mbps | 308 Mbps |
-| **WiFi 2.4 GHz → WAN** | **74 / 69 Mbps @ 3.1 % CPU** | – | – |
+| **WiFi 5 GHz ↔ WAN** | **510 up / 438 down Mbps, +0.3 % CPU** | ~624 Mbps @ 25–35 % | 308 Mbps |
+| **WiFi 2.4 GHz ↔ WAN** | **58 up / 61 down Mbps, +0.3 % CPU** | – | – |
 | MemAvailable, everything up | 18–20 MB | 36 MB | — |
+
+The CPU column is incremental: `/proc/stat` is sampled once a second through
+the run and the idle baseline of the same capture is subtracted, because the
+sampler itself costs 2–5 % on these cores. Wired lands at or below its own
+baseline — 949 Mbps costs nothing the measurement can resolve. nwrt's WiFi
+figure is about 20 % faster than this build and carries 25–35 % host CPU with
+it.
 
 Wired forwarding runs at line rate with the host CPU **completely idle** — the
 packets never enter Linux. **WiFi forwarding now does too**, on both radios and
@@ -41,8 +48,9 @@ offload.
 
 ## Known limitations
 
-- **WiFi forwarding is capped at ~92 Mbps** while NSS is loaded. Disabling NSS
-  raises it to ~308 Mbps but drops wired to ~610 Mbps. See FINDINGS.
+- WiFi offload is armed by a script after boot rather than by an init script,
+  and a held radio cannot receive until it runs. See
+  [docs/WIFILI.md](docs/WIFILI.md).
 - **Memory is tight.** 256 MB board; ath11k's data-path rings are patched down
   from the upstream sizes or nothing fits alongside NSS.
 - Monitor-mode capture on the radios is effectively disabled by those ring sizes.

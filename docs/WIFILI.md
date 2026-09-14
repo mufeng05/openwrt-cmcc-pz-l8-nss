@@ -10,15 +10,27 @@ Forwarded path only — a client on WiFi, through the router with NAT, to a wire
 host on the WAN side. That is what NSS accelerates; a `dd | nc` sourced on the
 router itself measures its own userspace and says nothing about the offload.
 
-| | Down | Up | Router CPU |
+iperf3 `-P 4`, 15 s per direction — the same shape as the wired numbers in
+the README, so the two are comparable.
+
+| | Down | Up | Router CPU, loaded / idle baseline |
 |---|---|---|---|
-| 5 GHz (QCN6122, HE80 2×2, 1201 Mbps link) | 226–337 Mbit/s | 121–197 Mbit/s | 3–4.5 % |
-| 2.4 GHz (IPQ5018, 287 Mbps link) | 74 Mbit/s | 69 Mbit/s | 3.1 % |
+| 5 GHz (QCN6122, HE80 2×2, 1201 Mbps link) | 438 Mbit/s | 510 Mbit/s | 4.2 % / 4.0 % |
+| 2.4 GHz (IPQ5018, 287 Mbps link) | 61 Mbit/s | 58 Mbit/s | 4.3 % / 3.9 % |
+| wired, for reference | 949 Mbit/s | 949 Mbit/s | 4.5 % / 5.5 % |
 
 One association each, `tx_fail 0`, zero NSS traps, zero Oops. The host sees
 about 100 frames per gigabyte — everything else is forwarded inside NSS.
 
-The CPU is no longer the limit at these rates; the air and the client are.
+Both halves of the CPU figure are given because the per-second sampler costs
+2–5 % on these cores by itself; what forwarding adds is the difference, 0.3 %
+on either radio and nothing measurable on wired.
+
+A single stream gets 226–337 down and 121–197 up on 5 GHz at the same CPU.
+That is the stream, not the offload. An earlier revision of this file quoted
+those single-stream numbers under a 4-stream heading.
+
+The CPU is not the limit at these rates; the air and the client are.
 
 ## The two things that had to be right
 
