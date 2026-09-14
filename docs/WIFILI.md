@@ -116,23 +116,23 @@ straight to `nss_wifi_vdev_tx_buf()`. State lives on `struct ath11k_base`
 instead of in a slot-indexed array, and nothing is reached through a function
 pointer.
 
-Both implementations are in the image while the port is being finished, and
-`nss_inbuilt` picks between them:
+The two ran side by side on one build for as long as it took to show they
+were equivalent, picked by a module parameter:
 
-```
-ath11k nss_inbuilt=1 nss_offload_mask=3 nss_refill_hold=3 frame_mode=2
-```
+| 5 GHz | uplink | downlink |
+|---|---|---|
+| probe, 4 runs | 529 Mbit/s | 412 (373-431) |
+| in-driver, 3 runs | 544 | 390 (332-421) |
 
-Measured with it set, against the probe path on the same build:
+The uplink is a little higher and the downlink a little lower, both inside the
+spread of either path on its own - the probe's own downlink covers 373 to 431.
+So the switch and the four hooks it chose between are gone, and the driver is
+the only implementation.
 
-| | uplink | downlink | host frames |
-|---|---|---|---|
-| probe | 503 Mbit/s | 456 Mbit/s | |
-| in-driver | 540-547 | 332-421 | 3199 of 749431 |
-
-CPU is 0.1-1.9 % over the idle baseline, 2.4 GHz does 70/57 Mbit/s, and there
-are no traps on either radio. 3199 host frames per 1.5 GB is the offload
-working: everything else is forwarded inside NSS.
+Measured without them: 521 / 411 Mbit/s on 5 GHz over three runs, 53/36 on
+2.4 GHz, no traps, and 4006 frames reached Linux out of roughly 1.5 GB of
+traffic. That last number is the offload working - everything else was
+forwarded inside NSS.
 
 ### What the port got wrong, and how it showed
 
@@ -162,11 +162,19 @@ data=58 ext=226 noab=0 short=0 eapol=2 up=282 extdrop=0
 
 `extdrop` non-zero with traffic flowing is this bug returning.
 
-### Still the probe's
+### What is left of the probe
 
-Nothing yet: vdev, peer and Tx are all in the driver. What remains is removing
-the four hook sets and the 90 s wait, after which the probe stops being able to
-drive a handover and becomes what it should be - an instrument.
+`nss_export.c` stays: it reads ath11k's ring layout into the flat form the NSS
+messages want, and that is as useful to an instrument as to the driver.
+`nss_wifili_probe` keeps it and can still drive the whole sequence by hand
+through its debugfs interface, which is how most of what is known about this
+firmware was established. What it can no longer do is attach itself to ath11k's
+events and own the data path - the four function pointers that let it are gone,
+and so is the 90 s wait for a module to turn up and claim them.
+
+It is not in the default image. It is kept because its comments record several
+dozen hypotheses that were tested and refuted, and that is worth more than the
+code around them.
 
 ## The Rx descriptor pool
 

@@ -1,4 +1,4 @@
-ath11k: export the data-path ring layout for an NSS wifili probe
+ath11k: NSS wifili offload
 
 NSS's wifili offload wants the WLAN data-path rings described to it -
 physical base, geometry and register bases for the TCL, TX completion,
@@ -85,7 +85,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
  
  	struct {
  		enum ath11k_bus bus;
-@@ -1360,4 +1365,33 @@
+@@ -1360,4 +1365,32 @@
  
  void ath11k_core_pm_notifier_unregister(struct ath11k_base *ab);
  
@@ -110,7 +110,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +int ath11k_nss_soc_slot(struct ath11k_base *ab);
 +bool ath11k_nss_dp_refill_owned(struct ath11k_base *ab, int mac_id,
 +				struct dp_rxdma_ring *rx_ring);
-+typedef int (*ath11k_nss_tx_fn)(void *ctx, struct sk_buff *skb, u32 vdev_id);
 +struct ath11k_vif;
 +int ath11k_nss_dp_tx(struct ath11k_vif *arvif, struct sk_buff *skb,
 +			 bool eth_encap);
@@ -333,7 +332,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
  		ab->mem_ce = ab->mem;
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/ath11k_nss_export.h
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,378 @@
 +/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 +/*
 + * Read-only view of ath11k's data-path ring layout, for the NSS wifili probe.
@@ -647,12 +646,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * The vdev has to exist by then.  A real implementation creates it from the
 + * vif-up path for the same reason peers are created here.
 + */
-+typedef int (*ath11k_nss_peer_fn)(void *ctx,
-+				  const struct ath11k_nss_peer *peer,
-+				  bool create);
 +
-+void ath11k_nss_set_peer_hook(unsigned int slot, ath11k_nss_peer_fn fn,
-+			      void *ctx);
 +
 +
 +/*
@@ -675,10 +669,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * ieee80211_data_to_8023() rather than dropped, because dropping them means
 + * the handshake never completes and no station ever becomes authorised.
 + */
-+typedef int (*ath11k_nss_tx_fn)(void *ctx, struct sk_buff *skb, u32 vdev_id);
 +
-+void ath11k_nss_dp_set_tx_hook(unsigned int idx, ath11k_nss_tx_fn fn,
-+			       void *ctx);
 +
 +/*
 + * ath11k_nss_dp_tx()
@@ -710,13 +701,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * held, so it must not call ath11k_nss_get_vifs().  Everything the callee
 + * needs, including the netdev, is in the struct.
 + */
-+typedef int (*ath11k_nss_dp_ready_fn)(void *ctx, unsigned int slot);
-+typedef int (*ath11k_nss_vif_fn)(void *ctx, const struct ath11k_nss_vif *vif,
-+				 bool add);
 +
-+void ath11k_nss_set_dp_ready_hook(ath11k_nss_dp_ready_fn fn, void *ctx);
-+void ath11k_nss_set_vif_hook(unsigned int slot, ath11k_nss_vif_fn fn,
-+			     void *ctx);
 +
 +/*
 + * Re-send the HTT ring configuration for the RXDMA refill ring, after NSS
@@ -728,7 +713,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +#endif /* ATH11K_NSS_EXPORT_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss_export.c
-@@ -0,0 +1,1478 @@
+@@ -0,0 +1,1318 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * Read-only export of ath11k's data-path ring layout for the NSS wifili probe,
@@ -835,6 +820,9 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +
 +static unsigned int ath11k_nss_offload_mask;
 +module_param_named(nss_offload_mask, ath11k_nss_offload_mask, uint, 0644);
++MODULE_PARM_DESC(nss_offload_mask,
++		 "bitmask of ath11k SoCs whose data path NSS owns, by stable"
++		 " slot: bit 0 the internal radio, bit 1 the QCN6122");
 +
 +/*
 + * Slots whose Rx refill ring the host must never fill, independent of the
@@ -859,25 +847,10 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + */
 +static unsigned int ath11k_nss_refill_hold;
 +
-+/*
-+ * Which implementation gets the handover.
-+ *
-+ * 0 calls the hook nss_wifili_probe.ko installs - how this has always worked.
-+ * 1 calls ath11k_nss_setup() in nss.c, the same sequence inside the driver.
-+ *
-+ * Both are in the image so that the two can be compared on one build with one
-+ * parameter and a reboot; when the in-driver path has been shown equivalent,
-+ * the hooks and this switch go away together.
-+ */
-+static bool ath11k_nss_inbuilt;
-+module_param_named(nss_inbuilt, ath11k_nss_inbuilt, bool, 0444);
-+MODULE_PARM_DESC(nss_inbuilt,
-+		 "hand the data path over from inside ath11k rather than from"
-+		 " nss_wifili_probe");
 +module_param_named(nss_refill_hold, ath11k_nss_refill_hold, uint, 0644);
-+MODULE_PARM_DESC(nss_offload_mask,
-+		 "bitmask of ath11k SoCs whose data path NSS owns, by stable"
-+		 " slot: bit 0 the internal radio, bit 1 the QCN6122");
++MODULE_PARM_DESC(nss_refill_hold,
++		 "bitmask of ath11k SoCs whose Rx refill ring the host must"
++		 " never fill, by the same slot numbering");
 +
 +/*
 + * ath11k_nss_soc_slot()
@@ -951,21 +924,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * Only the four hash-map registers are touched.  Everything else reo_setup
 + * wrote - the fragment destination, aging thresholds - is left alone.
 + */
-+static ath11k_nss_peer_fn ath11k_nss_peer_hook[ATH11K_NSS_MAX_SOC];
-+static void *ath11k_nss_peer_hook_ctx[ATH11K_NSS_MAX_SOC];
-+
-+void ath11k_nss_set_peer_hook(unsigned int slot, ath11k_nss_peer_fn fn,
-+			      void *ctx)
-+{
-+	if (slot >= ATH11K_NSS_MAX_SOC)
-+		return;
-+
-+	mutex_lock(&ath11k_nss_soc_lock);
-+	ath11k_nss_peer_hook[slot] = fn;
-+	ath11k_nss_peer_hook_ctx[slot] = ctx;
-+	mutex_unlock(&ath11k_nss_soc_lock);
-+}
-+EXPORT_SYMBOL(ath11k_nss_set_peer_hook);
 +
 +/*
 + * ath11k_nss_peer_event()
@@ -983,8 +941,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	struct ath11k_nss_peer info = {};
 +	struct ath11k_vif *arvif;
 +	struct ath11k_peer *peer;
-+	ath11k_nss_peer_fn fn;
-+	void *ctx;
 +	int slot, ret;
 +
 +	if (!ath11k_nss_dp_owned(ab))
@@ -992,11 +948,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +
 +	slot = ath11k_nss_soc_slot(ab);
 +	if (slot < 0)
-+		return;
-+
-+	fn = ath11k_nss_peer_hook[slot];
-+	ctx = ath11k_nss_peer_hook_ctx[slot];
-+	if (!fn && !ath11k_nss_inbuilt)
 +		return;
 +
 +	arvif = ath11k_vif_to_arvif(vif);
@@ -1029,15 +980,10 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		return;
 +	}
 +
-+	if (ath11k_nss_inbuilt) {
-+		ret = ath11k_nss_peer_update(ab, &info, create);
-+		if (ret)
-+			ath11k_warn(ab, "nss: peer %pM update failed (%d)\n",
-+				    info.mac_addr, ret);
-+		return;
-+	}
-+
-+	ret = fn(ctx, &info, create);
++	ret = ath11k_nss_peer_update(ab, &info, create);
++	if (ret)
++		ath11k_warn(ab, "nss: peer %pM update failed (%d)\n",
++			    info.mac_addr, ret);
 +	if (ret)
 +		ath11k_warn(ab, "nss: peer %s for %pM failed (%d)\n",
 +			    create ? "create" : "delete", sta->addr, ret);
@@ -1729,20 +1675,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * frame mode, which is a configuration problem rather than a per-packet one -
 + * hence the rate-limited warning rather than a counter nobody reads.
 + */
-+static ath11k_nss_tx_fn ath11k_nss_tx_hook[ATH11K_NSS_MAX_SOC];
-+static void *ath11k_nss_tx_hook_ctx[ATH11K_NSS_MAX_SOC];
-+
-+void ath11k_nss_dp_set_tx_hook(unsigned int idx, ath11k_nss_tx_fn fn, void *ctx)
-+{
-+	if (idx >= ATH11K_NSS_MAX_SOC)
-+		return;
-+
-+	mutex_lock(&ath11k_nss_soc_lock);
-+	ath11k_nss_tx_hook[idx] = fn;
-+	ath11k_nss_tx_hook_ctx[idx] = ctx;
-+	mutex_unlock(&ath11k_nss_soc_lock);
-+}
-+EXPORT_SYMBOL(ath11k_nss_dp_set_tx_hook);
 +
 +/*
 + * ath11k_nss_80211_to_8023()
@@ -1820,8 +1752,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		     bool eth_encap)
 +{
 +	struct ath11k_base *ab;
-+	ath11k_nss_tx_fn fn;
-+	void *ctx;
 +	int idx, ret;
 +
 +	if (!arvif || !arvif->ar || !arvif->vif)
@@ -1831,11 +1761,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	idx = ath11k_nss_soc_slot(ab);
 +	if (idx < 0)
 +		return -ENODEV;
-+
-+	fn = ath11k_nss_tx_hook[idx];
-+	ctx = ath11k_nss_tx_hook_ctx[idx];
-+	if (!fn && !ath11k_nss_inbuilt)
-+		return -ESHUTDOWN;
 +
 +	if (!eth_encap) {
 +		struct ieee80211_hdr *hdr = (void *)skb->data;
@@ -1895,10 +1820,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		}
 +	}
 +
-+	if (ath11k_nss_inbuilt)
-+		return ath11k_nss_tx(ab, skb, arvif->vdev_id);
-+
-+	return fn(ctx, skb, arvif->vdev_id);
++	return ath11k_nss_tx(ab, skb, arvif->vdev_id);
 +}
 +EXPORT_SYMBOL(ath11k_nss_dp_tx);
 +
@@ -1959,31 +1881,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * and ath11k_hif_irq_enable(), so mac80211 has never seen the radio and the
 + * data-path interrupts are still masked.  There is no earlier or quieter point.
 + */
-+static ath11k_nss_dp_ready_fn ath11k_nss_ready_hook;
-+static void *ath11k_nss_ready_ctx;
-+static DECLARE_WAIT_QUEUE_HEAD(ath11k_nss_ready_wq);
-+
-+/*
-+ * How long to wait for the module that talks to NSS to register.
-+ *
-+ * Generous on purpose.  The NSS core is brought up from an init script, not
-+ * from modules.d: it insmods qca-nss-drv, waits for the core to finish
-+ * booting, and only then loads the clients - so the module that answers this
-+ * hook cannot exist until well after ath11k's QMI worker gets here.  Waiting
-+ * costs a late phy registration; not waiting costs the handover.
-+ */
-+#define ATH11K_NSS_READY_WAIT_MS	90000
-+
-+void ath11k_nss_set_dp_ready_hook(ath11k_nss_dp_ready_fn fn, void *ctx)
-+{
-+	mutex_lock(&ath11k_nss_soc_lock);
-+	ath11k_nss_ready_hook = fn;
-+	ath11k_nss_ready_ctx = ctx;
-+	mutex_unlock(&ath11k_nss_soc_lock);
-+
-+	wake_up_all(&ath11k_nss_ready_wq);
-+}
-+EXPORT_SYMBOL(ath11k_nss_set_dp_ready_hook);
 +
 +/*
 + * ath11k_nss_dp_ready()
@@ -2000,54 +1897,13 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + */
 +void ath11k_nss_dp_ready(struct ath11k_base *ab)
 +{
-+	ath11k_nss_dp_ready_fn fn;
-+	void *ctx;
 +	int slot, ret;
 +
 +	slot = ath11k_nss_soc_slot(ab);
 +	if (slot < 0 || !(ath11k_nss_offload_mask & BIT(slot)))
 +		return;
 +
-+	if (ath11k_nss_inbuilt) {
-+		ret = ath11k_nss_setup(ab);
-+		if (ret) {
-+			ath11k_warn(ab, "nss: in-driver handover of slot %d failed (%d); falling back to the host data path\n",
-+				    slot, ret);
-+			ath11k_nss_offload_mask &= ~BIT(slot);
-+			return;
-+		}
-+		ath11k_info(ab, "nss: slot %d data path is NSS-owned\n", slot);
-+		return;
-+	}
-+
-+	/*
-+	 * Wait rather than race.  This is the QMI worker; blocking it delays
-+	 * ath11k_mac_register() and nothing else, and the radio does not exist
-+	 * for userspace until that returns - which is exactly the property the
-+	 * handover needs.
-+	 */
-+	if (!READ_ONCE(ath11k_nss_ready_hook))
-+		ath11k_info(ab, "nss: waiting for the offload module before registering slot %d\n",
-+			    slot);
-+
-+	if (!READ_ONCE(ath11k_nss_ready_hook) &&
-+	    !wait_event_timeout(ath11k_nss_ready_wq,
-+				READ_ONCE(ath11k_nss_ready_hook) != NULL,
-+				msecs_to_jiffies(ATH11K_NSS_READY_WAIT_MS))) {
-+		ath11k_warn(ab, "nss: no offload module registered after %u ms; slot %d stays on the host path\n",
-+			    ATH11K_NSS_READY_WAIT_MS, slot);
-+		ath11k_nss_offload_mask &= ~BIT(slot);
-+		return;
-+	}
-+
-+	mutex_lock(&ath11k_nss_soc_lock);
-+	fn = ath11k_nss_ready_hook;
-+	ctx = ath11k_nss_ready_ctx;
-+	mutex_unlock(&ath11k_nss_soc_lock);
-+
-+	ath11k_info(ab, "nss: handing the data path of slot %d over\n", slot);
-+
-+	ret = fn ? fn(ctx, slot) : -ENODEV;
++	ret = ath11k_nss_setup(ab);
 +	if (ret) {
 +		ath11k_warn(ab, "nss: handover of slot %d failed (%d); falling back to the host data path\n",
 +			    slot, ret);
@@ -2063,20 +1919,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * ---------------------------------------------------------------------------
 + * The vdev half.
 + */
-+static ath11k_nss_vif_fn ath11k_nss_vif_hook[ATH11K_NSS_MAX_SOC];
-+static void *ath11k_nss_vif_hook_ctx[ATH11K_NSS_MAX_SOC];
-+
-+void ath11k_nss_set_vif_hook(unsigned int slot, ath11k_nss_vif_fn fn, void *ctx)
-+{
-+	if (slot >= ATH11K_NSS_MAX_SOC)
-+		return;
-+
-+	mutex_lock(&ath11k_nss_soc_lock);
-+	ath11k_nss_vif_hook[slot] = fn;
-+	ath11k_nss_vif_hook_ctx[slot] = ctx;
-+	mutex_unlock(&ath11k_nss_soc_lock);
-+}
-+EXPORT_SYMBOL(ath11k_nss_set_vif_hook);
 +
 +/*
 + * ath11k_nss_vif_event()
@@ -2099,8 +1941,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	struct ath11k_vif *arvif;
 +	struct ath11k_nss_vif out;
 +	struct wireless_dev *wdev;
-+	ath11k_nss_vif_fn fn;
-+	void *ctx;
 +	int slot, i;
 +
 +	slot = ath11k_nss_soc_slot(ab);
@@ -2109,16 +1949,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +
 +	if (!vif)
 +		return;
-+
-+	if (!ath11k_nss_inbuilt) {
-+		mutex_lock(&ath11k_nss_soc_lock);
-+		fn = ath11k_nss_vif_hook[slot];
-+		ctx = ath11k_nss_vif_hook_ctx[slot];
-+		mutex_unlock(&ath11k_nss_soc_lock);
-+
-+		if (!fn)
-+			return;
-+	}
 +
 +	arvif = ath11k_vif_to_arvif(vif);
 +	wdev = ieee80211_vif_to_wdev(vif);
@@ -2148,15 +1978,10 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		   add ? "add" : "del", out.vdev_id, out.nss_opmode,
 +		   out.netdev, out.netdev ? out.netdev->ifindex : -1);
 +
-+	if (ath11k_nss_inbuilt) {
-+		if (add)
-+			ath11k_nss_vdev_create(ab, &out);
-+		else
-+			ath11k_nss_vdev_delete(ab);
-+		return;
-+	}
-+
-+	fn(ctx, &out, add);
++	if (add)
++		ath11k_nss_vdev_create(ab, &out);
++	else
++		ath11k_nss_vdev_delete(ab);
 +}
 +EXPORT_SYMBOL(ath11k_nss_vif_event);
 +
@@ -2209,7 +2034,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +EXPORT_SYMBOL(ath11k_nss_dp_htt_refill_setup);
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.h
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,130 @@
 +/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 +/*
 + * The NSS wifili offload, inside the driver.
@@ -2224,9 +2049,14 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * function pointer the module installed.  That worked, but it put the glue
 + * outside the driver: the ordering had to be arranged in /etc/modules.d, a
 + * failed handover left a radio unable to receive, and every hook was a pointer
-+ * read from softirq context with no lock.  nss_export.c stays - the probe is
-+ * still useful as a diagnostic and is the only consumer of that API - and
-+ * while both exist the nss_inbuilt module parameter picks between them.
++ * read from softirq context with no lock.  Those hooks are gone.
++ *
++ * nss_export.c stays.  It is what reads ath11k's ring layout into the flat
++ * form the NSS messages want, and nss_wifili_probe keeps using that half as a
++ * bring-up instrument - it can still drive the whole sequence by hand through
++ * its debugfs interface, which is how most of what is known about this
++ * firmware was established.  What it can no longer do is attach itself to
++ * ath11k's events and own the data path.
 + */
 +#ifndef ATH11K_NSS_H
 +#define ATH11K_NSS_H

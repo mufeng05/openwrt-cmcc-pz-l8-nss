@@ -48,9 +48,9 @@ offload.
 
 ## Known limitations
 
-- WiFi offload arms itself at boot now, but the handover still lives in an
-  out-of-tree module rather than in ath11k, and a radio whose handover fails
-  cannot receive at all. See [docs/WIFILI.md](docs/WIFILI.md).
+- A radio whose handover fails cannot receive at all: `nss_refill_hold` is a
+  load-time parameter, so its Rx ring stays empty even after the offload mask
+  is cleared. See [docs/WIFILI.md](docs/WIFILI.md).
 - **Memory is tight.** 256 MB board; ath11k's data-path rings are patched down
   from the upstream sizes or nothing fits alongside NSS.
 - Monitor-mode capture on the radios is effectively disabled by those ring sizes.

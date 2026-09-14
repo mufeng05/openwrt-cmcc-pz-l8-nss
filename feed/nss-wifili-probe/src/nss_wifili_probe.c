@@ -385,8 +385,6 @@ module_param_named(warm_delay, probe_warm_delay_ms, uint, 0644);
 static bool probe_deliver = true;
 module_param_named(deliver, probe_deliver, bool, 0644);
 
-static bool probe_tx_enable = true;
-module_param_named(tx, probe_tx_enable, bool, 0644);
 
 /*
  * How many excepted frames to hex-dump on their way up.
@@ -771,8 +769,6 @@ module_param_named(target_pdev, probe_target_pdev, int, 0644);
  * synchronously inside sta_state.  Keep both paths selectable until it is
  * clear which of the two differences that run had actually matters.
  */
-static bool probe_use_peer_hook = true;
-module_param_named(peer_hook, probe_use_peer_hook, bool, 0644);
 
 #define PROBE_PEER_MEM_SZ	1600
 /* PROBE_MAX_PEERS moved up, next to probe_slot_state */
@@ -801,8 +797,6 @@ static void probe_peer_mem_free_one(u32 pidx)
 	probe_peer_mem_pa[pidx] = 0;
 }
 
-static int probe_peer_hook(void *ctx, const struct ath11k_nss_peer *peer,
-			   bool create);
 
 /* NSS keeps its per-peer state in a block the host allocates; the vendor
  * driver allocates exactly this much in osif_nss_wifili_pmem_alloc().
@@ -1231,57 +1225,6 @@ static void probe_vdev_ext_cb(struct net_device *dev, struct sk_buff *skb,
  * with skb->next cleared.  On success NSS owns the skb, so return 0 and let
  * ath11k treat it exactly as a frame queued to TCL.
  */
-static int probe_vdev_tx(void *ctx, struct sk_buff *skb, u32 vdev_id)
-{
-	struct probe_slot_state *st = &probe_ss[probe_slot_of(ctx)];
-	nss_tx_status_t status;
-
-	if (st->vdev_ifnum < 0 || !st->tx_ctx) {
-		atomic_inc(&probe_txf_nodev);
-		atomic_inc(&probe_vdev_tx_fail);
-		return -ENODEV;
-	}
-
-	if (skb->len <= ETH_HLEN) {
-		atomic_inc(&probe_txf_short);
-		atomic_inc(&probe_vdev_tx_fail);
-		return -EINVAL;
-	}
-
-	if (skb->len > 1514 && skb_headroom(skb) <= 23 &&
-	    pskb_expand_head(skb, 24, 0, GFP_ATOMIC)) {
-		atomic_inc(&probe_txf_nomem);
-		atomic_inc(&probe_vdev_tx_fail);
-		return -ENOMEM;
-	}
-
-	/* Count EAPOL separately: whether M1 is even submitted decides
-	 * whether the handshake stalls on transmit or on receive. */
-	if (skb->len >= ETH_HLEN &&
-		    ((__be16 *)skb->data)[6] == htons(ETH_P_PAE)) {
-		atomic_inc(&probe_tx_eapol);
-		if (probe_dump_tx) {
-			probe_dump_tx--;
-			print_hex_dump(KERN_INFO, PFX "tx: ", DUMP_PREFIX_OFFSET,
-				       16, 1, skb->data,
-				       min_t(unsigned int, skb->len, 48u), false);
-			pr_info(PFX "tx: len=%u headroom=%d vdev_if=%d\n",
-				skb->len, skb_headroom(skb), st->vdev_ifnum);
-		}
-	}
-
-	skb->next = NULL;
-	status = nss_wifi_vdev_tx_buf(st->tx_ctx, skb, st->vdev_ifnum);
-	if (status != NSS_TX_SUCCESS) {
-		atomic_inc(&probe_txf_nss);
-		atomic_inc(&probe_vdev_tx_fail);
-		return -EIO;
-	}
-
-	atomic_inc(&probe_vdev_tx_ok);
-	return 0;
-}
-
 static void probe_vdev_msg_cb(void *app_data, struct nss_cmn_msg *msg)
 {
 	if (!msg)
@@ -2139,27 +2082,15 @@ static int probe_vdev_create(const struct ath11k_nss_vif *vif)
 	 * Only now: the hook is what ath11k calls from its Tx path, and it must
 	 * not fire before the interface it sends to is configured and up.
 	 */
-	if (probe_tx_enable) {
-		probe_tx_ctx = probe_ctx;
-		ath11k_nss_dp_set_tx_hook(probe_cur, probe_vdev_tx,
-					  (void *)(uintptr_t)probe_cur);
-	} else {
-		pr_info(PFX "tx hook off - ath11k submissions are refused\n");
-	}
+	probe_tx_ctx = probe_ctx;
 
 	/*
 	 * Only now: the peer hook needs a vdev to attach peers to, and arming
 	 * it earlier would have it fire for a station that associates while
 	 * the vdev is still being built.
 	 */
-	if (probe_use_peer_hook) {
-		ath11k_nss_set_peer_hook(probe_cur, probe_peer_hook,
-					 (void *)(uintptr_t)probe_cur);
-		pr_info(PFX "peer hook armed - peers follow ath11k's sta_state\n");
-	} else {
-		pr_info(PFX "peer hook off - peers come from the stage 4 poll\n");
-	}
-	pr_info(PFX "tx hook armed for vdev if=%d\n", ifnum);
+	pr_info(PFX "vdev if=%d ready; peers come from the stage 4 poll\n",
+		ifnum);
 
 	/*
 	 * probe_cur, not the module parameter.  This runs from the vif hook,
@@ -2197,8 +2128,6 @@ static void probe_vdev_free(void)
 	if (ifnum < 0)
 		return;
 
-	ath11k_nss_set_peer_hook(probe_cur, NULL, NULL);
-	ath11k_nss_dp_set_tx_hook(probe_cur, NULL, NULL);
 	probe_tx_ctx = NULL;
 
 	nss_unregister_wifi_vdev_if(ifnum);
@@ -2609,91 +2538,6 @@ static void probe_peek_rings(struct ath11k_nss_dp_info *info)
  * peer NSS has never seen traps the firmware within milliseconds, with nothing
  * in its log ring to say why.  Polling for the station cannot win that race.
  */
-static int probe_peer_hook(void *ctx, const struct ath11k_nss_peer *peer,
-			   bool create)
-{
-	int ret;
-
-	/*
-	 * Select the slot this peer belongs to.  Without it every peer message
-	 * went to whichever slot the last vif hook happened to leave behind:
-	 * with both radios armed, the 2.4 GHz peers were created on the
-	 * external wifili instance, and the internal one then reaped the
-	 * station M2s and delivered none of them - reo_reaped 20, rx_deliverd 0,
-	 * which is the same shape as a peer NSS does not know.
-	 */
-	probe_cur = probe_slot_of(ctx);
-
-	if (!probe_ctx) {
-		pr_warn(PFX "peer hook with no wifili context\n");
-		return -ENODEV;
-	}
-
-	if (probe_vdev_ifnum < 0) {
-		pr_warn(PFX "peer hook with no vdev - run stage 4 once after the AP comes up\n");
-		return -ENODEV;
-	}
-
-	if (!create) {
-		if (!probe_peer_created || probe_peer_id != peer->peer_id)
-			return 0;
-
-		probe_peer_delete(peer->peer_id);
-		probe_peer_created = false;
-		probe_peer_auth_sent = -1;
-		return 0;
-	}
-
-	/* A station that re-associates arrives with a new peer id. */
-	if (probe_peer_created && probe_peer_id != peer->peer_id) {
-		probe_peer_delete(probe_peer_id);
-		probe_peer_created = false;
-		probe_peer_auth_sent = -1;
-	}
-
-	if (probe_peer_created) {
-		/* Called again at the ASSOC->AUTHORIZED transition: the
-		 * peer is already there, only the flag has moved.
-		 */
-		if (probe_peer_auth_sent != !!peer->is_authorized) {
-			/*
-			 * The real ASSOC->AUTHORIZED transition, i.e. the
-			 * handshake is done and a PTK exists.  With
-			 * sec_early=0 the cipher is told to NSS here rather
-			 * than at PEER_CREATE, which is where the vendor and
-			 * the reference port send it.
-			 */
-			if (peer->is_authorized && !probe_sec_early)
-				probe_peer_security(peer->peer_id);
-			if (!probe_peer_auth(peer->peer_id, peer->is_authorized))
-				probe_peer_auth_sent = !!peer->is_authorized;
-		}
-		return 0;
-	}
-
-	if (!probe_peer_dma_dev) {
-		pr_warn(PFX "peer hook with no DMA device\n");
-		return -ENODEV;
-	}
-
-	ret = probe_peer_create(peer, probe_peer_dma_dev);
-	if (ret)
-		return ret;
-
-	if (probe_sec_early)
-		probe_peer_security(peer->peer_id);
-	probe_peer_next_hop(peer->mac_addr);
-	probe_peer_created = true;
-	probe_peer_id = peer->peer_id;
-	probe_peer_auth_sent = -1;
-
-	if (peer->is_authorized &&
-	    !probe_peer_auth(peer->peer_id, true))
-		probe_peer_auth_sent = 1;
-
-	return 0;
-}
-
 static int probe_run(unsigned int soc_idx, unsigned int stage,
 		     u32 swdesc, bool quiesce, u8 mem_profile)
 {
@@ -3430,30 +3274,6 @@ static int probe_smem_thread(void *unused)
  * ab->core_lock held, which is why probe_run() may sleep here but must not
  * call back into anything of ath11k's that takes that lock - it does not.
  */
-static int probe_dp_ready(void *ctx, unsigned int slot)
-{
-	int ret;
-
-	if (!probe_auto) {
-		pr_info(PFX "auto_start off - leaving slot %u to the debugfs path\n",
-			slot);
-		return -ENODEV;
-	}
-
-	if (slot >= PROBE_MAX_SOC || !(probe_slots & BIT(slot))) {
-		pr_info(PFX "slot %u not in our mask %#x\n", slot, probe_slots);
-		return -ENODEV;
-	}
-
-	pr_info(PFX "ath11k handed us slot %u before the radio exists\n", slot);
-
-	mutex_lock(&probe_lock);
-	ret = probe_run(slot, 3, probe_swdesc, false, (u8)probe_mem_profile);
-	mutex_unlock(&probe_lock);
-
-	return ret;
-}
-
 /*
  * probe_vif_event()
  *	An ath11k vdev appeared or is about to go away.
@@ -3465,47 +3285,6 @@ static int probe_dp_ready(void *ctx, unsigned int slot)
  * list: everything needed is in the struct, including the netdev that the
  * except path and ECM both key off.
  */
-static int probe_vif_event(void *ctx, const struct ath11k_nss_vif *vif,
-			   bool add)
-{
-	int ret = 0;
-
-	unsigned int slot = probe_slot_of(ctx);
-
-	if (!probe_auto || !probe_ctx)
-		return 0;
-
-	if (vif->nss_opmode != ATH11K_NSS_OPMODE_AP) {
-		pr_info(PFX "ignoring vdev %u (opmode %u)\n",
-			vif->vdev_id, vif->nss_opmode);
-		return 0;
-	}
-
-	mutex_lock(&probe_lock);
-	probe_cur = slot;
-	if (probe_ss[slot].wifili_if <= 0) {
-		/*
-		 * This slot was never armed.  Say so and succeed: an error here
-		 * aborts ath11k add_interface and the radio never comes up at
-		 * all, which is worse than leaving it unaccelerated.
-		 */
-		pr_info(PFX "slot %u not armed - vdev %u left to ath11k\n",
-			slot, vif->vdev_id);
-		mutex_unlock(&probe_lock);
-		return 0;
-	}
-	if (add) {
-		ret = probe_vdev_create(vif);
-	} else {
-		probe_vdev_free();
-		probe_peer_created = false;
-		probe_peer_auth_sent = -1;
-	}
-	mutex_unlock(&probe_lock);
-
-	return ret;
-}
-
 static ssize_t probe_write(struct file *f, const char __user *buf,
 			   size_t len, loff_t *off)
 {
@@ -3538,7 +3317,6 @@ static const struct file_operations probe_fops = {
 
 static int __init probe_init(void)
 {
-	unsigned int i;
 
 	init_completion(&probe_done);
 
@@ -3558,14 +3336,6 @@ static int __init probe_init(void)
 	pr_info(PFX "loaded - write '<soc> <stage> [swdesc] [quiesce] [memprofile]' to %s\n",
 		"/sys/kernel/debug/nss_wifili_probe/run");
 
-	if (probe_auto) {
-		ath11k_nss_set_dp_ready_hook(probe_dp_ready, NULL);
-		for (i = 0; i < PROBE_MAX_SOC; i++)
-			ath11k_nss_set_vif_hook(i, probe_vif_event,
-						(void *)(uintptr_t)i);
-		pr_info(PFX "auto-start armed; ath11k drives the handover\n");
-	}
-
 	if (probe_smem_watch) {
 		probe_smem_task = kthread_run(probe_smem_thread, NULL,
 					      "nss_probe_smem");
@@ -3583,7 +3353,6 @@ static int __init probe_init(void)
 
 static void __exit probe_exit(void)
 {
-	unsigned int i;
 
 	if (probe_netdev_nb_on) {
 		unregister_netdevice_notifier(&probe_netdev_nb);
@@ -3591,9 +3360,6 @@ static void __exit probe_exit(void)
 	}
 	if (probe_smem_task)
 		kthread_stop(probe_smem_task);
-	ath11k_nss_set_dp_ready_hook(NULL, NULL);
-	for (i = 0; i < PROBE_MAX_SOC; i++)
-		ath11k_nss_set_vif_hook(i, NULL, NULL);
 	debugfs_remove_recursive(probe_dir);
 	probe_vdev_free();
 	{
