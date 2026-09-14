@@ -80,6 +80,11 @@ cd openwrt && make -j$(nproc)
 `sysupgrade -n` from a running OpenWrt, or the U-Boot web recovery at
 `192.168.10.10`. Default LAN address is **192.168.10.1**.
 
+The two want different image formats and neither is obvious - the web recovery
+runs `source $imgaddr:script` and therefore needs a FIT with a flashing script
+in it, not a `.ubi`. [docs/RECOVERY.md](docs/RECOVERY.md) has both paths, the
+flash layout, and what the bootloader checks.
+
 The stock `platform.sh` aborts sysupgrade on this board — it calls
 `elecom_upgrade_prepare()`, which expects an A/B rootfs pair that PZ-L8 does not
 have, and the flash silently does nothing. Patched here.

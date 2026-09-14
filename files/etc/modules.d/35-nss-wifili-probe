@@ -6,19 +6,20 @@
 # hardware.  So the hook is registered before anything can call it and
 # ath11k_nss_dp_ready() never has to use its 90 s wait.
 #
-# vdev_netdev0/1  the AP netdev of each slot, 0 = internal 2.4 GHz, 1 = the
-#                 QCN6122.  Without them the vdev registers against a dummy
-#                 netdev and excepted frames - EAPOL among them - are delivered
-#                 to whichever slot answers first.  These are names rather than
-#                 something resolved at run time because the alternatives were
-#                 tried: dev_getbyhwaddr_rcu() from ath11k's add_interface
-#                 faults on pcpu_refcnt, and vif->netdev is not safe to
-#                 dereference there either.  Moving the glue into ath11k is what
-#                 removes the guess - the driver knows its own netdev.
+# The AP netdev of each slot now comes from ath11k itself, in
+# struct ath11k_nss_vif.  It used to be named here, as phy0-ap0 and phy1-ap0,
+# and that was wrong: phy numbering is not stable, and one boot came up with
+# phy0 on the external radio and phy1 on the internal one - the reverse of the
+# boot before it - which pointed each slot at the other radio.  Without a
+# netdev the vdev registers against a dummy and excepted frames, EAPOL among
+# them, are delivered to whichever slot answers first.
+#
+# vdev_netdev0/1 still exist as an override for a driver too old to fill the
+# name in.
 #
 # next_hop=158    NSS_ETH_RX_INTERFACE, the vdev base next hop.  Worth 27% of
 #                 the downlink: without it four runs gave 320 Mbit/s scattered
 #                 246-373, with it 406 inside 383-418.  It has to be set at load
 #                 time - writing it at run time and recreating the vdevs
 #                 crashed the board.
-nss_wifili_probe vdev_netdev0=phy0-ap0 vdev_netdev1=phy1-ap0 next_hop=158
+nss_wifili_probe next_hop=158

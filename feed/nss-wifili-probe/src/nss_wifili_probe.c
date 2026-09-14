@@ -254,7 +254,6 @@ static int probe_netdev_event(struct notifier_block *nb, unsigned long ev,
 			continue;
 		pr_info(PFX "slot %u vdev netdev %s unregistered - dropped\n",
 			i, dev->name);
-		dev_put(dev);
 	}
 	return NOTIFY_DONE;
 }
@@ -279,30 +278,30 @@ static u8 probe_scheme_id;
 /* moved into struct probe_slot_state */
 
 /*
- * Resolve the vdev's netdev by NAME instead of trusting vif->netdev.
+ * The vdev's netdev comes from ath11k, in vif->netdev, and is used as it
+ * arrives - no name, no reference.
  *
- * vif->netdev arrives from ieee80211_vif_to_wdev(vif)->netdev inside
- * drv_add_interface, and it is sometimes a valid linear-map pointer
- * (ffffff800f42c000) and sometimes garbage (ffffff3f9dcaf528) - dereferencing
- * the garbage faulted under RTNL and wedged the box.  dev_get_by_name() takes
- * its own reference on a netdev the stack agrees exists, which sidesteps the
- * question entirely.
+ * This replaces three module parameters that named it (vdev_netdev,
+ * vdev_netdev0, vdev_netdev1) and a dev_get_by_name() to resolve them.  Two
+ * things killed that approach.  phy numbering is not stable: one boot came up
+ * with phy0 on the external radio and phy1 on the internal one, the reverse of
+ * the boot before, so a hardcoded name silently pointed each slot at the other
+ * radio.  And the reference counting was the source of its own crash - two
+ * paths could dev_put() the same netdev, the refcount underflowed, the netdev
+ * was freed early, and the next access faulted.
+ *
+ * The old note here said vif->netdev "is sometimes garbage
+ * (ffffff3f9dcaf528)".  It is not.  That number is the faulting address, and
+ * subtracting the 0x528 offset of pcpu_refcnt leaves a perfectly good netdev.
+ * Measured at this point in add_interface: the pointer is valid and the
+ * ifindex is already right; it is the name that is still empty and the
+ * per-CPU refcount that does not exist yet.  So dev_hold() faults and reading
+ * the name returns nothing, but the pointer itself is exactly what is wanted.
  *
  * It matters because registering the dummy instead costs the except path, and
  * EAPOL is excepted: with the dummy, the 4-way handshake never reaches hostapd
- * and the station associates then drops.  Set this to e.g. "phy1-ap0".
+ * and the station associates then drops.
  */
-static char *probe_vdev_netdev;
-module_param_named(vdev_netdev, probe_vdev_netdev, charp, 0644);
-
-/*
- * One netdev name per slot, because with both radios armed a single name
- * cannot serve both.  An empty entry falls back to vdev_netdev, so the
- * single-radio arm scripts keep working unchanged.
- */
-static char *probe_vdev_name[PROBE_MAX_SOC];
-module_param_named(vdev_netdev0, probe_vdev_name[0], charp, 0644);
-module_param_named(vdev_netdev1, probe_vdev_name[1], charp, 0644);
 MODULE_PARM_DESC(vdev_netdev,
 		 "resolve the vdev netdev by this name rather than from the"
 		 " vif pointer; empty registers the dummy");
@@ -1935,8 +1934,6 @@ static int probe_vdev_create(const struct ath11k_nss_vif *vif)
 	nss_tx_status_t status;
 	uint32_t reg;
 	int ifnum;
-	const char *nm;
-	char nmbuf[IFNAMSIZ];
 
 	if (probe_vdev_ifnum >= 0) {
 		pr_info(PFX "vdev if=%d already created\n", probe_vdev_ifnum);
@@ -1955,32 +1952,31 @@ static int probe_vdev_create(const struct ath11k_nss_vif *vif)
 	}
 
 	/*
-	 * Never dereference vif->netdev here.
+	 * Use vif->netdev as it arrives.  Do not take a reference to it, and do
+	 * not read its name.
 	 *
-	 * This hook runs from ath11k's add_interface, i.e. inside
-	 * drv_add_interface() with RTNL held, and the netdev pointer that
-	 * arrives is sometimes garbage: dev_hold() faulted on it twice, taking
-	 * a level 0 translation fault reading pcpu_refcnt at +0x528
-	 * (ffffff3f9dcaf528, then ffffff3f9e6cb528).  Because RTNL is held on
-	 * that path the dying task never released it, so every later cfg80211
-	 * and netdev task piled up behind the lock and the whole box wedged.
+	 * This hook runs from ath11k's add_interface, inside drv_add_interface()
+	 * with RTNL held, and at that point the netdev object exists and its
+	 * ifindex is already correct - measured as 5 and 6, matching phy0-ap0
+	 * and phy1-ap0 - but it is not fully registered: the name is still
+	 * empty, and dev_hold() takes a level 0 translation fault on
+	 * pcpu_refcnt.  RTNL is held, so the dying task never releases it and
+	 * every later cfg80211 and netdev task piles up behind the lock.
 	 *
-	 * virt_addr_valid() does NOT catch it - that only asks whether the
-	 * address is a linear-map address backed by RAM, which a garbage
-	 * pointer landing inside mapped bounds satisfies, and it duly returned
-	 * true for both.  The reference driver does not try to validate it
-	 * either; it refuses to create the vdev at all unless wdev->netdev is
-	 * set, which is the same conclusion from the other direction.
+	 * An older note here read the faulting address, ffffff3f9dcaf528, as
+	 * the netdev pointer being garbage.  It is not: subtract the 0x528
+	 * offset of pcpu_refcnt and what is left is the netdev itself.  The
+	 * pointer was always fine; the refcount being asked for did not exist
+	 * yet.  virt_addr_valid() returning true for it was not a false
+	 * negative either - it really was a valid address.
 	 *
-	 * So register the dummy netdev instead.  What that costs is the except
-	 * path (a frame handed up arrives on the dummy, not on phy1-ap0) and
-	 * the ECM netdev-to-NSS-interface mapping - both recoverable, and
-	 * neither needed to answer the open question, which is why the NSS core
-	 * traps under sustained traffic.  Faulting under RTNL is not
-	 * recoverable.  Log the raw value so the export side can be diagnosed.
+	 * Storing it without a reference is safe, and is what the open
+	 * reference implementation does: by the time a frame reaches the netdev
+	 * it is registered, and mac80211 calls remove_interface - where the
+	 * vdev is unregistered from NSS - before it unregisters the netdev.  It
+	 * also removes the reference counting that underflowed in an earlier
+	 * round, freeing a netdev early and faulting at the same +0x528.
 	 */
-	pr_info(PFX "vif netdev=%px not dereferenced; resolving by name instead\n",
-		vif->netdev);
 	/*
 	 * Resolve the netdev by name, per slot.
 	 *
@@ -1997,45 +1993,15 @@ static int probe_vdev_create(const struct ath11k_nss_vif *vif)
 	 * vif->netdev.  By the time the name exists the netdev is registered,
 	 * which is why the name lookup is the safe one.
 	 */
-	nm = (probe_cur < PROBE_MAX_SOC) ? probe_vdev_name[probe_cur] : NULL;
-	if (!nm || !nm[0])
-		nm = probe_vdev_netdev;
-
 	/*
-	 * Trim the value into a local buffer.  Setting a charp parameter from
-	 * the shell is the normal way to do it and `echo name > vdev_netdev0`
-	 * stores the trailing newline, so dev_get_by_name() looks up
-	 * "phy0-ap0\n" and misses.  The failure is quiet - registration falls
-	 * back to the dummy netdev, and the only symptom is that excepted
-	 * frames go to the wrong radio.
-	 *
-	 * A copy rather than strim() in place: nm is const because it can also
-	 * point at whatever was given on the insmod line, and nothing here
-	 * needs to modify the parameter itself.
+	 * The name ath11k gave us, which is the one that is right whatever the
+	 * phy numbering came out as this boot.  The module parameters stay as
+	 * an override for a driver too old to fill it in.
 	 */
-	if (nm) {
-		size_t n = strlen(nm);
-
-		while (n && (nm[n - 1] == '\n' || nm[n - 1] == '\r' ||
-			     nm[n - 1] == ' ' || nm[n - 1] == '\t'))
-			n--;
-		if (n >= sizeof(nmbuf))
-			n = sizeof(nmbuf) - 1;
-		memcpy(nmbuf, nm, n);
-		nmbuf[n] = '\0';
-		nm = nmbuf;
-	}
-
-	probe_vdev_ndev = NULL;
-	if (nm && nm[0]) {
-		probe_vdev_ndev = dev_get_by_name(&init_net, nm);
-		if (probe_vdev_ndev)
-			pr_info(PFX "slot %u netdev '%s' resolved (held)\n",
-				probe_cur, nm);
-		else
-			pr_warn(PFX "slot %u netdev '%s' not found - dummy\n",
-				probe_cur, nm);
-	}
+	probe_vdev_ndev = vif->netdev;
+	if (!probe_vdev_ndev)
+		pr_warn(PFX "slot %u has no netdev - registering the dummy\n",
+			probe_cur);
 	reg = nss_register_wifi_vdev_if(probe_ctx, ifnum, probe_vdev_data_cb,
 					probe_vdev_ext_cb, probe_vdev_msg_cb,
 					probe_vdev_ndev ? : probe_ndev, 0);
@@ -2239,13 +2205,15 @@ static void probe_vdev_free(void)
 	nss_dynamic_interface_dealloc_node(ifnum,
 		NSS_DYNAMIC_INTERFACE_TYPE_VAP);
 
-	/* Only after the unregister: NSS must not be able to call back into a
-	 * netdev whose reference we have already dropped. */
+	/*
+	 * Only after the unregister: NSS must not be able to call back into a
+	 * netdev we have already forgotten.  No dev_put - no reference was
+	 * taken, which is also what stops two paths through here from
+	 * underflowing the refcount and freeing the netdev early.
+	 */
 	nd = xchg(&probe_vdev_ndev, (struct net_device *)NULL);
-	if (nd) {
-		pr_info(PFX "vdev netdev %s released\n", nd->name);
-		dev_put(nd);
-	}
+	if (nd)
+		pr_info(PFX "vdev netdev %s dropped\n", nd->name);
 }
 
 

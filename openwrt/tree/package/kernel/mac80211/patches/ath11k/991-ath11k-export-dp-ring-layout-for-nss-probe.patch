@@ -66,15 +66,26 @@ Diagnostic aid for bring-up, not for shipping as-is.
  		ath11k_err(ab, "failed to create soc core: %d\n", ret);
 --- a/drivers/net/wireless/ath/ath11k/core.h
 +++ b/drivers/net/wireless/ath/ath11k/core.h
-@@ -931,6 +931,7 @@
+@@ -35,6 +35,7 @@
+ #include "wow.h"
+ #include "fw.h"
+ #include "coredump.h"
++#include "nss.h"
+ 
+ #define SM(_v, _f) (((_v) << _f##_LSB) & _f##_MASK)
+ 
+@@ -931,6 +932,10 @@
  	void __iomem *mem;
  	void __iomem *mem_ce;
  	unsigned long mem_len;
 +	phys_addr_t mem_pa;
++
++	/* the NSS wifili offload of this SoC; see nss.h */
++	struct ath11k_nss_soc nss;
  
  	struct {
  		enum ath11k_bus bus;
-@@ -1360,4 +1361,26 @@
+@@ -1360,4 +1365,33 @@
  
  void ath11k_core_pm_notifier_unregister(struct ath11k_base *ab);
  
@@ -90,6 +101,13 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +extern bool ath11k_nss_coherent_rings;
 +void ath11k_nss_dp_drain_dst_ring(struct ath11k_base *ab, int ring_id);
 +bool ath11k_nss_dp_owned(struct ath11k_base *ab);
++
++/*
++ * Which wifili instance this SoC belongs to: 0 the internal radio, 1 the
++ * external one, -1 for a chip that has neither.  Derived from the chip id, so
++ * it is stable across boots and callable before anything is registered.
++ */
++int ath11k_nss_soc_slot(struct ath11k_base *ab);
 +bool ath11k_nss_dp_refill_owned(struct ath11k_base *ab, int mac_id,
 +				struct dp_rxdma_ring *rx_ring);
 +typedef int (*ath11k_nss_tx_fn)(void *ctx, struct sk_buff *skb, u32 vdev_id);
@@ -315,7 +333,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
  		ab->mem_ce = ab->mem;
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/ath11k_nss_export.h
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,392 @@
 +/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 +/*
 + * Read-only view of ath11k's data-path ring layout, for the NSS wifili probe.
@@ -555,6 +573,24 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	 * registration - which is what a wifi vdev needs to be accelerated
 +	 * at all.  Registering a dummy netdev instead makes both silently
 +	 * fail rather than error.
++	 *
++	 * Store it; do not take a reference to it, and do not read its name.
++	 * At this point in add_interface the object exists and its ifindex is
++	 * already right - measured as 5 and 6, matching phy0-ap0 and phy1-ap0 -
++	 * but it is not fully registered: the name is still empty and
++	 * dev_hold() takes a level 0 translation fault on pcpu_refcnt, under
++	 * RTNL, which wedges the box.
++	 *
++	 * The address in that fault, ffffff3f9dcaf528, was once read as the
++	 * netdev pointer being garbage.  It is not: subtract the 0x528 offset
++	 * of pcpu_refcnt and what is left is the netdev itself.  The pointer
++	 * was always fine; the refcount it was being asked for did not exist
++	 * yet.
++	 *
++	 * Storing it is safe: by the time a frame reaches the netdev it is
++	 * registered, and mac80211 calls remove_interface - where the vdev is
++	 * unregistered from NSS - before it unregisters the netdev.  This is
++	 * what the open reference implementation does.
 +	 */
 +	struct net_device *netdev;
 +};
@@ -692,7 +728,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +#endif /* ATH11K_NSS_EXPORT_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss_export.c
-@@ -0,0 +1,1420 @@
+@@ -0,0 +1,1454 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * Read-only export of ath11k's data-path ring layout for the NSS wifili probe,
@@ -822,6 +858,22 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * board wedges.  This gate touches the refill path and nothing else.
 + */
 +static unsigned int ath11k_nss_refill_hold;
++
++/*
++ * Which implementation gets the handover.
++ *
++ * 0 calls the hook nss_wifili_probe.ko installs - how this has always worked.
++ * 1 calls ath11k_nss_setup() in nss.c, the same sequence inside the driver.
++ *
++ * Both are in the image so that the two can be compared on one build with one
++ * parameter and a reboot; when the in-driver path has been shown equivalent,
++ * the hooks and this switch go away together.
++ */
++static bool ath11k_nss_inbuilt;
++module_param_named(nss_inbuilt, ath11k_nss_inbuilt, bool, 0444);
++MODULE_PARM_DESC(nss_inbuilt,
++		 "hand the data path over from inside ath11k rather than from"
++		 " nss_wifili_probe");
 +module_param_named(nss_refill_hold, ath11k_nss_refill_hold, uint, 0644);
 +MODULE_PARM_DESC(nss_offload_mask,
 +		 "bitmask of ath11k SoCs whose data path NSS owns, by stable"
@@ -847,7 +899,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + */
 +static u32 ath11k_nss_target_type(struct ath11k_base *ab);
 +
-+static int ath11k_nss_soc_slot(struct ath11k_base *ab)
++int ath11k_nss_soc_slot(struct ath11k_base *ab)
 +{
 +	switch (ath11k_nss_target_type(ab)) {
 +	case ATH11K_NSS_TARGET_TYPE_QCA5018:
@@ -1945,6 +1997,18 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	if (slot < 0 || !(ath11k_nss_offload_mask & BIT(slot)))
 +		return;
 +
++	if (ath11k_nss_inbuilt) {
++		ret = ath11k_nss_setup(ab);
++		if (ret) {
++			ath11k_warn(ab, "nss: in-driver handover of slot %d failed (%d); falling back to the host data path\n",
++				    slot, ret);
++			ath11k_nss_offload_mask &= ~BIT(slot);
++			return;
++		}
++		ath11k_info(ab, "nss: slot %d data path is NSS-owned\n", slot);
++		return;
++	}
++
 +	/*
 +	 * Wait rather than race.  This is the QMI worker; blocking it delays
 +	 * ath11k_mac_register() and nothing else, and the radio does not exist
@@ -2058,9 +2122,15 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +			break;
 +		}
 +
-+	ath11k_dbg(ab, ATH11K_DBG_MAC, "nss: vif %s vdev %u opmode %u dev %s\n",
++	/*
++	 * Not out.netdev->name: the netdev is not fully registered yet and its
++	 * name is still empty here.  The ifindex is set, and is the only thing
++	 * at this point that says which interface this is.
++	 */
++	ath11k_dbg(ab, ATH11K_DBG_MAC,
++		   "nss: vif %s vdev %u opmode %u netdev %px ifindex %d\n",
 +		   add ? "add" : "del", out.vdev_id, out.nss_opmode,
-+		   out.netdev ? out.netdev->name : "(none)");
++		   out.netdev, out.netdev ? out.netdev->ifindex : -1);
 +
 +	fn(ctx, &out, add);
 +}
@@ -2115,7 +2185,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +EXPORT_SYMBOL(ath11k_nss_dp_htt_refill_setup);
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.h
-@@ -0,0 +1,41 @@
+@@ -0,0 +1,86 @@
 +/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 +/*
 + * The NSS wifili offload, inside the driver.
@@ -2131,7 +2201,8 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * outside the driver: the ordering had to be arranged in /etc/modules.d, a
 + * failed handover left a radio unable to receive, and every hook was a pointer
 + * read from softirq context with no lock.  nss_export.c stays - the probe is
-+ * still useful as a diagnostic and it is the only consumer of that API.
++ * still useful as a diagnostic and is the only consumer of that API - and
++ * while both exist the nss_inbuilt module parameter picks between them.
 + */
 +#ifndef ATH11K_NSS_H
 +#define ATH11K_NSS_H
@@ -2139,8 +2210,52 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +#include <linux/types.h>
 +
 +struct ath11k_base;
++struct device;
++struct net_device;
 +
-+/* Is the NSS core present and usable at all? */
++/* NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG.  Checked against it in nss.c. */
++#define ATH11K_NSS_MAX_TX_PAGES		32
++
++/*
++ * Per-SoC state.  One of these lives on struct ath11k_base, which is the
++ * whole point of being in the driver: the probe kept the same fields in an
++ * array indexed by a slot number derived from the chip id, and three separate
++ * dual-radio bugs were one instance of that array being reached from the wrong
++ * radio.
++ *
++ * ctx is void * so that this header does not have to pull in the NSS ones;
++ * it is a struct nss_ctx_instance *.
++ */
++struct ath11k_nss_soc {
++	/* the handover completed and NSS owns this SoC's data path */
++	bool enabled;
++
++	/* wifili interface: internal, or one of the external ones */
++	int if_num;
++
++	/* the radio dynamic interface a pdev hangs off, and its thread scheme */
++	int radio_if_num;
++	u8 scheme_id;
++
++	void *ctx;
++
++	/*
++	 * Every NSS register call wants a netdev.  The SoC- and radio-level
++	 * registrations have no real one to give - they carry control messages,
++	 * not frames - so they get this.
++	 */
++	struct net_device *dummy;
++
++	struct device *dma_dev;
++
++	/* the Tx descriptor pool handed to the firmware */
++	int tx_pages;
++	int tx_ext_first_page;
++	void *tx_page_va[ATH11K_NSS_MAX_TX_PAGES];
++	dma_addr_t tx_page_pa[ATH11K_NSS_MAX_TX_PAGES];
++};
++
++/* Is there an NSS core on this platform at all? */
 +bool ath11k_nss_available(void);
 +
 +/*
@@ -2153,49 +2268,701 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + */
 +int ath11k_nss_setup(struct ath11k_base *ab);
 +
-+/* Give it back.  Safe to call when setup never ran. */
++/* Give it back.  Safe to call when setup never ran, and idempotent. */
 +void ath11k_nss_teardown(struct ath11k_base *ab);
 +
 +#endif /* ATH11K_NSS_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,691 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
-+ * NSS wifili offload for ath11k.  See nss.h.
++ * NSS wifili offload for ath11k.  See nss.h for why this is here.
 + *
-+ * Nothing calls into here yet: this file currently exists to prove that ath11k
-+ * can include the qca-nss-drv headers and resolve its symbols at load time.
-+ * That is not a formality - ath11k lives in the mac80211 backports package,
-+ * which compiles before qca-nss-drv unless the package dependency reorders it,
-+ * and the backports build overrides some of the flag variables an out-of-tree
-+ * module would use.
++ * This is a transliteration of the bring-up sequence that nss_wifili_probe.ko
++ * arrived at, not a fresh implementation of it: the message layouts, the field
++ * values and the order they are sent in are the ones that were measured, and
++ * the comments that record why a value is what it is have been carried across
++ * with it.  The differences are structural - state lives on struct ath11k_base
++ * instead of in a slot-indexed array, and nothing is reached through a
++ * function pointer - plus the diagnostic knobs are gone.  Those stay in the
++ * probe, which is still the right tool for asking the firmware questions.
 + */
 +#include <linux/module.h>
 +#include <linux/types.h>
++#include <linux/delay.h>
++#include <linux/dma-mapping.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
 +
 +#include <nss_api_if.h>
++#include <nss_wifili_if.h>
++#include <nss_dynamic_interface.h>
++#include <nss_wifi_vdev.h>
 +
 +#include "core.h"
 +#include "debug.h"
++#include "ath11k_nss_export.h"
 +#include "nss.h"
++
++/*
++ * One handover at a time.  Both SoCs reach ath11k_core_pdev_create() from
++ * their own QMI worker and on this board they arrive about 100 ms apart, so
++ * without this they interleave.  Their own state is per-ab and safe, but the
++ * NSS allocators they call - nss_get_available_wifili_external_if() and
++ * nss_dynamic_interface_alloc_node() - hand out from one global pool.  The
++ * probe never met this because it serialised every run behind its own mutex.
++ */
++static DEFINE_MUTEX(ath11k_nss_setup_lock);
++
++/*
++ * nss_wifili_msg_init() is EXPORT_SYMBOL()ed by qca-nss-drv but never declared
++ * in its exported headers - the same omission the upstream feed patched for
++ * nss_wifili_get_context().  Declare it rather than patch that driver.
++ */
++extern void nss_wifili_msg_init(struct nss_wifili_msg *ncm, uint16_t if_num,
++				uint32_t type, uint32_t len, void *cb,
++				void *app_data);
++
++/*
++ * The Tx descriptor pool.  The firmware fixes the descriptor sizes; the host
++ * hands it whole pages and says where the extended descriptors start.
++ *
++ * 245760 divides by both 80 and 160 exactly.  The previous 64 KiB page divided
++ * neither, so the last descriptor of a page had only part of itself inside it
++ * and the write ran past the allocation - corruption whose symptom depended on
++ * what happened to be next in memory.
++ */
++#define ATH11K_NSS_TX_DESC_SZ		80
++#define ATH11K_NSS_TX_EXT_DESC_SZ	160
++#define ATH11K_NSS_TX_PAGE_SZ		245760
++#define ATH11K_NSS_NUM_TX_DESC		4096
++
++/*
++ * WLAN_CFG_RX_SW_DESC_NUM_SIZE from the vendor's cfg_dp.h, QCA_LOWMEM_CONFIG
++ * branch - the profile this 256 MB board builds as.  Measured against 1024
++ * (ath11k's own refill ring size) over twelve runs: throughput is identical
++ * within the run-to-run spread, but rx_desc_alloc_fail goes from roughly two
++ * thirds of reo_reaped to exactly zero.
++ */
++#define ATH11K_NSS_RX_SW_DESC_NUM	4096
++
++/*
++ * nss_wifili_init_msg.flags.  The stripped vendor wifi_3_0.ko sets 0x40
++ * unconditionally in two QSDK generations, which makes it a premise rather
++ * than a feature.  The four documented bits (CCE_DISABLED, ADDTL_MEM_SEG_SET,
++ * PEXT_STATS_ENABLED, MULTISOC_THREAD_MAP_ENABLE) all apply to configurations
++ * this board does not have.
++ */
++#define ATH11K_NSS_INIT_FLAGS		0x40
++
++/* soc_mem_profile: the vendor binary writes 1 unconditionally. */
++#define ATH11K_NSS_MEM_PROFILE		1
++
++#define ATH11K_NSS_INTERNODE_Q		1024
++#define ATH11K_NSS_TX_DEVICE_LIMIT	65536
++
++/*
++ * How many REO destination rings to declare.  NSS reaps ring 0 only, and
++ * ath11k_nss_dp_reo_to_ring0() points every hash bucket at it before the
++ * firmware is told about the rings, so declaring the other three would
++ * describe rings nothing ever services.
++ */
++#define ATH11K_NSS_NUM_REO_RINGS	1
++
++/* ------------------------------------------------------------------ replies */
++
++/*
++ * The firmware emits unsolicited events on the same callback as replies, at
++ * about 1 Hz under load.  Deciding by message type alone missed them: the one
++ * this firmware actually sends is type 16, NSS_WIFILI_WDS_ACTIVE_INFO_MSG, and
++ * an earlier filter that only knew about type 10 let nine of them through in a
++ * single run.  The robust test is the response field - NOTIFY means "event,
++ * not answer" whatever the type is - and the type list is belt and braces for
++ * firmware that sends an event with a response of 0.
++ */
++static bool ath11k_nss_msg_is_event(const struct nss_wifili_msg *msg)
++{
++	switch (msg->cm.type) {
++	case 10:	/* NSS_WIFILI_STATS_MSG */
++	case 12:	/* NSS_WIFILI_PEER_STATS_MSG */
++	case 16:	/* NSS_WIFILI_WDS_ACTIVE_INFO_MSG */
++	case 41:	/* NSS_WIFILI_PEER_4ADDR_EVENT_MSG */
++	case 53:	/* NSS_WIFILI_ASTENTRY_SYNC_MSG */
++	case 54:	/* NSS_WIFILI_MECENTRY_SYNC_MSG */
++		return true;
++	default:
++		return msg->cm.response == NSS_CMN_RESPONSE_NOTIFY;
++	}
++}
++
++/*
++ * nss_wifili_tx_msg_sync() does the waiting and returns the verdict, so this
++ * exists only to put the firmware's own error number in the log - the status
++ * code says "it failed", the error number says what it objected to.
++ */
++static void ath11k_nss_event_cb(void *app_data, struct nss_wifili_msg *msg)
++{
++	struct ath11k_base *ab = app_data;
++
++	if (!msg)
++		return;
++
++	if (ath11k_nss_msg_is_event(msg))
++		return;
++
++	if (msg->cm.response != NSS_CMN_RESPONSE_ACK && ab)
++		ath11k_warn(ab, "nss: reply type=%u response=%u error=%u\n",
++			    msg->cm.type, msg->cm.response, msg->cm.error);
++}
++
++/*
++ * Registered because the register calls require one.  Frames arrive on the
++ * per-vdev callbacks, not here; anything that turns up is a surprise worth one
++ * line in the log.
++ */
++static void ath11k_nss_data_cb(struct net_device *dev, struct sk_buff *skb,
++			       struct napi_struct *napi)
++{
++	pr_warn_once("ath11k: nss: unexpected frame on a control interface\n");
++	dev_kfree_skb_any(skb);
++}
++
++static int ath11k_nss_send_simple(struct ath11k_base *ab, u32 type,
++				  const char *what, bool may_fail)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct nss_wifili_msg *msg;
++	nss_tx_status_t status;
++
++	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	nss_wifili_msg_init(msg, nss->if_num, type, 0,
++			    ath11k_nss_event_cb, ab);
++	status = nss_wifili_tx_msg_sync(nss->ctx, msg);
++	kfree(msg);
++
++	if (status != NSS_TX_SUCCESS) {
++		if (may_fail)
++			ath11k_dbg(ab, ATH11K_DBG_BOOT,
++				   "nss: %s declined (%d), expected on a core that has not run\n",
++				   what, status);
++		else
++			ath11k_warn(ab, "nss: %s failed (%d)\n", what, status);
++		return -EIO;
++	}
++
++	ath11k_dbg(ab, ATH11K_DBG_BOOT, "nss: %s ok\n", what);
++	return 0;
++}
++
++/* --------------------------------------------------------- Tx descriptors */
++
++static void ath11k_nss_free_tx_pages(struct ath11k_base *ab)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	int i;
++
++	for (i = 0; i < nss->tx_pages; i++)
++		if (nss->tx_page_va[i])
++			dma_free_coherent(nss->dma_dev, ATH11K_NSS_TX_PAGE_SZ,
++					  nss->tx_page_va[i],
++					  nss->tx_page_pa[i]);
++
++	memset(nss->tx_page_va, 0, sizeof(nss->tx_page_va));
++	nss->tx_pages = 0;
++	nss->tx_ext_first_page = 0;
++}
++
++static int ath11k_nss_alloc_tx_pages(struct ath11k_base *ab, struct device *dev)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	u32 reg_bytes, ext_bytes;
++	int reg_pages, ext_pages, total, i;
++
++	BUILD_BUG_ON(ATH11K_NSS_MAX_TX_PAGES !=
++		     NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG);
++
++	if (nss->tx_pages)
++		return 0;
++
++	/* one spare descriptor: the firmware indexes from 1 */
++	reg_bytes = ATH11K_NSS_TX_DESC_SZ * (ATH11K_NSS_NUM_TX_DESC + 1);
++	ext_bytes = ATH11K_NSS_TX_EXT_DESC_SZ * (ATH11K_NSS_NUM_TX_DESC + 1);
++	reg_pages = DIV_ROUND_UP(reg_bytes, ATH11K_NSS_TX_PAGE_SZ);
++	ext_pages = DIV_ROUND_UP(ext_bytes, ATH11K_NSS_TX_PAGE_SZ);
++	total = reg_pages + ext_pages;
++
++	if (total > ATH11K_NSS_MAX_TX_PAGES) {
++		ath11k_warn(ab, "nss: tx pool needs %d pages, max %d\n",
++			    total, ATH11K_NSS_MAX_TX_PAGES);
++		return -ENOMEM;
++	}
++
++	nss->dma_dev = dev;
++	for (i = 0; i < total; i++) {
++		nss->tx_page_va[i] = dma_alloc_coherent(dev,
++							ATH11K_NSS_TX_PAGE_SZ,
++							&nss->tx_page_pa[i],
++							GFP_KERNEL);
++		if (!nss->tx_page_va[i]) {
++			ath11k_warn(ab, "nss: tx pool page %d failed\n", i);
++			nss->tx_pages = i;
++			ath11k_nss_free_tx_pages(ab);
++			return -ENOMEM;
++		}
++	}
++
++	nss->tx_pages = total;
++	nss->tx_ext_first_page = reg_pages;
++
++	ath11k_dbg(ab, ATH11K_DBG_BOOT,
++		   "nss: tx pool %d desc, %d regular + %d ext pages, ext at %d\n",
++		   ATH11K_NSS_NUM_TX_DESC, reg_pages, ext_pages, reg_pages);
++	return 0;
++}
++
++/* -------------------------------------------------------- radio interface */
++
++/*
++ * The radio interface type has to match the wifili interface it hangs off: an
++ * external SoC's radio is EXTERNAL0/1, not INTERNAL.  Getting this wrong gets
++ * a node NSS will not associate with the pdev - the firmware took the
++ * PDEV_INIT and then died between it and START.
++ */
++static enum nss_dynamic_interface_type
++ath11k_nss_radio_di_type(struct ath11k_base *ab)
++{
++	if (ab->nss.if_num == NSS_WIFILI_INTERNAL_INTERFACE)
++		return NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_INTERNAL;
++
++	return ab->nss.if_num == NSS_WIFILI_EXTERNAL_INTERFACE1 ?
++		NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL1 :
++		NSS_DYNAMIC_INTERFACE_TYPE_WIFILI_EXTERNAL0;
++}
++
++/*
++ * The vendor does this before every PDEV_INIT: allocate a dynamic interface of
++ * the wifili radio type, register it, then ask for a thread scheme against it.
++ * scheme_id is the only part that reaches the firmware, but the firmware
++ * validates it - NSS_WIFILI_EMSG_PDEV_INIT_FAIL_INVALID_THREAD_SCHEME_ID
++ * exists - so a hardcoded 0 is not the same as one the allocator handed out.
++ */
++static int ath11k_nss_radio_if_alloc(struct ath11k_base *ab)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct nss_ctx_instance *rctx;
++	int ifnum;
++
++	if (nss->radio_if_num >= 0)
++		return 0;
++
++	ifnum = nss_dynamic_interface_alloc_node(ath11k_nss_radio_di_type(ab));
++	if (ifnum < 0) {
++		ath11k_warn(ab, "nss: radio interface alloc failed (%d)\n",
++			    ifnum);
++		return ifnum;
++	}
++
++	rctx = nss_register_wifili_radio_if(ifnum, ath11k_nss_data_cb,
++					    ath11k_nss_data_cb,
++					    ath11k_nss_event_cb,
++					    nss->dummy, 0);
++	if (!rctx) {
++		ath11k_warn(ab, "nss: radio interface %d register failed\n",
++			    ifnum);
++		nss_dynamic_interface_dealloc_node(ifnum,
++					ath11k_nss_radio_di_type(ab));
++		return -ENODEV;
++	}
++
++	nss->radio_if_num = ifnum;
++	nss->scheme_id = nss_wifili_thread_scheme_alloc(nss->ctx, ifnum,
++						NSS_WIFILI_LOW_PRIORITY_SCHEME);
++
++	ath11k_dbg(ab, ATH11K_DBG_BOOT, "nss: radio if=%d scheme_id=%u\n",
++		   ifnum, nss->scheme_id);
++	return 0;
++}
++
++static void ath11k_nss_radio_if_free(struct ath11k_base *ab)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++
++	if (nss->radio_if_num < 0)
++		return;
++
++	nss_wifili_thread_scheme_dealloc(nss->ctx, nss->radio_if_num);
++	nss_unregister_wifili_radio_if(nss->radio_if_num);
++	nss_dynamic_interface_dealloc_node(nss->radio_if_num,
++					   ath11k_nss_radio_di_type(ab));
++	nss->radio_if_num = -1;
++	nss->scheme_id = 0;
++}
++
++/* ------------------------------------------------------------------- rings */
++
++static void ath11k_nss_fill_srng(struct nss_wifili_hal_srng_info *dst,
++				 const struct ath11k_nss_srng *src)
++{
++	int i;
++
++	memset(dst, 0, sizeof(*dst));
++	if (!src->valid)
++		return;
++
++	dst->ring_id		= src->ring_id;
++	dst->ring_base_paddr	= src->ring_base_paddr;
++	dst->num_entries	= src->num_entries;
++	dst->flags		= src->flags;
++	dst->ring_dir		= src->ring_dir;
++	dst->entry_size		= src->entry_size;
++
++	for (i = 0; i < NSS_WIFILI_MAX_SRNG_REG_GROUPS_MSG &&
++		    i < ATH11K_NSS_NUM_REG_GRP; i++)
++		dst->hwreg_base[i] = src->hwreg_base[i];
++}
++
++/* --------------------------------------------------------------- PDEV_INIT */
++
++/*
++ * Control messages all go to the SoC interface: nss_wifili_tx_msg() rejects
++ * anything else outright, and the vendor confirms it - nss_wifili_pdev_attach()
++ * calls nss_cmn_msg_init() with the SoC interface number even though it has
++ * just allocated a radio interface.  radio_id in the payload selects the radio.
++ */
++static int ath11k_nss_send_pdev_init(struct ath11k_base *ab,
++				     const struct ath11k_nss_dp_info *info,
++				     unsigned int r)
++{
++	const struct ath11k_nss_pdev *p = &info->pdev[r];
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct nss_wifili_pdev_init_msg *pi;
++	struct nss_wifili_msg *msg;
++	nss_tx_status_t status;
++	int ret;
++
++	if (!p->valid)
++		return 0;
++
++	ret = ath11k_nss_radio_if_alloc(ab);
++	if (ret)
++		return ret;
++
++	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	pi = &msg->msg.pdevmsg;
++	ath11k_nss_fill_srng(&pi->rxdma_ring, &p->rxdma_ring);
++	pi->radio_id		= p->radio_id;
++	pi->lmac_id		= p->lmac_id;
++	pi->target_pdev_id	= p->target_pdev_id;
++	pi->num_rx_swdesc	= ATH11K_NSS_RX_SW_DESC_NUM;
++	pi->hwmode		= 0;
++	pi->scheme_id		= nss->scheme_id;
++
++	nss_wifili_msg_init(msg, nss->if_num, NSS_WIFILI_PDEV_INIT_MSG,
++			    sizeof(struct nss_wifili_pdev_init_msg),
++			    ath11k_nss_event_cb, ab);
++
++	status = nss_wifili_tx_msg_sync(nss->ctx, msg);
++	kfree(msg);
++
++	if (status != NSS_TX_SUCCESS) {
++		ath11k_warn(ab, "nss: PDEV_INIT radio %u failed (%d)\n",
++			    r, status);
++		ath11k_nss_radio_if_free(ab);
++		return -EIO;
++	}
++
++	ath11k_dbg(ab, ATH11K_DBG_BOOT,
++		   "nss: PDEV_INIT radio=%u lmac=%u target_pdev=%u swdesc=%u scheme=%u\n",
++		   r, p->lmac_id, p->target_pdev_id,
++		   ATH11K_NSS_RX_SW_DESC_NUM, nss->scheme_id);
++	return 0;
++}
++
++/* -------------------------------------------------------------------- INIT */
++
++static int ath11k_nss_send_init(struct ath11k_base *ab,
++				const struct ath11k_nss_dp_info *info)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct nss_wifili_init_msg *init;
++	struct nss_wifili_msg *msg;
++	nss_tx_status_t status;
++	unsigned int i;
++	int ret;
++
++	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	init = &msg->msg.init;
++	init->hssm.dev_base_addr	 = info->dev_base_paddr;
++	init->hssm.shadow_rdptr_mem_addr = info->shadow_rdptr_paddr;
++	init->hssm.shadow_wrptr_mem_addr = info->shadow_wrptr_paddr;
++	init->hssm.lmac_rings_start_id	 = info->lmac_rings_start_id;
++
++	/*
++	 * Declare only rings that were actually allocated.  An early run
++	 * claimed three TCL rings where this hardware has one and the firmware
++	 * did not object, so its validation cannot be relied on to catch this.
++	 */
++	init->num_tcl_data_rings = 0;
++	for (i = 0; i < info->num_tcl_data_rings; i++)
++		if (info->tcl_ring[i].valid)
++			init->num_tcl_data_rings++;
++
++	init->num_reo_dest_rings = 0;
++	for (i = 0; i < info->num_reo_dest_rings; i++)
++		if (info->reo_dest_ring[i].valid)
++			init->num_reo_dest_rings++;
++
++	if (init->num_reo_dest_rings > ATH11K_NSS_NUM_REO_RINGS)
++		init->num_reo_dest_rings = ATH11K_NSS_NUM_REO_RINGS;
++
++	init->target_type	= info->nss_target_type;
++	init->wrip.tlv_size	= info->rx_tlv_size;
++	init->wrip.rx_buf_len	= info->rx_buf_len;
++	init->soc_mem_profile	= ATH11K_NSS_MEM_PROFILE;
++	init->flags		= ATH11K_NSS_INIT_FLAGS;
++
++	for (i = 0; i < info->num_tcl_data_rings; i++) {
++		ath11k_nss_fill_srng(&init->tcl_ring_info[i],
++				     &info->tcl_ring[i]);
++		ath11k_nss_fill_srng(&init->tx_comp_ring[i],
++				     &info->tx_comp_ring[i]);
++	}
++	for (i = 0; i < info->num_reo_dest_rings; i++)
++		ath11k_nss_fill_srng(&init->reo_dest_ring[i],
++				     &info->reo_dest_ring[i]);
++
++	ath11k_nss_fill_srng(&init->reo_exception_ring,
++			     &info->reo_exception_ring);
++	ath11k_nss_fill_srng(&init->rx_rel_ring, &info->rx_rel_ring);
++	ath11k_nss_fill_srng(&init->reo_reinject_ring,
++			     &info->reo_reinject_ring);
++
++	ret = ath11k_nss_alloc_tx_pages(ab, info->dma_dev);
++	if (ret) {
++		kfree(msg);
++		return ret;
++	}
++
++	init->wtdim.num_tx_desc		= ATH11K_NSS_NUM_TX_DESC;
++	init->wtdim.num_tx_desc_ext	= ATH11K_NSS_NUM_TX_DESC;
++	init->wtdim.num_pool		= info->num_radios ? : 1;
++	init->wtdim.num_memaddr		= nss->tx_pages;
++	init->wtdim.ext_desc_page_num	= nss->tx_ext_first_page;
++	init->wtdim.num_tx_device_limit	= ATH11K_NSS_TX_DEVICE_LIMIT;
++	init->tx_sw_internode_queue_size = ATH11K_NSS_INTERNODE_Q;
++	for (i = 0; i < (unsigned int)nss->tx_pages; i++) {
++		init->wtdim.memory_addr[i] = (u32)nss->tx_page_pa[i];
++		init->wtdim.memory_size[i] = ATH11K_NSS_TX_PAGE_SZ;
++	}
++
++	ath11k_dbg(ab, ATH11K_DBG_BOOT,
++		   "nss: INIT tcl=%u reo=%u tlv=%u rx_buf_len=%u target=%u\n",
++		   init->num_tcl_data_rings, init->num_reo_dest_rings,
++		   init->wrip.tlv_size, init->wrip.rx_buf_len,
++		   init->target_type);
++
++	nss_wifili_msg_init(msg, nss->if_num, NSS_WIFILI_INIT_MSG,
++			    sizeof(struct nss_wifili_init_msg),
++			    ath11k_nss_event_cb, ab);
++
++	status = nss_wifili_tx_msg_sync(nss->ctx, msg);
++	kfree(msg);
++
++	if (status != NSS_TX_SUCCESS) {
++		ath11k_warn(ab, "nss: INIT rejected (%d)\n", status);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++/* ------------------------------------------------------------------- setup */
 +
 +bool ath11k_nss_available(void)
 +{
 +	return nss_cmn_get_nss_enabled();
 +}
 +
++static int ath11k_nss_wifili_register(struct ath11k_base *ab, int slot)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++
++	if (nss->ctx)
++		return 0;
++
++	/*
++	 * Slot 0 is the internal radio and takes the internal wifili
++	 * interface; anything else asks for one of the external ones.  The
++	 * slot itself comes from the chip id, not from probe order.
++	 */
++	if (slot == 0) {
++		nss->if_num = NSS_WIFILI_INTERNAL_INTERFACE;
++	} else {
++		nss->if_num = nss_get_available_wifili_external_if();
++		if (nss->if_num == -1) {
++			ath11k_warn(ab, "nss: no external wifili interface\n");
++			return -ENODEV;
++		}
++	}
++
++	nss->ctx = nss_register_wifili_if(nss->if_num, ath11k_nss_data_cb,
++					  ath11k_nss_data_cb,
++					  ath11k_nss_event_cb, nss->dummy, 0);
++	if (!nss->ctx) {
++		ath11k_warn(ab, "nss: wifili interface %d register failed\n",
++			    nss->if_num);
++		return -ENODEV;
++	}
++
++	ath11k_dbg(ab, ATH11K_DBG_BOOT, "nss: wifili interface %d registered\n",
++		   nss->if_num);
++	return 0;
++}
++
 +int ath11k_nss_setup(struct ath11k_base *ab)
 +{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct ath11k_nss_dp_info *info;
++	unsigned int i;
++	int slot, ret;
++
++	if (nss->enabled)
++		return 0;
++
 +	if (!ath11k_nss_available()) {
 +		ath11k_warn(ab, "nss: no NSS core on this platform\n");
 +		return -ENOTSUPP;
 +	}
 +
-+	ath11k_info(ab, "nss: in-driver handover is not implemented yet\n");
-+	return -EOPNOTSUPP;
++	slot = ath11k_nss_soc_slot(ab);
++	if (slot < 0) {
++		ath11k_warn(ab, "nss: no wifili slot for this chip\n");
++		return -ENOTSUPP;
++	}
++
++	nss->radio_if_num = -1;
++
++	info = kzalloc(sizeof(*info), GFP_KERNEL);
++	if (!info)
++		return -ENOMEM;
++
++	mutex_lock(&ath11k_nss_setup_lock);
++
++	ret = ath11k_nss_get_dp_info(slot, info);
++	if (ret) {
++		ath11k_warn(ab, "nss: cannot read the data path layout (%d)\n",
++			    ret);
++		goto free_info;
++	}
++
++	if (!nss->dummy) {
++		nss->dummy = alloc_netdev_dummy(0);
++		if (!nss->dummy) {
++			ret = -ENOMEM;
++			goto free_info;
++		}
++	}
++
++	ret = ath11k_nss_wifili_register(ab, slot);
++	if (ret)
++		goto free_dummy;
++
++	/*
++	 * Narrow the REO hash map to destination ring 0 before the firmware is
++	 * told about the rings.  NSS reaps ring 0 only; with ath11k's four-way
++	 * hash split in place most frames land in rings nothing services.
++	 */
++	ret = ath11k_nss_dp_reo_to_ring0(slot);
++	if (ret)
++		ath11k_warn(ab, "nss: could not narrow the REO hash map (%d)\n",
++			    ret);
++
++	/*
++	 * Clear whatever a previous life left in the firmware.  On a cold boot
++	 * there is nothing to clear and both of these answer with an error,
++	 * which is why they are not checked - but ath11k_core_reconfigure_on_
++	 * crash() runs this whole path again on a live NSS core, and there a
++	 * reset that is not preceded by a stop is refused outright
++	 * (NSS_WIFILI_EMSG_RESET_NO_STOP exists for exactly that).
++	 */
++	ath11k_nss_send_simple(ab, NSS_WIFILI_STOP_MSG, "STOP", true);
++	msleep(100);
++	ath11k_nss_send_simple(ab, NSS_WIFILI_SOC_RESET_MSG, "SOC_RESET", true);
++	msleep(200);
++
++	ret = ath11k_nss_send_init(ab, info);
++	if (ret)
++		goto unregister;
++
++	for (i = 0; i < ATH11K_NSS_MAX_PDEV; i++) {
++		ret = ath11k_nss_send_pdev_init(ab, info, i);
++		if (ret)
++			goto unregister;
++	}
++	msleep(200);
++
++	ret = ath11k_nss_send_simple(ab, NSS_WIFILI_START_MSG, "START", false);
++	if (ret)
++		goto unregister;
++	msleep(200);
++
++	nss->enabled = true;
++	mutex_unlock(&ath11k_nss_setup_lock);
++	kfree(info);
++	ath11k_info(ab, "nss: data path handed over\n");
++	return 0;
++
++unregister:
++	ath11k_nss_radio_if_free(ab);
++	nss_unregister_wifili_if(nss->if_num);
++	nss->ctx = NULL;
++	ath11k_nss_free_tx_pages(ab);
++free_dummy:
++	free_netdev(nss->dummy);
++	nss->dummy = NULL;
++	mutex_unlock(&ath11k_nss_setup_lock);
++	kfree(info);
++	return ret;
++
++free_info:
++	mutex_unlock(&ath11k_nss_setup_lock);
++	kfree(info);
++	return ret;
 +}
 +
 +void ath11k_nss_teardown(struct ath11k_base *ab)
 +{
++	struct ath11k_nss_soc *nss = &ab->nss;
++
++	if (!nss->ctx)
++		return;
++
++	if (nss->enabled) {
++		ath11k_nss_send_simple(ab, NSS_WIFILI_STOP_MSG, "STOP", false);
++		msleep(100);
++		ath11k_nss_send_simple(ab, NSS_WIFILI_SOC_RESET_MSG,
++				       "SOC_RESET", false);
++		nss->enabled = false;
++	}
++
++	ath11k_nss_radio_if_free(ab);
++	nss_unregister_wifili_if(nss->if_num);
++	nss->ctx = NULL;
++
++	ath11k_nss_free_tx_pages(ab);
++
++	if (nss->dummy) {
++		free_netdev(nss->dummy);
++		nss->dummy = NULL;
++	}
 +}
