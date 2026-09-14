@@ -1,0 +1,58 @@
+mac80211: tell the driver about AP isolation
+
+nl80211 SET_BSS carries ap_isolate down to ieee80211_change_bss(), which sets
+IEEE80211_SDATA_DONT_BRIDGE_PACKETS on its own sdata, checks it in its own Rx
+path, and tells nobody.  A driver whose data path forwards between stations
+below mac80211 - an NSS, PPE or equivalent offload - never reaches that check,
+so `option isolate` silently does nothing on such hardware.
+
+Qualcomm carry the same fix in their tree as BSS_CHANGED_NSS_AP_ISOLATE plus a
+mac80211 operation of its own.  This is the smaller form: one bit in the
+existing changed mask and one bool in the existing bss_conf, so an ordinary
+bss_info_changed sees it and no new op is needed.
+
+Bit 32 was free; 31 and 33 were already taken.
+
+ieee80211_reconfig is deliberately not touched.  A driver that keeps the value
+across a firmware restart does not need telling again, and one that does not
+keep it would not have asked for the bit.
+
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -399,6 +399,7 @@
+ 	BSS_CHANGED_HE_BSS_COLOR	= 1<<29,
+ 	BSS_CHANGED_FILS_DISCOVERY      = 1<<30,
+ 	BSS_CHANGED_UNSOL_BCAST_PROBE_RESP = BIT_ULL(31),
++	BSS_CHANGED_AP_ISOLATE		= BIT_ULL(32),
+ 	BSS_CHANGED_MLD_VALID_LINKS	= BIT_ULL(33),
+ 	BSS_CHANGED_MLD_TTLM		= BIT_ULL(34),
+ 	BSS_CHANGED_TPE			= BIT_ULL(35),
+@@ -781,6 +782,12 @@
+ 	bool use_cts_prot;
+ 	bool use_short_preamble;
+ 	bool use_short_slot;
++
++	/* Stations on this BSS must not be forwarded to each other.  Set
++	 * alongside BSS_CHANGED_AP_ISOLATE for drivers that forward below
++	 * mac80211 and cannot see IEEE80211_SDATA_DONT_BRIDGE_PACKETS.
++	 */
++	bool ap_isolate;
+ 	bool enable_beacon;
+ 	u8 dtim_period;
+ 	u16 beacon_int;
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -3001,6 +3001,13 @@
+ 		else
+ 			sdata->flags &= ~IEEE80211_SDATA_DONT_BRIDGE_PACKETS;
+ 		ieee80211_check_fast_rx_iface(sdata);
++
++		/* A driver whose data path does its own intra-BSS forwarding
++		 * never reaches the check in ieee80211_rx_h_data(), so it has
++		 * to be told.
++		 */
++		link->conf->ap_isolate = params->ap_isolate;
++		changed |= BSS_CHANGED_AP_ISOLATE;
+ 	}
+ 
+ 	if (params->ht_opmode >= 0) {

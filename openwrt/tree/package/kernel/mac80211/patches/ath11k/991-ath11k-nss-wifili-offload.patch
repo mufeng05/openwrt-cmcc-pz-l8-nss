@@ -107,7 +107,17 @@ Diagnostic aid for bring-up, not for shipping as-is.
  
  #define SM(_v, _f) (((_v) << _f##_LSB) & _f##_MASK)
  
-@@ -931,6 +932,10 @@
+@@ -362,6 +363,9 @@
+ };
+ 
+ struct ath11k_vif {
++	/* what NSS was told about this interface; see nss.h */
++	struct arvif_nss nss;
++
+ 	u32 vdev_id;
+ 	enum wmi_vdev_type vdev_type;
+ 	enum wmi_vdev_subtype vdev_subtype;
+@@ -931,6 +935,10 @@
  	void __iomem *mem;
  	void __iomem *mem_ce;
  	unsigned long mem_len;
@@ -118,7 +128,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
  
  	struct {
  		enum ath11k_bus bus;
-@@ -1360,4 +1365,30 @@
+@@ -1360,4 +1368,30 @@
  
  void ath11k_core_pm_notifier_unregister(struct ath11k_base *ab);
  
@@ -287,6 +297,18 @@ Diagnostic aid for bring-up, not for shipping as-is.
  	err_ring = &ar->dp.rxdma_err_dst_ring[ath11k_hw_mac_id_to_srng_id(&ab->hw_params,
  									  mac_id)];
  	rx_ring = &ar->dp.rx_refill_buf_ring;
+@@ -5310,6 +5339,11 @@
+ 		arsta = ath11k_sta_to_arsta(peer->sta);
+ 		ath11k_dp_rx_update_peer_stats(arsta, ppdu_info);
+ 
++		/* the only place a station's receive rate can come from once
++		 * its frames stop passing through mac80211
++		 */
++		ath11k_nss_update_sta_rxrate(ab, ppdu_info, peer);
++
+ 		if (ath11k_debugfs_is_pktlog_peer_valid(ar, peer->addr))
+ 			trace_ath11k_htt_rxdesc(ar, skb->data, log_type, rx_buf_sz);
+ 
 --- a/drivers/net/wireless/ath/ath11k/dp_rx.h
 +++ b/drivers/net/wireless/ath/ath11k/dp_rx.h
 @@ -83,6 +83,20 @@
@@ -346,7 +368,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
  
  	if (!info->enable_beacon) {
 +		/* Stop NSS forwarding before the vdev goes down under it. */
-+		ath11k_nss_vdev_down(ar->ab, arvif->vdev_id);
++		ath11k_nss_vdev_down(arvif);
 +
  		ret = ath11k_wmi_vdev_down(ar, arvif->vdev_id);
  		if (ret)
@@ -355,12 +377,27 @@ Diagnostic aid for bring-up, not for shipping as-is.
  
  	arvif->is_up = true;
  
-+	ath11k_nss_vdev_up(ar->ab, arvif->vdev_id, arvif->vif->addr);
++	ath11k_nss_vdev_up(arvif);
 +
  	ath11k_dbg(ar->ab, ATH11K_DBG_MAC, "vdev %d up\n", arvif->vdev_id);
  }
  
-@@ -4470,6 +4475,14 @@
+@@ -3629,6 +3634,14 @@
+ 		}
+ 	}
+ 
++	if (changed & BSS_CHANGED_AP_ISOLATE) {
++		/* NSS forwards between this vdev's stations itself, below the
++		 * check mac80211 does in its own Rx path, so it is the only
++		 * thing that can honour this.
++		 */
++		ath11k_nss_vdev_set_ap_bridge(arvif, !info->ap_isolate);
++	}
++
+ 	if (changed & BSS_CHANGED_ERP_CTS_PROT) {
+ 		u32 cts_prot;
+ 
+@@ -4470,6 +4483,14 @@
  			goto exit;
  		}
  
@@ -375,7 +412,26 @@ Diagnostic aid for bring-up, not for shipping as-is.
  		if (flags == WMI_KEY_GROUP && cmd == SET_KEY && is_ap_with_no_sta)
  			arvif->reinstall_group_keys = true;
  	}
-@@ -6984,6 +6997,11 @@
+@@ -6246,6 +6267,7 @@
+ 		tlv_filter = ath11k_mac_mon_status_filter_default;
+ 		if (ath11k_debugfs_rx_filter(ar))
+ 			tlv_filter.rx_filter = ath11k_debugfs_rx_filter(ar);
++		ath11k_nss_ext_rx_stats(ar->ab, &tlv_filter);
+ 	}
+ 
+ 	for (i = 0; i < ab->hw_params.num_rxdma_per_pdev; i++) {
+@@ -6783,6 +6805,10 @@
+ 	}
+ 
+ 	memset(arvif, 0, sizeof(*arvif));
++	/* 0 is a valid NSS interface number; nss.created is what gates use of
++	 * this, but leaving it at -1 keeps a stale read obvious.
++	 */
++	arvif->nss.if_num = -1;
+ 
+ 	arvif->ar = ar;
+ 	arvif->vif = vif;
+@@ -6984,6 +7010,11 @@
  		ath11k_reg_handle_chan_list(ab, reg_info, IEEE80211_REG_LPI_AP);
  	}
  
@@ -387,7 +443,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
  	mutex_unlock(&ar->conf_mutex);
  
  	return 0;
-@@ -7038,6 +7056,9 @@
+@@ -7038,6 +7069,9 @@
  	ath11k_dbg(ab, ATH11K_DBG_MAC, "remove interface (vdev %d)\n",
  		   arvif->vdev_id);
  
@@ -397,17 +453,17 @@ Diagnostic aid for bring-up, not for shipping as-is.
  	ret = ath11k_spectral_vif_stop(arvif);
  	if (ret)
  		ath11k_warn(ab, "failed to stop spectral for vdev %i: %d\n",
-@@ -7515,6 +7536,9 @@
+@@ -7515,6 +7549,9 @@
  				    arvif->vdev_id, ret);
  			continue;
  		}
 +
 +		/* The radio moved; tell NSS the interface is live again. */
-+		ath11k_nss_vdev_up(ab, arvif->vdev_id, arvif->vif->addr);
++		ath11k_nss_vdev_up(arvif);
  	}
  
  	/* Restart the internal monitor vdev on new channel */
-@@ -9205,6 +9229,9 @@
+@@ -9205,6 +9242,9 @@
  
  	ath11k_mac_put_chain_rssi(sinfo, arsta, "ppdu", false);
  
@@ -417,7 +473,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
  	mutex_lock(&ar->conf_mutex);
  	if (!(sinfo->filled & BIT_ULL(NL80211_STA_INFO_CHAIN_SIGNAL)) &&
  	    arsta->arvif->vdev_type == WMI_VDEV_TYPE_STA &&
-@@ -9802,6 +9829,9 @@
+@@ -9802,6 +9842,9 @@
  				    sta->addr, arvif->vdev_id);
  	} else if ((old_state == IEEE80211_STA_NONE &&
  		    new_state == IEEE80211_STA_NOTEXIST)) {
@@ -427,7 +483,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
  		ret = ath11k_mac_station_remove(ar, vif, sta);
  		if (ret)
  			ath11k_warn(ar->ab, "Failed to remove station: %pM for VDEV: %d\n",
-@@ -9830,6 +9860,11 @@
+@@ -9830,6 +9873,11 @@
  		if (ret)
  			ath11k_warn(ar->ab, "Failed to associate station: %pM\n",
  				    sta->addr);
@@ -439,7 +495,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
  
  		spin_lock_bh(&ar->data_lock);
  		/* Set arsta bw and prev bw */
-@@ -9846,6 +9881,11 @@
+@@ -9846,6 +9894,11 @@
  
  		spin_unlock_bh(&ar->ab->base_lock);
  
@@ -851,7 +907,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +#endif /* ATH11K_NSS_EXPORT_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss_export.c
-@@ -0,0 +1,1273 @@
+@@ -0,0 +1,1290 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * Read-only export of ath11k's data-path ring layout for the NSS wifili probe,
@@ -1098,20 +1154,37 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	if (!ar)
 +		return -ENODEV;
 +
-+	/* The BSSID for the reconstructed header is the AP vif's own address. */
++	ether_addr_copy(da, ((struct ethhdr *)skb->data)->h_dest);
++	ether_addr_copy(sa, ((struct ethhdr *)skb->data)->h_source);
++
++	/*
++	 * The BSSID for the reconstructed header decides which interface
++	 * mac80211 hands the frame to, so it has to be the one the frame was
++	 * actually addressed to.  An uplink EAPOL's destination is the AP's
++	 * own MAC, which says exactly that.
++	 *
++	 * This used to take the first AP vif on the radio, which was right
++	 * while a radio had one.  With two, ar->arvifs is head-inserted, so
++	 * the first is the most recently added interface, and every EAPOL on
++	 * the radio went to that one: the other BSS's clients associated,
++	 * failed the handshake and retried every three seconds.
++	 */
 +	if (!mutex_trylock(&ar->conf_mutex))
 +		return -EBUSY;
-+	list_for_each_entry(iter, &ar->arvifs, list)
-+		if (iter->vif && iter->vdev_type == WMI_VDEV_TYPE_AP) {
++	list_for_each_entry(iter, &ar->arvifs, list) {
++		if (!iter->vif || iter->vdev_type != WMI_VDEV_TYPE_AP)
++			continue;
++		if (ether_addr_equal(iter->vif->addr, da)) {
 +			arvif = iter;
 +			break;
 +		}
++		if (!arvif)
++			arvif = iter;
++	}
 +	mutex_unlock(&ar->conf_mutex);
 +	if (!arvif)
 +		return -ENODEV;
 +
-+	ether_addr_copy(da, ((struct ethhdr *)skb->data)->h_dest);
-+	ether_addr_copy(sa, ((struct ethhdr *)skb->data)->h_source);
 +	skb_pull(skb, ETH_HLEN);
 +
 +	if (skb_headroom(skb) < sizeof(*hdr) + 8 &&
@@ -1893,7 +1966,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		}
 +	}
 +
-+	return ath11k_nss_tx(ab, skb, arvif->vdev_id);
++	return ath11k_nss_tx(arvif, skb);
 +}
 +EXPORT_SYMBOL(ath11k_nss_dp_tx);
 +
@@ -2072,9 +2145,9 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		   out.netdev, out.netdev ? out.netdev->ifindex : -1);
 +
 +	if (add)
-+		ath11k_nss_vdev_create(ab, &out);
++		ath11k_nss_vdev_create(arvif, &out);
 +	else
-+		ath11k_nss_vdev_delete(ab);
++		ath11k_nss_vdev_delete(arvif);
 +}
 +EXPORT_SYMBOL(ath11k_nss_vif_event);
 +
@@ -2127,7 +2200,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +EXPORT_SYMBOL(ath11k_nss_dp_htt_refill_setup);
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.h
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,259 @@
 +/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 +/*
 + * The NSS wifili offload, inside the driver.
@@ -2210,6 +2283,22 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	u32 tx_failed;
 +	u32 tx_retries;
 +	u32 rx_dropped;
++
++	/*
++	 * The same two counts as the vendor reads, and the same two from the
++	 * report's own retry sub-struct.  This firmware leaves the first pair
++	 * at zero - 650k packets with no retries is not believable - so both
++	 * are kept and whichever is populated is the one reported.
++	 */
++	u32 tx_failed_alt;
++	u32 tx_retries_alt;
++
++	/*
++	 * The rate of the last data PPDU received from this peer, parsed off
++	 * the monitor status ring.  mac80211 cannot supply it: the frames it
++	 * would have derived it from never reach it.
++	 */
++	struct rate_info rxrate;
 +};
 +
 +/*
@@ -2258,8 +2347,40 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	int vdev_if_num;
 +	struct net_device *vdev_ndev;
 +
-+	/* which vdev this interface carries, for tearing its peers down */
-+	u32 vdev_id;
++};
++
++/*
++ * Per-interface state, kept on struct ath11k_vif.
++ *
++ * This was on the SoC, one set per radio, which is why exactly one AP per
++ * radio could be offloaded - a second BSS would have overwritten the first
++ * one's interface number.  Both vendor drivers keep it per interface: QSDK
++ * 11's ath11k calls it struct arvif_nss and hangs it off struct ath11k_vif,
++ * and QSDK 12.5's qca-wifi stores the if_num on the VAP object in
++ * osif_nss_ol_vap_create().  Below the pdev, nothing on the NSS side is
++ * per-radio.
++ */
++struct arvif_nss {
++	/* the dynamic interface NSS allocated for this vdev, or -1 */
++	int if_num;
++
++	/*
++	 * The vif's own netdev, without a reference; see the note on
++	 * struct ath11k_nss_vif in ath11k_nss_export.h for why it cannot be
++	 * held or named at the point it is taken.
++	 */
++	struct net_device *ndev;
++
++	bool created;
++
++	/*
++	 * AP isolation, as NSS_WIFI_VDEV_CFG_AP_BRIDGE_CMD understands it:
++	 * NSS forwards between this vdev's stations unless told not to.
++	 * mac80211 does its own intra-BSS check in the Rx path, which the
++	 * offload never reaches, so this is the only thing that can enforce
++	 * it once frames stop entering Linux.
++	 */
++	bool ap_isolate;
 +};
 +
 +/* Is there an NSS core on this platform at all? */
@@ -2286,10 +2407,15 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +struct ieee80211_key_conf;
 +struct sk_buff;
 +
++struct ath11k_vif;
++
 +/* An AP interface appeared, or is going away. */
-+int ath11k_nss_vdev_create(struct ath11k_base *ab,
++int ath11k_nss_vdev_create(struct ath11k_vif *arvif,
 +			   const struct ath11k_nss_vif *vif);
-+void ath11k_nss_vdev_delete(struct ath11k_base *ab);
++void ath11k_nss_vdev_delete(struct ath11k_vif *arvif);
++
++/* Whether NSS may forward between this interface's own stations. */
++void ath11k_nss_vdev_set_ap_bridge(struct ath11k_vif *arvif, bool bridge);
 +
 +/*
 + * The station lifecycle, as mac80211 reports it.  All three are called from
@@ -2308,6 +2434,18 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +
 +/* Fill in what only NSS knows about a station. */
 +struct station_info;
++struct hal_rx_mon_ppdu_info;
++struct htt_rx_ring_tlv_filter;
++
++/*
++ * The monitor status ring is still the host's under the offload; these are
++ * what make it carry, and then record, a station's receive rate.
++ */
++void ath11k_nss_ext_rx_stats(struct ath11k_base *ab,
++			     struct htt_rx_ring_tlv_filter *tlv_filter);
++void ath11k_nss_update_sta_rxrate(struct ath11k_base *ab,
++				  struct hal_rx_mon_ppdu_info *ppdu_info,
++				  struct ath11k_peer *peer);
 +void ath11k_nss_update_sta_stats(struct ath11k *ar, struct ieee80211_sta *sta,
 +				 struct station_info *sinfo);
 +
@@ -2315,16 +2453,16 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * The AP started or stopped beaconing, or its radio is about to restart on
 + * another channel.  Both are called with ar->conf_mutex held.
 + */
-+void ath11k_nss_vdev_up(struct ath11k_base *ab, u32 vdev_id, const u8 *mac);
-+void ath11k_nss_vdev_down(struct ath11k_base *ab, u32 vdev_id);
++void ath11k_nss_vdev_up(struct ath11k_vif *arvif);
++void ath11k_nss_vdev_down(struct ath11k_vif *arvif);
 +
 +/* Hand a frame to NSS instead of putting it in TCL. */
-+int ath11k_nss_tx(struct ath11k_base *ab, struct sk_buff *skb, u32 vdev_id);
++int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb);
 +
 +#endif /* ATH11K_NSS_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -0,0 +1,1946 @@
+@@ -0,0 +1,2163 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * NSS wifili offload for ath11k.  See nss.h for why this is here.
@@ -2354,6 +2492,8 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +#include "debug.h"
 +#include "peer.h"
 +#include "dp_rx.h"
++#include "hal_rx.h"
++#include "mac.h"
 +#include "ath11k_nss_export.h"
 +#include "nss.h"
 +
@@ -2466,7 +2606,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * returns.
 + */
 +#define ATH11K_NSS_SOCS			2
-+static struct ath11k_base *ath11k_nss_ndev_owner[ATH11K_NSS_SOCS];
++#define ATH11K_NSS_MAX_VDEVS		16
 +
 +static atomic_t ath11k_nss_rx_data = ATOMIC_INIT(0);
 +static atomic_t ath11k_nss_rx_ext = ATOMIC_INIT(0);
@@ -2475,6 +2615,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +static atomic_t ath11k_nss_rx_eapol = ATOMIC_INIT(0);
 +static atomic_t ath11k_nss_rx_up = ATOMIC_INIT(0);
 +static atomic_t ath11k_nss_rx_extdrop = ATOMIC_INIT(0);
++
 +
 +static int ath11k_nss_rxstats_get(char *buf, const struct kernel_param *kp)
 +{
@@ -2488,6 +2629,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +			 atomic_read(&ath11k_nss_rx_up),
 +			 atomic_read(&ath11k_nss_rx_extdrop));
 +}
++
 +
 +static const struct kernel_param_ops ath11k_nss_rxstats_ops = {
 +	.get = ath11k_nss_rxstats_get,
@@ -2517,17 +2659,63 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	return NULL;
 +}
 +
-+static struct ath11k_base *ath11k_nss_ab_of_netdev(struct net_device *dev)
++/*
++ * Every offloaded interface, so that a callback holding only a netdev - or a
++ * peer holding only a vdev id - can find the one it belongs to.  Written
++ * under ar->conf_mutex when an interface is created or destroyed, read from
++ * softirq, which is what the ONCE accessors are for.
++ */
++static struct ath11k_vif *ath11k_nss_vdev_owner[ATH11K_NSS_MAX_VDEVS];
++
++static struct ath11k_vif *ath11k_nss_arvif_of_netdev(struct net_device *dev)
 +{
 +	unsigned int i;
 +
-+	for (i = 0; i < ATH11K_NSS_SOCS; i++) {
-+		struct ath11k_base *ab = READ_ONCE(ath11k_nss_ndev_owner[i]);
++	if (!dev)
++		return NULL;
 +
-+		if (ab && ab->nss.vdev_ndev == dev)
-+			return ab;
++	for (i = 0; i < ATH11K_NSS_MAX_VDEVS; i++) {
++		struct ath11k_vif *arvif = READ_ONCE(ath11k_nss_vdev_owner[i]);
++
++		if (arvif && READ_ONCE(arvif->nss.ndev) == dev)
++			return arvif;
 +	}
 +	return NULL;
++}
++
++static struct ath11k_vif *ath11k_nss_arvif_of_vdev(struct ath11k_base *ab,
++						   u32 vdev_id)
++{
++	unsigned int i;
++
++	for (i = 0; i < ATH11K_NSS_MAX_VDEVS; i++) {
++		struct ath11k_vif *arvif = READ_ONCE(ath11k_nss_vdev_owner[i]);
++
++		if (arvif && arvif->ar->ab == ab && arvif->vdev_id == vdev_id)
++			return arvif;
++	}
++	return NULL;
++}
++
++/* The netdev an offloaded frame on this vdev belongs to, or NULL. */
++static struct net_device *ath11k_nss_ndev_of_vdev(struct ath11k_base *ab,
++						  u32 vdev_id)
++{
++	struct ath11k_vif *arvif = ath11k_nss_arvif_of_vdev(ab, vdev_id);
++	struct net_device *ndev;
++
++	if (!arvif)
++		return NULL;
++
++	ndev = READ_ONCE(arvif->nss.ndev);
++	return (ndev && ndev != ab->nss.dummy) ? ndev : NULL;
++}
++
++static struct ath11k_base *ath11k_nss_ab_of_netdev(struct net_device *dev)
++{
++	struct ath11k_vif *arvif = ath11k_nss_arvif_of_netdev(dev);
++
++	return arvif ? arvif->ar->ab : NULL;
 +}
 +
 +/* ------------------------------------------------------------------ replies */
@@ -2585,13 +2773,10 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +static void ath11k_nss_peer_stats_rx(struct ath11k_base *ab,
 +				     const struct nss_wifili_peer_stats *stats)
 +{
-+	struct net_device *ndev = READ_ONCE(ab->nss.vdev_ndev);
 +	struct pcpu_sw_netstats *tstats;
 +	u64 tx_pkts, tx_bytes, rx_pkts, rx_bytes;
++	struct net_device *ndev;
 +	u32 i;
-+
-+	if (!ndev || ndev == ab->nss.dummy)
-+		return;
 +
 +	spin_lock_bh(&ab->base_lock);
 +
@@ -2599,6 +2784,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		const struct nss_wifili_peer_ctrl_stats *p = &stats->wpcs[i];
 +		struct ath11k_peer *peer;
 +		u32 tx_dropped = 0;
++		u32 p_vdev_id;
 +		int j;
 +
 +		tx_pkts  = (u64)p->tx.tx_ucast_cnt + p->tx.tx_mcast_cnt +
@@ -2615,16 +2801,26 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +			tx_dropped += p->tx.dropped.drop_stats[j];
 +
 +		peer = ath11k_peer_find_by_id(ab, p->peer_id);
-+		if (peer) {
++		if (!peer)
++			continue;
++		p_vdev_id = peer->vdev_id;
++		{
 +			peer->nss.tx_packets += tx_pkts;
 +			peer->nss.tx_bytes   += tx_bytes;
 +			peer->nss.rx_packets += rx_pkts;
 +			peer->nss.rx_bytes   += rx_bytes;
 +			peer->nss.tx_failed  += tx_dropped;
 +			peer->nss.tx_retries += p->tx.retries;
++			peer->nss.tx_failed_alt  += p->retry.tx_failed_retry_count;
++			peer->nss.tx_retries_alt += p->retry.tx_retry_count;
 +			peer->nss.rx_dropped += p->rx.err.mic_err +
 +					        p->rx.err.decrypt_err;
 +		}
++
++		/* each peer's traffic belongs to its own interface */
++		ndev = ath11k_nss_ndev_of_vdev(ab, p_vdev_id);
++		if (!ndev)
++			continue;
 +
 +		tstats = this_cpu_ptr(ndev->tstats);
 +		u64_stats_update_begin(&tstats->syncp);
@@ -2652,6 +2848,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +				 struct station_info *sinfo)
 +{
 +	struct ath11k_base *ab = ar->ab;
++	struct rate_info rxrate = {};
 +	struct ath11k_peer *peer;
 +
 +	if (!ab->nss.enabled)
@@ -2669,8 +2866,9 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	sinfo->tx_bytes	  = peer->nss.tx_bytes;
 +	sinfo->rx_packets = peer->nss.rx_packets;
 +	sinfo->rx_bytes	  = peer->nss.rx_bytes;
-+	sinfo->tx_failed  = peer->nss.tx_failed;
-+	sinfo->tx_retries = peer->nss.tx_retries;
++	sinfo->tx_failed  = peer->nss.tx_failed ? : peer->nss.tx_failed_alt;
++	sinfo->tx_retries = peer->nss.tx_retries ? : peer->nss.tx_retries_alt;
++	rxrate = peer->nss.rxrate;
 +
 +	spin_unlock_bh(&ab->base_lock);
 +
@@ -2680,6 +2878,114 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +			 BIT_ULL(NL80211_STA_INFO_RX_BYTES64) |
 +			 BIT_ULL(NL80211_STA_INFO_TX_FAILED) |
 +			 BIT_ULL(NL80211_STA_INFO_TX_RETRIES);
++
++	if (rxrate.legacy || rxrate.nss) {
++		sinfo->rxrate = rxrate;
++		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
++	}
++}
++
++/*
++ * The monitor status TLV that carries a received PPDU's peer id and rate.
++ *
++ * It is not in ath11k's default filter, and without it the per-PPDU block in
++ * ath11k_dp_rx_process_mon_status() never runs: it bails on an invalid peer
++ * id, and the peer id is in this TLV.  On the host path none of that matters,
++ * because the receive rate comes off each frame's ieee80211_rx_status - but
++ * an offloaded frame has no such thing.
++ */
++void ath11k_nss_ext_rx_stats(struct ath11k_base *ab,
++			     struct htt_rx_ring_tlv_filter *tlv_filter)
++{
++	if (!ab->nss.enabled)
++		return;
++
++	/*
++	 * Two TLVs, not one.  PPDU_END_USER_STATS carries the peer id and the
++	 * preamble type - without it ath11k_dp_rx_process_mon_status() bails
++	 * on an invalid peer id and never reaches the per-PPDU block at all.
++	 * The rate itself is not in it: mcs, nss and bw come from the HT/VHT/HE
++	 * SIG TLVs and the legacy rate from L-SIG, all of which arrive with
++	 * PPDU_START.  With only the first, every station reported 6.0 Mbit/s -
++	 * the L-SIG base rate left over in a field nothing had written.
++	 */
++	tlv_filter->rx_filter |= HTT_RX_FILTER_TLV_FLAGS_PPDU_START |
++				 HTT_RX_FILTER_TLV_FLAGS_PPDU_END_USER_STATS;
++}
++
++/*
++ * One received PPDU's rate, recorded against the peer that sent it.  Called
++ * from the monitor status ring with ab->base_lock held.
++ *
++ * This is the vendor's conversion; their two call sites - one for MU, one for
++ * SU - do not exist in this ath11k, whose monitor path has a single place
++ * holding both the peer and a parsed ppdu_info.
++ */
++void ath11k_nss_update_sta_rxrate(struct ath11k_base *ab,
++				  struct hal_rx_mon_ppdu_info *ppdu_info,
++				  struct ath11k_peer *peer)
++{
++	static const u16 legacy_rates[ATH11K_LEGACY_NUM] = {
++		10, 20, 55, 60, 90, 110, 120, 180, 240, 360, 480, 540
++	};
++	struct rate_info rate = {};
++
++	if (!ab->nss.enabled || !peer->nss.created)
++		return;
++
++	/*
++	 * The vendor skips anything that is not a data frame.  This firmware
++	 * does not fill frame_control from the TLVs the monitor status ring
++	 * carries, so that test is unconditionally false here and threw every
++	 * PPDU away: counted over one run, 1489 of 1489 rejected, 1466 of them
++	 * HE with the mcs and nss the station was really using.  Keep the
++	 * vendor's intent where the field says something and ignore it where
++	 * it says nothing.
++	 */
++	if (ppdu_info->frame_control &&
++	    !ieee80211_is_data(cpu_to_le16(ppdu_info->frame_control)))
++		return;
++
++	switch (ppdu_info->preamble_type) {
++	case WMI_RATE_PREAMBLE_CCK:
++	case WMI_RATE_PREAMBLE_OFDM:
++		if (ppdu_info->rate >= ATH11K_LEGACY_NUM)
++			return;
++		rate.legacy = legacy_rates[ppdu_info->rate];
++		break;
++	case WMI_RATE_PREAMBLE_HT:
++		if (ppdu_info->mcs >= ATH11K_HT_MCS_NUM)
++			return;
++		rate.mcs = ppdu_info->mcs;
++		rate.flags = RATE_INFO_FLAGS_MCS;
++		if (ppdu_info->gi)
++			rate.flags |= RATE_INFO_FLAGS_SHORT_GI;
++		break;
++	case WMI_RATE_PREAMBLE_VHT:
++		if (ppdu_info->mcs > ATH11K_VHT_MCS_MAX)
++			return;
++		rate.mcs = ppdu_info->mcs;
++		rate.flags = RATE_INFO_FLAGS_VHT_MCS;
++		if (ppdu_info->gi)
++			rate.flags |= RATE_INFO_FLAGS_SHORT_GI;
++		break;
++	case WMI_RATE_PREAMBLE_HE:
++		if (ppdu_info->mcs > ATH11K_HE_MCS_MAX)
++			return;
++		rate.mcs = ppdu_info->mcs;
++		rate.flags = RATE_INFO_FLAGS_HE_MCS;
++		rate.he_dcm = ppdu_info->dcm;
++		rate.he_gi = ath11k_mac_he_gi_to_nl80211_he_gi(ppdu_info->gi);
++		rate.he_ru_alloc = ppdu_info->ru_alloc;
++		break;
++	default:
++		return;
++	}
++
++	rate.nss = ppdu_info->nss ? : 1;
++	rate.bw = ath11k_mac_bw_to_mac80211_bw(ppdu_info->bw);
++
++	peer->nss.rxrate = rate;
 +}
 +
 +static void ath11k_nss_event_cb(void *app_data, struct nss_wifili_msg *msg)
@@ -2723,14 +3029,12 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +static void ath11k_nss_mic_error(struct ath11k_base *ab, struct sk_buff *skb)
 +{
 +	struct hal_rx_desc *desc = (struct hal_rx_desc *)skb->data;
-+	struct net_device *ndev = READ_ONCE(ab->nss.vdev_ndev);
 +	u8 peer_addr[ETH_ALEN], keyidx;
 +	struct ath11k_peer *peer;
++	struct net_device *ndev;
++	u32 vdev_id;
 +	bool is_mcbc;
 +	u16 peer_id;
-+
-+	if (!ndev || ndev == ab->nss.dummy)
-+		goto drop;
 +
 +	if (!ath11k_dp_rx_h_msdu_end_first_msdu(ab, desc))
 +		goto drop;
@@ -2746,7 +3050,12 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	}
 +	ether_addr_copy(peer_addr, peer->addr);
 +	keyidx = is_mcbc ? peer->mcast_keyidx : peer->ucast_keyidx;
++	vdev_id = peer->vdev_id;
 +	spin_unlock_bh(&ab->base_lock);
++
++	ndev = ath11k_nss_ndev_of_vdev(ab, vdev_id);
++	if (!ndev)
++		goto drop;
 +
 +	cfg80211_michael_mic_failure(ndev, peer_addr,
 +				     is_mcbc ? NL80211_KEYTYPE_GROUP :
@@ -3562,7 +3871,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	struct ath11k_base *ab = ar->ab;
 +	struct ath11k_peer *peer;
 +
-+	if (!ab->nss.enabled || ab->nss.vdev_if_num < 0)
++	if (!ab->nss.enabled || !ath11k_vif_to_arvif(vif)->nss.created)
 +		return;
 +
 +	peer = ath11k_nss_peer_of(ab, vif, sta);
@@ -3812,12 +4121,12 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * Hand a frame ath11k was about to put in TCL to NSS instead.  Called from
 + * ath11k_nss_dp_tx(), which has already converted an 802.11 frame to 802.3.
 + */
-+int ath11k_nss_tx(struct ath11k_base *ab, struct sk_buff *skb, u32 vdev_id)
++int ath11k_nss_tx(struct ath11k_vif *arvif, struct sk_buff *skb)
 +{
-+	struct ath11k_nss_soc *nss = &ab->nss;
++	struct ath11k_nss_soc *nss = &arvif->ar->ab->nss;
 +	nss_tx_status_t status;
 +
-+	if (nss->vdev_if_num < 0 || !nss->ctx)
++	if (!arvif->nss.created || !nss->ctx)
 +		return -ENODEV;
 +
 +	if (skb->len <= ETH_HLEN)
@@ -3832,7 +4141,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		return -ENOMEM;
 +
 +	skb->next = NULL;
-+	status = nss_wifi_vdev_tx_buf(nss->ctx, skb, nss->vdev_if_num);
++	status = nss_wifi_vdev_tx_buf(nss->ctx, skb, arvif->nss.if_num);
 +	if (status != NSS_TX_SUCCESS)
 +		return -EIO;
 +
@@ -3840,16 +4149,18 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	return 0;
 +}
 +
-+int ath11k_nss_vdev_create(struct ath11k_base *ab,
++int ath11k_nss_vdev_create(struct ath11k_vif *arvif,
 +			   const struct ath11k_nss_vif *vif)
 +{
++	struct ath11k_base *ab = arvif->ar->ab;
 +	struct ath11k_nss_soc *nss = &ab->nss;
 +	struct nss_wifi_vdev_config_msg *cfg;
 +	struct nss_wifi_vdev_msg *msg;
 +	nss_tx_status_t status;
++	unsigned int slot;
 +	int ifnum;
 +
-+	if (!nss->enabled || nss->vdev_if_num >= 0)
++	if (!nss->enabled || arvif->nss.created)
 +		return 0;
 +
 +	if (nss->radio_if_num < 0) {
@@ -3869,10 +4180,10 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	 * struct ath11k_nss_vif in ath11k_nss_export.h for why both are
 +	 * unavailable at this point and why the bare pointer is safe.
 +	 */
-+	nss->vdev_ndev = vif->netdev;
-+	if (!nss->vdev_ndev) {
++	arvif->nss.ndev = vif->netdev;
++	if (!arvif->nss.ndev) {
 +		ath11k_warn(ab, "nss: vif has no netdev; excepted frames will be lost\n");
-+		nss->vdev_ndev = nss->dummy;
++		arvif->nss.ndev = nss->dummy;
 +	}
 +
 +	/*
@@ -3886,7 +4197,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +				  ath11k_nss_vdev_data_cb,
 +				  ath11k_nss_vdev_ext_cb,
 +				  ath11k_nss_vdev_msg_cb,
-+				  nss->vdev_ndev, 0);
++				  arvif->nss.ndev, 0);
 +
 +	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 +	if (!msg) {
@@ -3952,7 +4263,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	ath11k_nss_vdev_cmd(ab, ifnum, NSS_WIFI_VDEV_CFG_MCBC_EXC_TO_HOST_CMD,
 +			    1, "MCBC_EXC_TO_HOST");
 +	ath11k_nss_vdev_cmd(ab, ifnum, NSS_WIFI_VDEV_CFG_AP_BRIDGE_CMD,
-+			    1, "AP_BRIDGE");
++			    !arvif->nss.ap_isolate, "AP_BRIDGE");
 +
 +	/*
 +	 * Where a received frame goes next.  NSS_ETH_RX_INTERFACE hands it to
@@ -3970,24 +4281,28 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +				    ath11k_nss_next_hop, status);
 +	}
 +
-+	nss->vdev_if_num = ifnum;
-+	nss->vdev_id = vif->vdev_id;
++	arvif->nss.if_num = ifnum;
 +
 +	/*
-+	 * Only now, and only after vdev_ndev is set: the per-vdev callbacks
-+	 * find their SoC through this, and NSS can call them as soon as the
-+	 * interface is up.
++	 * Only now, and only after the netdev is set: the per-vdev callbacks
++	 * find their interface through this registry, and NSS can call them as
++	 * soon as it is up.
 +	 */
-+	{
-+		int slot = ath11k_nss_soc_slot(ab);
-+
-+		if (slot >= 0 && slot < ATH11K_NSS_SOCS)
-+			WRITE_ONCE(ath11k_nss_ndev_owner[slot], ab);
++	for (slot = 0; slot < ATH11K_NSS_MAX_VDEVS; slot++) {
++		if (!READ_ONCE(ath11k_nss_vdev_owner[slot])) {
++			WRITE_ONCE(ath11k_nss_vdev_owner[slot], arvif);
++			break;
++		}
 +	}
++	if (slot == ATH11K_NSS_MAX_VDEVS)
++		ath11k_warn(ab, "nss: no room to register vdev %u; its excepted frames will be lost\n",
++			    vif->vdev_id);
++
++	arvif->nss.created = true;
 +
 +	ath11k_info(ab, "nss: vdev %d up for vdev_id %u on %s\n",
 +		    ifnum, vif->vdev_id,
-+		    nss->vdev_ndev ? nss->vdev_ndev->name : "(none)");
++		    arvif->nss.ndev ? arvif->nss.ndev->name : "(none)");
 +
 +	/* The AP's own BSS peer, which NSS needs before it will forward. */
 +	ath11k_nss_self_peer_create(ab, vif->vdev_id, vif->mac_addr);
@@ -4003,21 +4318,22 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * they buy is that NSS is not forwarding on a vdev whose radio is mid-restart
 + * on another channel.
 + */
-+void ath11k_nss_vdev_up(struct ath11k_base *ab, u32 vdev_id, const u8 *mac)
++void ath11k_nss_vdev_up(struct ath11k_vif *arvif)
 +{
++	struct ath11k_base *ab = arvif->ar->ab;
 +	struct ath11k_nss_soc *nss = &ab->nss;
 +	struct nss_wifi_vdev_msg *msg;
 +	nss_tx_status_t status;
 +
-+	if (!nss->enabled || nss->vdev_if_num < 0 || nss->vdev_id != vdev_id)
++	if (!nss->enabled || !arvif->nss.created)
 +		return;
 +
 +	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 +	if (!msg)
 +		return;
 +
-+	ether_addr_copy(msg->msg.vdev_enable.mac_addr, mac);
-+	nss_wifi_vdev_msg_init(msg, nss->vdev_if_num,
++	ether_addr_copy(msg->msg.vdev_enable.mac_addr, arvif->vif->addr);
++	nss_wifi_vdev_msg_init(msg, arvif->nss.if_num,
 +			       NSS_WIFI_VDEV_INTERFACE_UP_MSG,
 +			       sizeof(struct nss_wifi_vdev_enable_msg),
 +			       NULL, NULL);
@@ -4029,20 +4345,21 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		ath11k_warn(ab, "nss: VDEV_UP failed (%d)\n", status);
 +}
 +
-+void ath11k_nss_vdev_down(struct ath11k_base *ab, u32 vdev_id)
++void ath11k_nss_vdev_down(struct ath11k_vif *arvif)
 +{
++	struct ath11k_base *ab = arvif->ar->ab;
 +	struct ath11k_nss_soc *nss = &ab->nss;
 +	struct nss_wifi_vdev_msg *msg;
 +	nss_tx_status_t status;
 +
-+	if (!nss->enabled || nss->vdev_if_num < 0 || nss->vdev_id != vdev_id)
++	if (!nss->enabled || !arvif->nss.created)
 +		return;
 +
 +	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
 +	if (!msg)
 +		return;
 +
-+	nss_wifi_vdev_msg_init(msg, nss->vdev_if_num,
++	nss_wifi_vdev_msg_init(msg, arvif->nss.if_num,
 +			       NSS_WIFI_VDEV_INTERFACE_DOWN_MSG,
 +			       sizeof(struct nss_wifi_vdev_disable_msg),
 +			       NULL, NULL);
@@ -4054,27 +4371,59 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		ath11k_warn(ab, "nss: VDEV_DOWN failed (%d)\n", status);
 +}
 +
-+void ath11k_nss_vdev_delete(struct ath11k_base *ab)
++/*
++ * mac80211 keeps AP isolation to itself - ieee80211_change_bss() sets
++ * IEEE80211_SDATA_DONT_BRIDGE_PACKETS on its private sdata and checks it in
++ * its own Rx path, which an offloaded frame never reaches.  The 992 patch
++ * gives the driver the value; this is what it does with it.  The vendor's
++ * ath11k does the same thing from a mac80211 op of its own; their 12.5
++ * qca-wifi additionally keeps a per-MAC isolation list and pushes that to NSS
++ * with NSS_WIFILI_ISOLATION_MSG, which has no equivalent in OpenWrt's
++ * per-interface `option isolate`.
++ */
++void ath11k_nss_vdev_set_ap_bridge(struct ath11k_vif *arvif, bool bridge)
 +{
-+	struct ath11k_nss_soc *nss = &ab->nss;
-+	int ifnum = xchg(&nss->vdev_if_num, -1);
++	struct ath11k_base *ab = arvif->ar->ab;
 +
-+	if (ifnum < 0)
++	if (arvif->nss.ap_isolate == !bridge)
 +		return;
 +
-+	ath11k_nss_peer_delete_all(ab, nss->vdev_id);
++	arvif->nss.ap_isolate = !bridge;
++
++	if (!ab->nss.enabled || !arvif->nss.created)
++		return;
++
++	ath11k_nss_vdev_cmd(ab, arvif->nss.if_num,
++			    NSS_WIFI_VDEV_CFG_AP_BRIDGE_CMD, bridge,
++			    "AP_BRIDGE");
++	ath11k_info(ab, "nss: vdev %u %s its own stations\n",
++		    arvif->vdev_id, bridge ? "bridges" : "isolates");
++}
++
++void ath11k_nss_vdev_delete(struct ath11k_vif *arvif)
++{
++	struct ath11k_base *ab = arvif->ar->ab;
++	unsigned int slot;
++	int ifnum;
++
++	if (!arvif->nss.created)
++		return;
++
++	arvif->nss.created = false;
++	ifnum = arvif->nss.if_num;
++	arvif->nss.if_num = -1;
++
++	ath11k_nss_peer_delete_all(ab, arvif->vdev_id);
 +
 +	nss_unregister_wifi_vdev_if(ifnum);
 +	nss_dynamic_interface_dealloc_node(ifnum,
 +					   NSS_DYNAMIC_INTERFACE_TYPE_VAP);
 +
-+	{
-+		int slot = ath11k_nss_soc_slot(ab);
++	for (slot = 0; slot < ATH11K_NSS_MAX_VDEVS; slot++)
++		if (READ_ONCE(ath11k_nss_vdev_owner[slot]) == arvif)
++			WRITE_ONCE(ath11k_nss_vdev_owner[slot], NULL);
 +
-+		if (slot >= 0 && slot < ATH11K_NSS_SOCS)
-+			WRITE_ONCE(ath11k_nss_ndev_owner[slot], NULL);
-+	}
-+	nss->vdev_ndev = NULL;
++	arvif->nss.ndev = NULL;
 +}
 +
 +/* ------------------------------------------------------------------- setup */
@@ -4147,7 +4496,6 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	}
 +
 +	nss->radio_if_num = -1;
-+	nss->vdev_if_num = -1;
 +
 +	info = kzalloc(sizeof(*info), GFP_KERNEL);
 +	if (!info)
@@ -4244,11 +4592,18 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +void ath11k_nss_teardown(struct ath11k_base *ab)
 +{
 +	struct ath11k_nss_soc *nss = &ab->nss;
++	unsigned int slot;
 +
 +	if (!nss->ctx)
 +		return;
 +
-+	ath11k_nss_vdev_delete(ab);
++	/* every interface this SoC still has, not just the one it used to */
++	for (slot = 0; slot < ATH11K_NSS_MAX_VDEVS; slot++) {
++		struct ath11k_vif *arvif = READ_ONCE(ath11k_nss_vdev_owner[slot]);
++
++		if (arvif && arvif->ar->ab == ab)
++			ath11k_nss_vdev_delete(arvif);
++	}
 +
 +	if (nss->enabled) {
 +		ath11k_nss_send_simple(ab, NSS_WIFILI_STOP_MSG, "STOP", false);

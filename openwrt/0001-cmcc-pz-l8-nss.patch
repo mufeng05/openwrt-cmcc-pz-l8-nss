@@ -521,3 +521,14 @@ index c6e8d0fb0d..7f00567659 100644
  
  		remove_oem_ubi_volume bt_fw
  		remove_oem_ubi_volume ubi_rootfs
+--- a/package/kernel/linux/modules/netfilter.mk
++++ b/package/kernel/linux/modules/netfilter.mk
+@@ -330,7 +330,7 @@
+   KCONFIG:=$(KCONFIG_IPT_IPOPT)
+   FILES:=$(foreach mod,$(IPT_IPOPT-m),$(LINUX_DIR)/net/$(mod).ko)
+   AUTOLOAD:=$(call AutoProbe,$(notdir $(IPT_IPOPT-m)))
+-  $(call AddDepends/ipt)
++  $(call AddDepends/ipt,+kmod-nf-conntrack)
+ endef
+ 
+ define KernelPackage/ipt-ipopt/description
