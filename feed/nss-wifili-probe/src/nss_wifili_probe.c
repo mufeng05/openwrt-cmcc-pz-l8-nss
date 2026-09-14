@@ -1482,26 +1482,36 @@ static int probe_send_reset(struct nss_ctx_instance *ctx)
  * multiplying by 3 here was a misapplication of the open ath11k reference.
  */
 /*
- * BISECTION: back to ath11k's own pool size (1024) to isolate swdesc from the
- * other two values changed in the same round.
+ * Was 1024, as a bisection: the round that first tried 4096 also changed
+ * num_tx_desc and init_flags, and it moved the failure from traffic-time to
+ * association-time - the core died ~123 ms after the second PEER_SECURITY,
+ * with no PEER_AUTH and no data frames.  1024 restored the traffic-time
+ * failure, which left 4096 under suspicion of being actively harmful here
+ * despite matching both vendor formulas.
  *
- * The vendor-derived 4096 is the better-grounded number on paper - both vendor
- * formulas produce it for a non-QCA5018 radio - but the round that introduced
- * it also moved the failure from traffic-time to association-time:
+ * It was not.  Both failures were ath11k's sixteen cached refill buffers
+ * landing in NSS's descriptor pool - see nss_refill_hold in the 991 patch -
+ * and with that fixed, 4096 was re-run A/B against 1024 on the 5 GHz radio,
+ * six iperf3 -P 4 runs each over two fresh boots per value:
  *
- *	99.2956  PEER_CREATE  peer_id=4 -> ACK
- *	99.3209  PEER_SECURITY pkt_type=0 -> ACK
- *	99.3482  PEER_SECURITY pkt_type=1 -> ACK
- *	99.4715  COREDUMP COMPLETE        <- 123 ms later, no PEER_AUTH, no data
+ *	                 uplink       downlink   rx_desc_alloc_fail
+ *	swdesc 1024   477 Mbit/s    482 Mbit/s   ~420000 per run
+ *	swdesc 4096   488 Mbit/s    446 Mbit/s   0
  *
- * where the original 1024 survived association, reached PEER_AUTH, and only
- * trapped ~1.5 s into sustained traffic.  Reverting num_tx_desc 8192->4096 did
- * not restore that, so num_tx_desc is cleared and swdesc is the next suspect.
- * If 1024 restores the traffic-time failure, swdesc=4096 is actively harmful
- * here despite matching the vendor formula - which would mean this board's
- * firmware really does size the pool from the ring, not from the cfg count.
+ * Zero traps either way.  The throughput columns are noise - the run-to-run
+ * spread is 110 Mbit/s against a 10 Mbit/s difference in means - so the pool
+ * size does not buy rate at these speeds.  What it does is take
+ * rx_desc_alloc_fail from two thirds of reo_reaped to exactly zero, on every
+ * run, cumulative over 1.7 M frames.
+ *
+ * That counter never cost a frame: rx_deliverd tracked reo_reaped to within
+ * ten packets at 1024 too, so the exhaustion is on the replenish side and the
+ * firmware recovers from it.  4096 is kept anyway - it is the value both
+ * vendor formulas give for a radio that is not the internal 2.4 GHz one, it
+ * silences an error counter that would otherwise mask a real one, and it costs
+ * no host memory (MemAvailable is 21 MB either way; the pool is firmware side).
  */
-#define PROBE_RX_SW_DESC_NUM	1024
+#define PROBE_RX_SW_DESC_NUM	4096
 #define PROBE_TX_PAGE_SZ	245760
 #define PROBE_TX_MAX_PAGES	NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG
 

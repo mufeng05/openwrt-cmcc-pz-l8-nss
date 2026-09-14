@@ -98,6 +98,41 @@ and `nss_wifi_vdev_set_peer_next_hop` per peer are all accepted and all made no
 difference, because there was nothing NSS could do with a frame it could not
 read.
 
+## The Rx descriptor pool
+
+`PROBE_RX_SW_DESC_NUM` is what the probe puts in `num_rx_swdesc` in PDEV_INIT,
+and it sizes the firmware's Rx software descriptor pool. It sat at 1024 —
+ath11k's own refill ring size — as a bisection, because the round that first
+raised it to 4096 also changed `num_tx_desc` and `init_flags`, and that round
+moved the crash from traffic time to association time. 1024 put the crash back
+where it had been, so 4096 stayed under suspicion.
+
+It was innocent. Both crashes were ath11k's sixteen cached refill buffers, and
+with `nss_refill_hold` in place 4096 was re-run against 1024 on the 5 GHz radio,
+six iperf3 `-P 4` runs per value, each value armed from a fresh boot twice:
+
+| | uplink | downlink | `rx_desc_alloc_fail` |
+|---|---|---|---|
+| swdesc 1024 | 477 Mbit/s | 482 Mbit/s | 387k–461k per run |
+| swdesc 4096 | 488 Mbit/s | 446 Mbit/s | **0** |
+
+Zero traps either way, twelve runs over four boots.
+
+**The throughput columns are noise.** Run to run the uplink spread is 110 Mbit/s
+against a 10 Mbit/s difference in means, and the downlink mean moves the wrong
+way. Pool size does not buy rate here.
+
+**The counter goes to exactly zero,** on every run, and stays there over 1.7 M
+cumulative frames. It never cost a frame in the first place — `rx_deliverd`
+tracked `reo_reaped` to within ten packets at 1024 as well — so the exhaustion
+is on the replenish side and the firmware recovers from it. 4096 is kept
+because it is the value both vendor formulas give for a radio that is not the
+internal 2.4 GHz one, because an error counter that is always nonzero cannot
+warn about anything, and because it is free: the pool is firmware side and
+MemAvailable is 21 MB either way.
+
+So this is not where the gap to nwrt's ~624 Mbit/s is.
+
 ## Both radios at once
 
 Everything per-radio in the probe is per slot: `probe_ss[PROBE_MAX_SOC]` holds
@@ -141,10 +176,6 @@ sh scripts/arm-wifili-nss.sh
   if NSS has not claimed the slot, or drain ath11k's buffers and flush the
   hardware cache at handover instead. Re-announcing the ring over HTT does
   **not** flush it — tested.
-- `rx_desc_alloc_fail` climbs under load. `PROBE_RX_SW_DESC_NUM` is 1024 where
-  the vendor reference runs 4096; raising it via the run line used to trap
-  immediately, which is worth re-testing now that the buffer-ownership bug is
-  gone.
 - The two radios were tested one client at a time, not with a client on each
   simultaneously.
 - `auth_early=1` authorises the peer at create time instead of after the
