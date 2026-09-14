@@ -48,9 +48,9 @@ offload.
 
 ## Known limitations
 
-- A radio whose handover fails cannot receive at all: `nss_refill_hold` is a
-  load-time parameter, so its Rx ring stays empty even after the offload mask
-  is cleared. See [docs/WIFILI.md](docs/WIFILI.md).
+- One AP interface per radio: a second BSS on the same radio is not
+  offloaded, and AP isolation is not passed to NSS. See
+  [docs/WIFILI.md](docs/WIFILI.md).
 - **Memory is tight.** 256 MB board; ath11k's data-path rings are patched down
   from the upstream sizes or nothing fits alongside NSS.
 - Monitor-mode capture on the radios is effectively disabled by those ring sizes.

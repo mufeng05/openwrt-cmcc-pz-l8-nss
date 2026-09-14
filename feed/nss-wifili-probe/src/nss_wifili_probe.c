@@ -1793,7 +1793,7 @@ static int probe_vdev_cmd(int ifnum, u32 cmd, u32 value, const char *name)
 	return (status == NSS_TX_SUCCESS) ? 0 : -EIO;
 }
 
-static int probe_peer_create(const struct ath11k_nss_peer *peer,
+static int probe_peer_create(const struct ath11k_nss_peer_info *peer,
 			     struct device *dma_dev);
 static int probe_peer_security(u32 peer_id);
 
@@ -1805,7 +1805,7 @@ static int probe_peer_delete(u32 peer_id);
 static void probe_self_peer_create(unsigned int soc_idx, const u8 *mac,
 				   struct device *dma_dev)
 {
-	struct ath11k_nss_peer peers[ATH11K_NSS_MAX_PEER];
+	struct ath11k_nss_peer_info peers[ATH11K_NSS_MAX_PEER];
 	int np, i;
 
 	if (!probe_self_peer || probe_self_peer_id >= 0 || !dma_dev)
@@ -1839,7 +1839,7 @@ static void probe_self_peer_create(unsigned int soc_idx, const u8 *mac,
  */
 static void probe_warm_peers_run(struct device *dma_dev)
 {
-	struct ath11k_nss_peer d;
+	struct ath11k_nss_peer_info d;
 	unsigned int i;
 
 	if (!probe_warm_peers || !dma_dev)
@@ -2219,7 +2219,7 @@ static int probe_peer_reoq_setup(u32 peer_id)
  * bytes per peer - and the physical address travels in the create message.  A
  * single block is enough here: the probe creates one peer.
  */
-static int probe_peer_create(const struct ath11k_nss_peer *peer,
+static int probe_peer_create(const struct ath11k_nss_peer_info *peer,
 			     struct device *dma_dev)
 {
 	struct nss_wifili_msg *msg;
@@ -2822,7 +2822,7 @@ static int probe_run(unsigned int soc_idx, unsigned int stage,
 vdev_peer:
 	if (stage >= 4) {
 		struct ath11k_nss_vif vifs[ATH11K_NSS_MAX_VIF];
-		struct ath11k_nss_peer peers[ATH11K_NSS_MAX_PEER];
+		struct ath11k_nss_peer_info peers[ATH11K_NSS_MAX_PEER];
 		int nv, np, pi;
 
 		pr_info(PFX "STAGE 4: vdev + peer\n");

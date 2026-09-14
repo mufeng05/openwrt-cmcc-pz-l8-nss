@@ -22,6 +22,13 @@ the README, so the two are comparable.
 One association each, `tx_fail 0`, zero NSS traps, zero Oops. The host sees
 about 100 frames per gigabyte — everything else is forwarded inside NSS.
 
+Three stations on the 5 GHz radio at once - a laptop, a phone and a watch, four
+NSS peers counting the vdev's own - hold 418 up / 351 down with all three
+associated, and a phone speedtest through them moved 1.72 GB down and 177 MB up
+with no traps. `tx_sent_count` and `rx_deliverd` agree with the interface's own
+byte counters to within 0.3 %, and with the per-station counters to within a
+dozen frames.
+
 Both halves of the CPU figure are given because the per-second sampler costs
 2–5 % on these cores by itself; what forwarding adds is the difference, 0.3 %
 on either radio and nothing measurable on wired.
@@ -301,22 +308,81 @@ It is deliberately a separate pair of flags from the ones `nss-offload` keeps
 for the ECM stack: the wired offload works and is not what changed, so a bad
 WiFi boot must not switch it off.
 
+## Against the vendor driver
+
+Two vendor sources, and they are not the same thing. QSDK 11's ath11k carries
+the offload as a patch set (`199-002`, `199-003`, `211-*`, `235-*`, `236-*`,
+`300`, `301`, `311`) - that is source, and it is the shape this driver follows.
+The firmware this board actually shipped with is newer: nwrt is QSDK 12.5 and
+uses `wifi_3_0.ko`, the qca-wifi driver, which is a different driver speaking
+the same NSS wifili protocol. Where the two disagree, 12.5 is what runs on this
+hardware, so the constants below were checked against that binary.
+
+Every number this driver sends at INIT matches what `nss_wifili_soc_init` in
+`wifi_3_0.ko` sends, bar one:
+
+| | 12.5 binary | here | |
+|---|---|---|---|
+| INIT flags | `0x40`, unconditionally | `0x40` | same |
+| `MULTISOC_THREAD_MAP` (`0x10`) | set from a cfg item this board does not set | not set | same |
+| Tx descriptors per pool, two pools | 4096 | 4096 | same |
+| Tx page size | 245760 | 245760 | same |
+| Tx descriptor / extension size | 80 / 160 | 80 / 160 | same |
+| `num_tx_device_limit` | 65536 | 65536 | same |
+| thread scheme priority | a packed bitmap, unset here, so 0 = low | `NSS_WIFILI_LOW_PRIORITY_SCHEME` | same |
+| `num_rx_swdesc` | 2048 | 4096 | **differs** |
+
+The last one is deliberate. QSDK 11's ath11k asks for `3 * DP_RXDMA_BUF_RING_SIZE`
+and 12.5's qca-wifi for a flat 2048; 4096 is what was measured here to take
+`rx_desc_alloc_fail` from two thirds of `reo_reaped` to zero, and larger is the
+safe direction.
+
+Structurally, what the vendor does and this driver now does too:
+
+| | vendor | here |
+|---|---|---|
+| peer state | on `struct ath11k_peer` | same |
+| peer create | from `ath11k_peer_map_event()` | at `AUTH->ASSOC` - see below |
+| cipher | `ath11k_nss_cipher_type()` from the installed key | same, plus WEP, which their switch omits |
+| statistics | NSS's peer reports into the netdev and `sinfo` | same, minus the host-side part |
+| vdev up/down | from `ath11k_control_beaconing()` and the channel switch | same |
+| teardown | `pdev_destroy`, the crash path, `pdev_create`'s error label | same three |
+| MIC errors | SoC ext callback to `cfg80211_michael_mic_failure()` | same |
+| radio buffers | four range messages at `pdev_init` | same |
+
+**Peer create is the one deliberate departure.** The vendor creates its NSS
+peer in `ath11k_peer_map_event()`, the earliest moment a peer id exists. That
+is not safe on this firmware: a peer handed over at `NOTEXIST->NONE` - already
+later than the map event - took the firmware down on the first frame, against a
+run that created the same peer two seconds later and was stable. So the create
+sits at `AUTH->ASSOC`, after `ath11k_station_assoc()` and still before the
+station is authorised and can have a frame forwarded.
+
 ## Known limitations
 
-- A radio whose handover *fails* is worse off than one that was never offloaded:
-  `nss_refill_hold` is a load-time parameter, so the ring stays empty even
-  after `ath11k_nss_dp_ready()` clears the slot from the offload mask, and the
-  radio cannot receive at all. It has not happened since the ordering above was
-  put in place — the NSS core is up 3 s before ath11k asks — but the failure
-  mode is real. The fix is for the failure path to refill the ring, not just
-  clear the hold; re-announcing it over HTT does **not** flush the hardware
-  cache, which was tested.
+- **One AP vdev per radio.** A second BSS on the same radio - a guest network -
+  would need the vdev state per `arvif` rather than per SoC, which is what the
+  vendor's `struct arvif_nss` is for. Nothing here assumes it is impossible; it
+  has not been built.
+- **AP isolation is not passed to NSS.** Intra-BSS forwarding happens inside
+  NSS, so `option isolate` cannot work without telling it. The vendor adds a
+  `nss_bss_info_changed` mac80211 op and a `BSS_CHANGED_NSS_AP_ISOLATE` flag to
+  carry it; both are QSDK mac80211 additions, and this project builds on an
+  unmodified one.
+- **`tx retries` and `tx failed` read zero.** The fields exist now and come from
+  NSS's peer report, but 650k packets with no retries is not believable - this
+  firmware appears not to fill them. The byte and packet counts it does fill
+  agree with `reo_reaped` and `tx_sent_count` to within a dozen frames.
+- **Rx bitrate is missing from `iw station dump`.** The vendor fills it from the
+  monitor PPDU path (`ath11k_nss_update_sta_rxrate`), which needs the
+  PPDU_END_USER_STATS TLV filter enabled. Tx bitrate is unaffected and correct.
+- **The MIC error path is untested.** It is written and it compiles, but the
+  test network is WPA2-CCMP, where Michael MIC does not apply.
 - `next_hop` must be set when the module loads. Writing 158 to it at runtime
   and recreating the vdevs crashed the board. Set at load time it is stable and
-  worth 27 % of the downlink — see below.
-- The two radios were tested one client at a time, not with a client on each
-  simultaneously.
-- `auth_early=1` authorises the peer at create time instead of after the
-  handshake. It is a shortcut, not a fix.
+  worth 27 % of the downlink.
+- The sojourn statistics message is refused by this NSS firmware
+  (`NSS.FW.12.2-156-MP.R` answers type 33 with error 99, twice a boot, once per
+  radio). The message is the vendor's and is kept for a later firmware.
 - The probe is a diagnostic harness with a lot of knobs, several of which exist
   only to have refuted something. It is not a driver.
