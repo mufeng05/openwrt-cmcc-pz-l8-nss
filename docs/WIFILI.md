@@ -175,19 +175,28 @@ Four files in `files/` do it, and the whole mechanism is load order plus
 parameters:
 
 ```
-etc/modules.d/29-ath11k-nss        ath11k nss_offload_mask=3 nss_refill_hold=3 frame_mode=2
 etc/modules.d/32-qca-nss-drv       qca-nss-drv
-etc/modules.d/33-nss-wifili-probe  nss_wifili_probe vdev_netdev0=phy0-ap0 vdev_netdev1=phy1-ap0 next_hop=158
+etc/modules.d/34-ath11k-nss        ath11k nss_offload_mask=3 nss_refill_hold=3 frame_mode=2
+etc/modules.d/35-nss-wifili-probe  nss_wifili_probe vdev_netdev0=phy0-ap0 vdev_netdev1=phy1-ap0 next_hop=158
 etc/init.d/nss-failsafe            START=05
 ```
 
-kmodloader walks `/etc/modules.d` in name order, so:
-`ath11k` with its parameters (29) → `qca-nss-dp` (31) → `qca-nss-drv` (32) →
-the probe (33) → `ath11k_ahb`, which has no numeric prefix and therefore sorts
-last. That last one is what actually probes the hardware, so by the time
-ath11k's QMI worker reaches `ath11k_core_pdev_create()` the NSS core has been
-up for three seconds and the probe has already registered its hook. A measured
-boot:
+kmodloader walks `/etc/modules.d` in name order, so: `qca-nss-dp` (31, stock)
+→ `qca-nss-drv` (32) → `ath11k` with its parameters (34) → the probe (35) →
+`ath11k_ahb`, which has no numeric prefix and therefore sorts last. That last
+one is what actually probes the hardware, so by the time ath11k's QMI worker
+reaches `ath11k_core_pdev_create()` the NSS core has been up for three seconds
+and the probe has already registered its hook.
+
+Two of those positions are load-bearing rather than tidy. `qca-nss-drv` must
+follow `qca-nss-dp`, because it takes over nss-dp's data plane and reopens
+eth0/eth1 through NSS — that is the order the wired offload was brought up in
+and the only one that has been tested. And ath11k must follow `qca-nss-drv`,
+because ath11k now links against it: kmodloader would otherwise pull
+qca-nss-drv in as a dependency at ath11k's position and put it *before*
+nss-dp.
+
+A measured boot:
 
 ```
 21.33  NSS core 0 booted successfully
@@ -211,7 +220,7 @@ refuses to run if the probe is already loaded, which on a normal boot it is.
 `nss-failsafe` runs at START=05, before kmodloader, and arms
 `/etc/nss-wifi-pending`. `nss-offload` clears it once `eth0` has carrier. A
 boot that hangs, or that comes up with the LAN dead, never clears it — so the
-next boot finds it still armed, rewrites `29-ath11k-nss` to `ath11k
+next boot finds it still armed, rewrites `34-ath11k-nss` to `ath11k
 frame_mode=2` and writes `/etc/nss-wifi-disabled`. One bad boot disarms the
 WiFi handover without needing anything to work.
 

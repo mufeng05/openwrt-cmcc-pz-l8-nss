@@ -1,6 +1,6 @@
 # The module that answers ath11k's handover hook.
 #
-# 33 puts it after ath11k (29, for its parameters) and after qca-nss-drv (32),
+# 35 puts it after ath11k (34, for its parameters) and after qca-nss-drv (32),
 # whose symbols it links against, and before ath11k_ahb - which has no numeric
 # prefix, so kmodloader runs it last, and which is what actually probes the
 # hardware.  So the hook is registered before anything can call it and

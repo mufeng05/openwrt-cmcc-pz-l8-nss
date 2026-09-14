@@ -13,7 +13,7 @@
 # radios down and back up, so it is a deliberate step, not something to put in
 # /etc/rc.d yet.
 #
-# Prerequisites, both set before ath11k probes - see files/etc/modules.d/29-ath11k-nss:
+# Prerequisites, both set before ath11k probes - see files/etc/modules.d/34-ath11k-nss:
 #   ath11k nss_refill_hold=3 frame_mode=2
 #
 # Order matters.  The probe is inserted and both wifili SoCs are initialised

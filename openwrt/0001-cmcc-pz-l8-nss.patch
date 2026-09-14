@@ -11,6 +11,40 @@ index 18fae054d4..2f23b696b0 100755
  				*) ipad=${ipaddr:-"192.168.$((addr_offset++)).1"} ;;
  			esac
  
+diff --git a/package/kernel/mac80211/Makefile b/package/kernel/mac80211/Makefile
+index aec88b692b..5296d88b63 100644
+--- a/package/kernel/mac80211/Makefile
++++ b/package/kernel/mac80211/Makefile
+@@ -282,9 +282,15 @@ ifeq ($(BUILD_VARIANT),smallbuffers)
+ 	C_DEFINES+= -DCONFIG_ATH10K_SMALLBUFFERS
+ endif
+ 
++# ath11k's NSS offload calls into qca-nss-drv, which stages its headers to
++# $(STAGING_DIR)/usr/include/qca-nss-drv from its own Build/InstallDev.  The
++# build-order dependency that makes them exist by now is the +kmod-qca-nss-drv
++# on KernelPackage/ath11k in ath.mk - without it mac80211 compiles first.
++NSS_CFLAGS:=-I$(STAGING_DIR)/usr/include/qca-nss-drv
++
+ MAKE_OPTS:= \
+ 	$(subst -C $(LINUX_DIR),-C "$(PKG_BUILD_DIR)",$(KERNEL_MAKEOPTS)) \
+-	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) $(C_DEFINES)" \
++	EXTRA_CFLAGS="-I$(PKG_BUILD_DIR)/include $(IREMAP_CFLAGS) $(C_DEFINES) $(NSS_CFLAGS)" \
+ 	KLIB_BUILD="$(LINUX_DIR)" \
+ 	MODPROBE=true \
+ 	KLIB=$(TARGET_MODULES_DIR) \
+diff --git a/package/kernel/mac80211/ath.mk b/package/kernel/mac80211/ath.mk
+index 9adb8914cd..3e1f7decf0 100644
+--- a/package/kernel/mac80211/ath.mk
++++ b/package/kernel/mac80211/ath.mk
+@@ -318,7 +318,7 @@ define KernelPackage/ath11k
+   URL:=https://wireless.wiki.kernel.org/en/users/drivers/ath11k
+   DEPENDS+= +kmod-ath +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT \
+   +kmod-crypto-michael-mic +ATH11K_THERMAL:kmod-hwmon-core \
+-  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers
++  +ATH11K_THERMAL:kmod-thermal +kmod-qcom-qmi-helpers +kmod-qca-nss-drv
+   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/ath/ath11k/ath11k.ko
+ endef
+ 
 diff --git a/package/kernel/qca-ssdk/Makefile b/package/kernel/qca-ssdk/Makefile
 index a5588d5032..d64c8ffdcd 100644
 --- a/package/kernel/qca-ssdk/Makefile

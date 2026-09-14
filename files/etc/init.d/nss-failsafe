@@ -22,7 +22,7 @@ START=05
 
 FLAG=/etc/nss-wifi-pending
 DISABLED=/etc/nss-wifi-disabled
-MODCONF=/etc/modules.d/29-ath11k-nss
+MODCONF=/etc/modules.d/34-ath11k-nss
 
 # frame_mode=2 stays in the safe line.  It selects Ethernet encap/decap, it is
 # what every throughput number was measured with, and it has nothing to do with

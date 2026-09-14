@@ -20,11 +20,12 @@ Diagnostic aid for bring-up, not for shipping as-is.
 
 --- a/drivers/net/wireless/ath/ath11k/Makefile
 +++ b/drivers/net/wireless/ath/ath11k/Makefile
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,8 @@
  # SPDX-License-Identifier: BSD-3-Clause-Clear
  obj-$(CPTCFG_ATH11K) += ath11k.o
  ath11k-y += core.o \
 +	     nss_export.o \
++	     nss.o \
  	    hal.o \
  	    hal_tx.o \
  	    hal_rx.o \
@@ -2112,3 +2113,89 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	return ret;
 +}
 +EXPORT_SYMBOL(ath11k_nss_dp_htt_refill_setup);
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/nss.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: BSD-3-Clause-Clear */
++/*
++ * The NSS wifili offload, inside the driver.
++ *
++ * Qualcomm's own driver hands its data path to the NSS core from
++ * ath11k_core_pdev_create(), between ath11k_dp_pdev_alloc() and
++ * ath11k_mac_register(): every ring exists by then, and mac80211 has not yet
++ * been told the radio is there.  This is the same three messages - INIT,
++ * PDEV_INIT, START - sent from the same place.
++ *
++ * Until now they came from nss_wifili_probe.ko, which ath11k called through a
++ * function pointer the module installed.  That worked, but it put the glue
++ * outside the driver: the ordering had to be arranged in /etc/modules.d, a
++ * failed handover left a radio unable to receive, and every hook was a pointer
++ * read from softirq context with no lock.  nss_export.c stays - the probe is
++ * still useful as a diagnostic and it is the only consumer of that API.
++ */
++#ifndef ATH11K_NSS_H
++#define ATH11K_NSS_H
++
++#include <linux/types.h>
++
++struct ath11k_base;
++
++/* Is the NSS core present and usable at all? */
++bool ath11k_nss_available(void);
++
++/*
++ * Hand this SoC's data path over.  Called from ath11k_core_pdev_create() with
++ * ab->core_lock held; this is the QMI worker, so sleeping is fine and blocking
++ * delays only ath11k_mac_register().
++ *
++ * Returns 0 when NSS owns the data path.  On any error the caller must leave
++ * the SoC on the host path.
++ */
++int ath11k_nss_setup(struct ath11k_base *ab);
++
++/* Give it back.  Safe to call when setup never ran. */
++void ath11k_nss_teardown(struct ath11k_base *ab);
++
++#endif /* ATH11K_NSS_H */
+--- /dev/null
++++ b/drivers/net/wireless/ath/ath11k/nss.c
+@@ -0,0 +1,39 @@
++// SPDX-License-Identifier: BSD-3-Clause-Clear
++/*
++ * NSS wifili offload for ath11k.  See nss.h.
++ *
++ * Nothing calls into here yet: this file currently exists to prove that ath11k
++ * can include the qca-nss-drv headers and resolve its symbols at load time.
++ * That is not a formality - ath11k lives in the mac80211 backports package,
++ * which compiles before qca-nss-drv unless the package dependency reorders it,
++ * and the backports build overrides some of the flag variables an out-of-tree
++ * module would use.
++ */
++#include <linux/module.h>
++#include <linux/types.h>
++
++#include <nss_api_if.h>
++
++#include "core.h"
++#include "debug.h"
++#include "nss.h"
++
++bool ath11k_nss_available(void)
++{
++	return nss_cmn_get_nss_enabled();
++}
++
++int ath11k_nss_setup(struct ath11k_base *ab)
++{
++	if (!ath11k_nss_available()) {
++		ath11k_warn(ab, "nss: no NSS core on this platform\n");
++		return -ENOTSUPP;
++	}
++
++	ath11k_info(ab, "nss: in-driver handover is not implemented yet\n");
++	return -EOPNOTSUPP;
++}
++
++void ath11k_nss_teardown(struct ath11k_base *ab)
++{
++}
