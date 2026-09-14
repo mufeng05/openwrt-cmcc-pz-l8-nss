@@ -728,7 +728,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +#endif /* ATH11K_NSS_EXPORT_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss_export.c
-@@ -0,0 +1,1454 @@
+@@ -0,0 +1,1478 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * Read-only export of ath11k's data-path ring layout for the NSS wifili probe,
@@ -996,7 +996,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +
 +	fn = ath11k_nss_peer_hook[slot];
 +	ctx = ath11k_nss_peer_hook_ctx[slot];
-+	if (!fn)
++	if (!fn && !ath11k_nss_inbuilt)
 +		return;
 +
 +	arvif = ath11k_vif_to_arvif(vif);
@@ -1026,6 +1026,14 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	if (!info.valid) {
 +		ath11k_warn(ab, "nss: no peer for %pM on vdev %d, not handing over\n",
 +			    sta->addr, arvif->vdev_id);
++		return;
++	}
++
++	if (ath11k_nss_inbuilt) {
++		ret = ath11k_nss_peer_update(ab, &info, create);
++		if (ret)
++			ath11k_warn(ab, "nss: peer %pM update failed (%d)\n",
++				    info.mac_addr, ret);
 +		return;
 +	}
 +
@@ -1826,7 +1834,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +
 +	fn = ath11k_nss_tx_hook[idx];
 +	ctx = ath11k_nss_tx_hook_ctx[idx];
-+	if (!fn)
++	if (!fn && !ath11k_nss_inbuilt)
 +		return -ESHUTDOWN;
 +
 +	if (!eth_encap) {
@@ -1886,6 +1894,9 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +			return ret;
 +		}
 +	}
++
++	if (ath11k_nss_inbuilt)
++		return ath11k_nss_tx(ab, skb, arvif->vdev_id);
 +
 +	return fn(ctx, skb, arvif->vdev_id);
 +}
@@ -2096,13 +2107,18 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	if (slot < 0 || !(ath11k_nss_offload_mask & BIT(slot)))
 +		return;
 +
-+	mutex_lock(&ath11k_nss_soc_lock);
-+	fn = ath11k_nss_vif_hook[slot];
-+	ctx = ath11k_nss_vif_hook_ctx[slot];
-+	mutex_unlock(&ath11k_nss_soc_lock);
-+
-+	if (!fn || !vif)
++	if (!vif)
 +		return;
++
++	if (!ath11k_nss_inbuilt) {
++		mutex_lock(&ath11k_nss_soc_lock);
++		fn = ath11k_nss_vif_hook[slot];
++		ctx = ath11k_nss_vif_hook_ctx[slot];
++		mutex_unlock(&ath11k_nss_soc_lock);
++
++		if (!fn)
++			return;
++	}
 +
 +	arvif = ath11k_vif_to_arvif(vif);
 +	wdev = ieee80211_vif_to_wdev(vif);
@@ -2131,6 +2147,14 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +		   "nss: vif %s vdev %u opmode %u netdev %px ifindex %d\n",
 +		   add ? "add" : "del", out.vdev_id, out.nss_opmode,
 +		   out.netdev, out.netdev ? out.netdev->ifindex : -1);
++
++	if (ath11k_nss_inbuilt) {
++		if (add)
++			ath11k_nss_vdev_create(ab, &out);
++		else
++			ath11k_nss_vdev_delete(ab);
++		return;
++	}
 +
 +	fn(ctx, &out, add);
 +}
@@ -2185,7 +2209,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +EXPORT_SYMBOL(ath11k_nss_dp_htt_refill_setup);
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.h
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,125 @@
 +/* SPDX-License-Identifier: BSD-3-Clause-Clear */
 +/*
 + * The NSS wifili offload, inside the driver.
@@ -2215,6 +2239,13 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +
 +/* NSS_WIFILI_MAX_NUMBER_OF_PAGE_MSG.  Checked against it in nss.c. */
 +#define ATH11K_NSS_MAX_TX_PAGES		32
++
++/*
++ * Peer memory is indexed by peer id, so this bounds the ids NSS will be told
++ * about.  ath11k's own table for this board is larger; a peer beyond this is
++ * refused rather than silently written past the end of the array.
++ */
++#define ATH11K_NSS_MAX_PEERS		128
 +
 +/*
 + * Per-SoC state.  One of these lives on struct ath11k_base, which is the
@@ -2253,6 +2284,22 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	int tx_ext_first_page;
 +	void *tx_page_va[ATH11K_NSS_MAX_TX_PAGES];
 +	dma_addr_t tx_page_pa[ATH11K_NSS_MAX_TX_PAGES];
++
++	/*
++	 * One AP vdev per radio, which is what this board runs and what the
++	 * message sequence was validated against.  A second vdev on the same
++	 * radio would need this per arvif rather than per SoC.
++	 */
++	int vdev_if_num;
++	struct net_device *vdev_ndev;
++
++	/* the AP's own BSS peer, and the station currently associated */
++	int self_peer_id;
++	int peer_created;
++	int peer_auth_sent;
++
++	void *peer_mem_va[ATH11K_NSS_MAX_PEERS];
++	dma_addr_t peer_mem_pa[ATH11K_NSS_MAX_PEERS];
 +};
 +
 +/* Is there an NSS core on this platform at all? */
@@ -2271,10 +2318,26 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +/* Give it back.  Safe to call when setup never ran, and idempotent. */
 +void ath11k_nss_teardown(struct ath11k_base *ab);
 +
++struct ath11k_nss_vif;
++struct ath11k_nss_peer;
++struct sk_buff;
++
++/* An AP interface appeared, or is going away. */
++int ath11k_nss_vdev_create(struct ath11k_base *ab,
++			   const struct ath11k_nss_vif *vif);
++void ath11k_nss_vdev_delete(struct ath11k_base *ab);
++
++/* A station changed state.  Idempotent - it is called again at AUTHORIZED. */
++int ath11k_nss_peer_update(struct ath11k_base *ab,
++			   const struct ath11k_nss_peer *peer, bool create);
++
++/* Hand a frame to NSS instead of putting it in TCL. */
++int ath11k_nss_tx(struct ath11k_base *ab, struct sk_buff *skb, u32 vdev_id);
++
 +#endif /* ATH11K_NSS_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -0,0 +1,691 @@
+@@ -0,0 +1,1467 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * NSS wifili offload for ath11k.  See nss.h for why this is here.
@@ -2370,6 +2433,87 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + */
 +#define ATH11K_NSS_NUM_REO_RINGS	1
 +
++/*
++ * htt_pkt_type_ethernet, which is also what ath11k's frame_mode=2 and
++ * HAL_TCL_ENCAP_TYPE_ETHERNET mean.  The hardware decaps to Ethernet and NSS
++ * has to be told to expect that; with the firmware's own default it receives
++ * 802.11 + RFC1042 SNAP, cannot parse it, matches no rule, and excepts every
++ * frame to Linux.
++ */
++#define ATH11K_NSS_ENCAP_TYPE		2
++#define ATH11K_NSS_DECAP_TYPE		2
++
++/* cdp_sec_type: 6 is AES-CCMP, which is what WPA2 on this AP negotiates. */
++#define ATH11K_NSS_SEC_TYPE		6
++
++/*
++ * NSS_WIFILI_PEER_UPDATE_AUTH_FLAG.  The header in this qca-nss-drv numbers it
++ * 43; the firmware answers only to 44, and the vendor binary sends 44.
++ */
++#define ATH11K_NSS_PEER_AUTH_MSG	44
++
++/* Per-peer state NSS keeps in host DRAM. */
++#define ATH11K_NSS_PEER_MEM_SZ		1600
++
++/*
++ * The vdev base next hop.  NSS_ETH_RX_INTERFACE (158) hands a received frame
++ * to NSS's own Ethernet Rx processing, which is what lets it reach eth1
++ * without Linux seeing it; 0 leaves it unset, and every frame is delivered to
++ * the netdev the vdev was registered with instead.
++ */
++static unsigned int ath11k_nss_next_hop = NSS_ETH_RX_INTERFACE;
++module_param_named(nss_next_hop, ath11k_nss_next_hop, uint, 0444);
++MODULE_PARM_DESC(nss_next_hop,
++		 "vdev base next hop; 0 delivers received frames to the netdev");
++
++/*
++ * Which ath11k_base owns a netdev.  The per-vdev NSS callbacks are handed the
++ * netdev and nothing else, so this is the way back to the SoC.  Two entries,
++ * one per wifili instance, indexed by the same slot ath11k_nss_soc_slot()
++ * returns.
++ */
++#define ATH11K_NSS_SOCS			2
++static struct ath11k_base *ath11k_nss_ndev_owner[ATH11K_NSS_SOCS];
++
++static atomic_t ath11k_nss_rx_data = ATOMIC_INIT(0);
++static atomic_t ath11k_nss_rx_ext = ATOMIC_INIT(0);
++static atomic_t ath11k_nss_rx_noab = ATOMIC_INIT(0);
++static atomic_t ath11k_nss_rx_short = ATOMIC_INIT(0);
++static atomic_t ath11k_nss_rx_eapol = ATOMIC_INIT(0);
++static atomic_t ath11k_nss_rx_up = ATOMIC_INIT(0);
++static atomic_t ath11k_nss_rx_extdrop = ATOMIC_INIT(0);
++
++static int ath11k_nss_rxstats_get(char *buf, const struct kernel_param *kp)
++{
++	return scnprintf(buf, PAGE_SIZE,
++			 "data=%d ext=%d noab=%d short=%d eapol=%d up=%d extdrop=%d\n",
++			 atomic_read(&ath11k_nss_rx_data),
++			 atomic_read(&ath11k_nss_rx_ext),
++			 atomic_read(&ath11k_nss_rx_noab),
++			 atomic_read(&ath11k_nss_rx_short),
++			 atomic_read(&ath11k_nss_rx_eapol),
++			 atomic_read(&ath11k_nss_rx_up),
++			 atomic_read(&ath11k_nss_rx_extdrop));
++}
++
++static const struct kernel_param_ops ath11k_nss_rxstats_ops = {
++	.get = ath11k_nss_rxstats_get,
++};
++module_param_cb(nss_rxstats, &ath11k_nss_rxstats_ops, NULL, 0444);
++
++static struct ath11k_base *ath11k_nss_ab_of_netdev(struct net_device *dev)
++{
++	unsigned int i;
++
++	for (i = 0; i < ATH11K_NSS_SOCS; i++) {
++		struct ath11k_base *ab = READ_ONCE(ath11k_nss_ndev_owner[i]);
++
++		if (ab && ab->nss.vdev_ndev == dev)
++			return ab;
++	}
++	return NULL;
++}
++
 +/* ------------------------------------------------------------------ replies */
 +
 +/*
@@ -2401,6 +2545,12 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + * exists only to put the firmware's own error number in the log - the status
 + * code says "it failed", the error number says what it objected to.
 + */
++/*
++ * Set while the STOP and SOC_RESET that clear a previous life are in flight.
++ * On a cold boot both are refused, and their replies should not be warnings.
++ */
++static bool ath11k_nss_quiet;
++
 +static void ath11k_nss_event_cb(void *app_data, struct nss_wifili_msg *msg)
 +{
 +	struct ath11k_base *ab = app_data;
@@ -2411,7 +2561,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	if (ath11k_nss_msg_is_event(msg))
 +		return;
 +
-+	if (msg->cm.response != NSS_CMN_RESPONSE_ACK && ab)
++	if (msg->cm.response != NSS_CMN_RESPONSE_ACK && ab && !ath11k_nss_quiet)
 +		ath11k_warn(ab, "nss: reply type=%u response=%u error=%u\n",
 +			    msg->cm.type, msg->cm.response, msg->cm.error);
 +}
@@ -2786,6 +2936,687 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	return 0;
 +}
 +
++
++/* ============================================================ the peer half */
++
++/*
++ * NSS keeps its own per-peer state in host DRAM and is told where.  The block
++ * is mapped for the device and stays mapped for the life of the peer; the
++ * index is the peer id, which is what every later message uses to name it.
++ */
++static void ath11k_nss_peer_mem_free(struct ath11k_base *ab, u32 pid)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++
++	if (pid >= ATH11K_NSS_MAX_PEERS || !nss->peer_mem_va[pid])
++		return;
++
++	dma_unmap_single(nss->dma_dev, nss->peer_mem_pa[pid],
++			 ATH11K_NSS_PEER_MEM_SZ, DMA_TO_DEVICE);
++	kfree(nss->peer_mem_va[pid]);
++	nss->peer_mem_va[pid] = NULL;
++	nss->peer_mem_pa[pid] = 0;
++}
++
++static int ath11k_nss_peer_delete(struct ath11k_base *ab, u32 peer_id)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct nss_wifili_msg *msg;
++	nss_tx_status_t status;
++
++	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	msg->msg.peermsg.peer_id = peer_id;
++
++	nss_wifili_msg_init(msg, nss->if_num, NSS_WIFILI_PEER_DELETE_MSG,
++			    sizeof(struct nss_wifili_peer_msg),
++			    ath11k_nss_event_cb, ab);
++
++	status = nss_wifili_tx_msg_sync(nss->ctx, msg);
++	kfree(msg);
++
++	ath11k_nss_peer_mem_free(ab, peer_id);
++
++	if (status != NSS_TX_SUCCESS) {
++		ath11k_warn(ab, "nss: PEER_DELETE %u failed (%d)\n",
++			    peer_id, status);
++		return -EIO;
++	}
++
++	ath11k_dbg(ab, ATH11K_DBG_MAC, "nss: peer %u deleted\n", peer_id);
++	return 0;
++}
++
++/*
++ * The cipher, per peer, for both the pairwise and the group key.  pkt_type 0
++ * is the group key and 1 the pairwise one; the vendor sends both.
++ */
++static void ath11k_nss_peer_security(struct ath11k_base *ab, u32 peer_id)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct nss_wifili_msg *msg;
++	nss_tx_status_t status;
++	int pkt_type;
++
++	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
++	if (!msg)
++		return;
++
++	for (pkt_type = 0; pkt_type < 2; pkt_type++) {
++		memset(msg, 0, sizeof(*msg));
++		msg->msg.securitymsg.peer_id	   = peer_id;
++		msg->msg.securitymsg.pkt_type	   = pkt_type;
++		msg->msg.securitymsg.security_type = ATH11K_NSS_SEC_TYPE;
++
++		nss_wifili_msg_init(msg, nss->if_num,
++				    NSS_WIFILI_PEER_SECURITY_TYPE_MSG,
++				    sizeof(struct nss_wifili_peer_security_type_msg),
++				    ath11k_nss_event_cb, ab);
++
++		status = nss_wifili_tx_msg_sync(nss->ctx, msg);
++		if (status != NSS_TX_SUCCESS)
++			ath11k_warn(ab, "nss: PEER_SECURITY %u/%d failed (%d)\n",
++				    peer_id, pkt_type, status);
++		msleep(20);
++	}
++
++	kfree(msg);
++}
++
++/*
++ * A peer NSS considers unauthorised is one whose frames it refuses to forward,
++ * which is the shape of "reo_reaped climbs and rx_deliverd stays zero".
++ */
++static int ath11k_nss_peer_auth(struct ath11k_base *ab, u32 peer_id,
++				bool authorized)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct nss_wifili_msg *msg;
++	nss_tx_status_t status;
++
++	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
++	if (!msg)
++		return -ENOMEM;
++
++	msg->msg.peer_auth.peer_id   = peer_id;
++	msg->msg.peer_auth.auth_flag = authorized ? 1 : 0;
++
++	nss_wifili_msg_init(msg, nss->if_num, ATH11K_NSS_PEER_AUTH_MSG,
++			    sizeof(struct nss_wifili_peer_update_auth_flag),
++			    ath11k_nss_event_cb, ab);
++
++	status = nss_wifili_tx_msg_sync(nss->ctx, msg);
++	kfree(msg);
++
++	if (status != NSS_TX_SUCCESS) {
++		ath11k_warn(ab, "nss: PEER_AUTH %u failed (%d)\n",
++			    peer_id, status);
++		return -EIO;
++	}
++
++	ath11k_info(ab, "nss: peer %u authorised=%d\n", peer_id, authorized);
++	return 0;
++}
++
++static int ath11k_nss_peer_create(struct ath11k_base *ab,
++				  const struct ath11k_nss_peer *peer)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct nss_wifili_peer_msg *pm;
++	struct nss_wifili_msg *msg;
++	nss_tx_status_t status;
++	u32 pid = peer->peer_id;
++
++	if (pid >= ATH11K_NSS_MAX_PEERS) {
++		ath11k_warn(ab, "nss: peer id %u past the peer table\n", pid);
++		return -EINVAL;
++	}
++
++	if (!nss->dma_dev)
++		return -ENODEV;
++
++	ath11k_nss_peer_mem_free(ab, pid);
++
++	nss->peer_mem_va[pid] = kzalloc(ATH11K_NSS_PEER_MEM_SZ, GFP_KERNEL);
++	if (!nss->peer_mem_va[pid])
++		return -ENOMEM;
++
++	nss->peer_mem_pa[pid] = dma_map_single(nss->dma_dev,
++					       nss->peer_mem_va[pid],
++					       ATH11K_NSS_PEER_MEM_SZ,
++					       DMA_TO_DEVICE);
++	if (dma_mapping_error(nss->dma_dev, nss->peer_mem_pa[pid])) {
++		kfree(nss->peer_mem_va[pid]);
++		nss->peer_mem_va[pid] = NULL;
++		return -ENOMEM;
++	}
++
++	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
++	if (!msg) {
++		ath11k_nss_peer_mem_free(ab, pid);
++		return -ENOMEM;
++	}
++
++	pm = &msg->msg.peermsg;
++	ether_addr_copy(pm->peer_mac_addr, peer->mac_addr);
++	pm->vdev_id	     = peer->vdev_id;
++	pm->peer_id	     = peer->peer_id;
++	pm->hw_ast_idx	     = peer->hw_peer_id;
++	pm->tx_ast_hash	     = peer->ast_hash;
++	pm->nss_peer_mem     = (u32)nss->peer_mem_pa[pid];
++	pm->psta_vdev_id     = peer->vdev_id;
++	pm->peer_memory_size = ATH11K_NSS_PEER_MEM_SZ;
++
++	nss_wifili_msg_init(msg, nss->if_num, NSS_WIFILI_PEER_CREATE_MSG,
++			    sizeof(*pm), ath11k_nss_event_cb, ab);
++
++	status = nss_wifili_tx_msg_sync(nss->ctx, msg);
++	kfree(msg);
++
++	if (status != NSS_TX_SUCCESS) {
++		ath11k_warn(ab, "nss: PEER_CREATE %pM (%u) failed (%d)\n",
++			    peer->mac_addr, peer->peer_id, status);
++		ath11k_nss_peer_mem_free(ab, pid);
++		return -EIO;
++	}
++
++	ath11k_info(ab, "nss: peer %pM id %u vdev %u ast_hash %u hw_ast %u\n",
++		    peer->mac_addr, peer->peer_id, peer->vdev_id,
++		    peer->ast_hash, peer->hw_peer_id);
++	return 0;
++}
++
++/*
++ * The AP's own BSS peer.  NSS will not forward for a vdev whose own peer it
++ * does not know, and ath11k has already created it by the time the vdev is
++ * built - so find it among the peers ath11k has and pass it on.
++ */
++static void ath11k_nss_self_peer_create(struct ath11k_base *ab, const u8 *mac)
++{
++	struct ath11k_nss_peer peers[ATH11K_NSS_MAX_PEER];
++	struct ath11k_nss_soc *nss = &ab->nss;
++	int np, i, slot;
++
++	if (nss->self_peer_id >= 0 || !nss->dma_dev)
++		return;
++
++	slot = ath11k_nss_soc_slot(ab);
++	if (slot < 0)
++		return;
++
++	np = ath11k_nss_get_peers(slot, peers, ARRAY_SIZE(peers));
++	for (i = 0; i < np; i++) {
++		if (!peers[i].valid ||
++		    !ether_addr_equal(peers[i].mac_addr, mac))
++			continue;
++
++		if (!ath11k_nss_peer_create(ab, &peers[i])) {
++			nss->self_peer_id = peers[i].peer_id;
++			ath11k_nss_peer_security(ab, peers[i].peer_id);
++		}
++		return;
++	}
++
++	ath11k_warn(ab, "nss: no self peer for %pM among %d\n", mac, np);
++	return;
++}
++
++/*
++ * ath11k's sta_state transitions, as they arrive.  It is called again at
++ * ASSOC->AUTHORIZED with the same peer, so it has to be idempotent: the peer
++ * is already there and only the flag has moved.
++ */
++int ath11k_nss_peer_update(struct ath11k_base *ab,
++			   const struct ath11k_nss_peer *peer, bool create)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	int ret;
++
++	if (!nss->enabled || nss->vdev_if_num < 0)
++		return -ENODEV;
++
++	if (!create) {
++		if (nss->peer_created != (int)peer->peer_id)
++			return 0;
++		ath11k_nss_peer_delete(ab, peer->peer_id);
++		nss->peer_created = -1;
++		nss->peer_auth_sent = -1;
++		return 0;
++	}
++
++	/* A station that re-associates arrives with a new peer id. */
++	if (nss->peer_created >= 0 && nss->peer_created != (int)peer->peer_id) {
++		ath11k_nss_peer_delete(ab, nss->peer_created);
++		nss->peer_created = -1;
++		nss->peer_auth_sent = -1;
++	}
++
++	if (nss->peer_created >= 0) {
++		if (nss->peer_auth_sent != !!peer->is_authorized &&
++		    !ath11k_nss_peer_auth(ab, peer->peer_id,
++					  peer->is_authorized))
++			nss->peer_auth_sent = !!peer->is_authorized;
++		return 0;
++	}
++
++	ret = ath11k_nss_peer_create(ab, peer);
++	if (ret)
++		return ret;
++
++	ath11k_nss_peer_security(ab, peer->peer_id);
++	nss->peer_created = peer->peer_id;
++	nss->peer_auth_sent = -1;
++
++	if (peer->is_authorized &&
++	    !ath11k_nss_peer_auth(ab, peer->peer_id, true))
++		nss->peer_auth_sent = 1;
++
++	return 0;
++}
++
++
++/* =========================================================== the vdev half */
++
++/*
++ * One AP vdev per radio, which is what this board runs and what the message
++ * sequence below was validated against.  A second vdev on the same radio would
++ * need this state per arvif rather than per SoC; nothing here assumes it is
++ * impossible, it simply has not been built or tested.
++ */
++
++static void ath11k_nss_vdev_cmd(struct ath11k_base *ab, int ifnum, u32 cmd,
++				u32 value, const char *name)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct nss_wifi_vdev_msg *msg;
++	nss_tx_status_t status;
++
++	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
++	if (!msg)
++		return;
++
++	msg->msg.vdev_cmd.cmd	= cmd;
++	msg->msg.vdev_cmd.value	= value;
++
++	nss_wifi_vdev_msg_init(msg, ifnum, NSS_WIFI_VDEV_INTERFACE_CMD_MSG,
++			       sizeof(struct nss_wifi_vdev_cmd_msg),
++			       NULL, NULL);
++
++	status = nss_wifi_vdev_tx_msg(nss->ctx, msg);
++	if (status != NSS_TX_SUCCESS)
++		ath11k_warn(ab, "nss: vdev %d cmd %s (%u) = %u failed (%d)\n",
++			    ifnum, name, cmd, value, status);
++
++	kfree(msg);
++}
++
++/*
++ * Excepted frames: NSS reaped this one from REO, resolved its peer, and had
++ * nowhere better to send it - a broadcast, an ARP, a DHCP discover, an EAPOL,
++ * or a flow ECM has not accelerated yet.
++ */
++static void ath11k_nss_rx_deliver(struct ath11k_base *ab,
++				  struct net_device *dev, struct sk_buff *skb)
++{
++	int slot;
++
++	if (!dev) {
++		dev_kfree_skb_any(skb);
++		return;
++	}
++
++	if (skb->len < ETH_HLEN) {
++		atomic_inc(&ath11k_nss_rx_short);
++		dev_kfree_skb_any(skb);
++		return;
++	}
++
++	/*
++	 * With frame_mode=2 the hardware decaps to Ethernet and what arrives
++	 * here is already 802.3.  Convert anything that is still 802.11.
++	 *
++	 * ieee80211_is_data() alone cannot tell the two apart: it reads the
++	 * first two bytes as a frame control field, and for an Ethernet frame
++	 * those are the first two bytes of the destination MAC.  A DA
++	 * beginning 28:d0 gives fc = 0xd028, whose type reads as DATA, and the
++	 * frame would be mangled.  Requiring the RFC1042 SNAP header at the
++	 * 802.11 payload offset settles it - no Ethernet frame carries that
++	 * there.
++	 */
++	if (skb->len >= sizeof(struct ieee80211_hdr_3addr)) {
++		struct ieee80211_hdr *h11 = (struct ieee80211_hdr *)skb->data;
++		static const u8 snap[6] = { 0xaa, 0xaa, 0x03, 0x00, 0x00, 0x00 };
++		unsigned int hl = ieee80211_hdrlen(h11->frame_control);
++
++		if (ieee80211_is_data(h11->frame_control) &&
++		    skb->len >= hl + sizeof(snap) &&
++		    !memcmp(skb->data + hl, snap, sizeof(snap))) {
++			if (ieee80211_data_to_8023_exthdr(skb, NULL,
++							  dev->dev_addr,
++							  NL80211_IFTYPE_AP,
++							  0, false)) {
++				dev_kfree_skb_any(skb);
++				return;
++			}
++		}
++	}
++
++	/*
++	 * EAPOL goes to mac80211, not to the bridge: hostapd listens on the
++	 * nl80211 control port, which only mac80211's receive path feeds.
++	 * Delivering it to the AP netdev reaches the bridge and nothing else,
++	 * and the four-way handshake never completes.
++	 */
++	slot = ath11k_nss_soc_slot(ab);
++	if (slot >= 0 && !ath11k_nss_dp_rx_eapol(slot, 0, skb)) {
++		atomic_inc(&ath11k_nss_rx_eapol);
++		return;
++	}
++
++	skb->dev = dev;
++	skb->protocol = eth_type_trans(skb, dev);
++	skb_reset_network_header(skb);
++	skb->pkt_type = PACKET_HOST;
++	skb->ip_summed = CHECKSUM_NONE;
++	skb->next = NULL;
++
++	/*
++	 * No dev_sw_netstats_rx_add(): that writes through dev->tstats, the
++	 * per-cpu block a driver opts into, and a mac80211 netdev leaves the
++	 * pointer unset.  mac80211 accounts for what it receives itself.
++	 */
++	atomic_inc(&ath11k_nss_rx_up);
++	netif_receive_skb(skb);
++}
++
++static void ath11k_nss_vdev_data_cb(struct net_device *dev,
++				    struct sk_buff *skb,
++				    struct napi_struct *napi)
++{
++	struct ath11k_base *ab = ath11k_nss_ab_of_netdev(dev);
++
++	atomic_inc(&ath11k_nss_rx_data);
++	if (!ab) {
++		atomic_inc(&ath11k_nss_rx_noab);
++		dev_kfree_skb_any(skb);
++		return;
++	}
++	ath11k_nss_rx_deliver(ab, dev, skb);
++}
++
++/*
++ * The extended callback carries two different things with a type in the
++ * headroom: frames NSS is excepting, and notifications wearing an skb - Tx
++ * completions, Rx error reports, PPDU metadata.  Delivering the notifications
++ * to the stack unexamined hands the bridge things that are not frames, so the
++ * type has to be looked at.
++ *
++ * MCBC_RX is the one that matters and the one that was missed.  It is what
++ * MCBC_EXC_TO_HOST produces, so every broadcast from a station arrives here:
++ * dropping it means no DHCP discover and no ARP ever reach the host, and a
++ * client associates, completes the handshake and then cannot get an address.
++ * Measured while it was being dropped: 237 frames on this callback, all type
++ * 14, and two on the data callback - the EAPOL pair, which is why the
++ * handshake worked and nothing else did.
++ */
++static void ath11k_nss_vdev_ext_cb(struct net_device *dev, struct sk_buff *skb,
++				   struct napi_struct *napi)
++{
++	struct nss_wifi_vdev_per_packet_metadata *md;
++	struct ath11k_base *ab = ath11k_nss_ab_of_netdev(dev);
++
++	atomic_inc(&ath11k_nss_rx_ext);
++	if (!ab) {
++		atomic_inc(&ath11k_nss_rx_noab);
++		dev_kfree_skb_any(skb);
++		return;
++	}
++
++	md = (struct nss_wifi_vdev_per_packet_metadata *)
++		(skb->head + NSS_WIFI_VDEV_PER_PACKET_METADATA_OFFSET);
++
++	switch (md->pkt_type) {
++	/* frames */
++	case NSS_WIFI_VDEV_EXT_DATA_PKT_TYPE_NONE:
++	case NSS_WIFI_VDEV_EXT_DATA_PKT_TYPE_IGMP:
++	case NSS_WIFI_VDEV_EXT_DATA_PKT_TYPE_WDS_LEARN:
++	case NSS_WIFI_VDEV_EXT_DATA_PKT_TYPE_MCBC_RX:
++	case NSS_WIFI_VDEV_EXT_DATA_PKT_TYPE_4ADDR:
++	case NSS_WIFI_VDEV_EXT_DATA_PKT_TYPE_EAPOL:
++		ath11k_nss_rx_deliver(ab, dev, skb);
++		return;
++	/* notifications: TXINFO, RX_ERR, TX_COMPL, PPDU/MPDU info, ... */
++	default:
++		atomic_inc(&ath11k_nss_rx_extdrop);
++		pr_info_once("ath11k: nss: ext pkt_type %u dropped\n",
++			     md->pkt_type);
++		dev_kfree_skb_any(skb);
++		return;
++	}
++}
++
++static void ath11k_nss_vdev_msg_cb(void *app_data, struct nss_cmn_msg *msg)
++{
++}
++
++/*
++ * Hand a frame ath11k was about to put in TCL to NSS instead.  Called from
++ * ath11k_nss_dp_tx(), which has already converted an 802.11 frame to 802.3.
++ */
++int ath11k_nss_tx(struct ath11k_base *ab, struct sk_buff *skb, u32 vdev_id)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	nss_tx_status_t status;
++
++	if (nss->vdev_if_num < 0 || !nss->ctx)
++		return -ENODEV;
++
++	if (skb->len <= ETH_HLEN)
++		return -EINVAL;
++
++	/*
++	 * NSS writes its own headers in front of a full-size frame, and a
++	 * short headroom is what a converted 802.11 frame arrives with.
++	 */
++	if (skb->len > ETH_FRAME_LEN && skb_headroom(skb) <= 23 &&
++	    pskb_expand_head(skb, 24, 0, GFP_ATOMIC))
++		return -ENOMEM;
++
++	skb->next = NULL;
++	status = nss_wifi_vdev_tx_buf(nss->ctx, skb, nss->vdev_if_num);
++	if (status != NSS_TX_SUCCESS)
++		return -EIO;
++
++	/* NSS owns the skb now; ath11k treats this as queued to TCL. */
++	return 0;
++}
++
++int ath11k_nss_vdev_create(struct ath11k_base *ab,
++			   const struct ath11k_nss_vif *vif)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	struct nss_wifi_vdev_config_msg *cfg;
++	struct nss_wifi_vdev_msg *msg;
++	nss_tx_status_t status;
++	int ifnum;
++
++	if (!nss->enabled || nss->vdev_if_num >= 0)
++		return 0;
++
++	if (nss->radio_if_num < 0) {
++		ath11k_warn(ab, "nss: no radio interface; PDEV_INIT first\n");
++		return -EINVAL;
++	}
++
++	ifnum = nss_dynamic_interface_alloc_node(NSS_DYNAMIC_INTERFACE_TYPE_VAP);
++	if (ifnum < 0) {
++		ath11k_warn(ab, "nss: vdev interface alloc failed (%d)\n",
++			    ifnum);
++		return ifnum;
++	}
++
++	/*
++	 * vif->netdev as it arrives: no reference, no name.  See the note on
++	 * struct ath11k_nss_vif in ath11k_nss_export.h for why both are
++	 * unavailable at this point and why the bare pointer is safe.
++	 */
++	nss->vdev_ndev = vif->netdev;
++	if (!nss->vdev_ndev) {
++		ath11k_warn(ab, "nss: vif has no netdev; excepted frames will be lost\n");
++		nss->vdev_ndev = nss->dummy;
++	}
++
++	/*
++	 * No return check.  nss_register_wifi_vdev_if() is declared uint32_t
++	 * but its own documentation says "@return None", and on the path that
++	 * works it returns 0 - so testing it turns every successful
++	 * registration into a failure.  There is no way to tell from here
++	 * whether it worked; the VDEV_CONFIGURE that follows is what reports.
++	 */
++	nss_register_wifi_vdev_if(nss->ctx, ifnum,
++				  ath11k_nss_vdev_data_cb,
++				  ath11k_nss_vdev_ext_cb,
++				  ath11k_nss_vdev_msg_cb,
++				  nss->vdev_ndev, 0);
++
++	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
++	if (!msg) {
++		nss_unregister_wifi_vdev_if(ifnum);
++		nss_dynamic_interface_dealloc_node(ifnum,
++					NSS_DYNAMIC_INTERFACE_TYPE_VAP);
++		return -ENOMEM;
++	}
++
++	cfg = &msg->msg.vdev_config;
++	ether_addr_copy(cfg->mac_addr, vif->mac_addr);
++	cfg->radio_ifnum = nss->radio_if_num;
++	cfg->vdev_id	 = vif->vdev_id;
++	cfg->opmode	 = vif->nss_opmode;
++
++	nss_wifi_vdev_msg_init(msg, ifnum,
++			       NSS_WIFI_VDEV_INTERFACE_CONFIGURE_MSG,
++			       sizeof(*cfg), NULL, NULL);
++	status = nss_wifi_vdev_tx_msg(nss->ctx, msg);
++	if (status != NSS_TX_SUCCESS) {
++		ath11k_warn(ab, "nss: VDEV_CONFIGURE failed (%d)\n", status);
++		kfree(msg);
++		nss_unregister_wifi_vdev_if(ifnum);
++		nss_dynamic_interface_dealloc_node(ifnum,
++					NSS_DYNAMIC_INTERFACE_TYPE_VAP);
++		return -EIO;
++	}
++
++	memset(msg, 0, sizeof(*msg));
++	ether_addr_copy(msg->msg.vdev_enable.mac_addr, vif->mac_addr);
++	nss_wifi_vdev_msg_init(msg, ifnum, NSS_WIFI_VDEV_INTERFACE_UP_MSG,
++			       sizeof(struct nss_wifi_vdev_enable_msg),
++			       NULL, NULL);
++	status = nss_wifi_vdev_tx_msg(nss->ctx, msg);
++	if (status != NSS_TX_SUCCESS)
++		ath11k_warn(ab, "nss: VDEV_UP failed (%d)\n", status);
++	kfree(msg);
++
++	/*
++	 * The vendor ends its vap_create with this.  An interface NSS believes
++	 * has no MTU is not one it will hand a frame to, which is the shape of
++	 * "reaped from REO but never delivered".
++	 */
++	nss_if_change_mtu(nss->ctx, ifnum, ETH_DATA_LEN);
++
++	/*
++	 * Tell the vdev what its frames look like.  Leaving these to the
++	 * firmware's defaults is how the encapsulation ends up as raw or
++	 * native-wifi while ath11k is handing it Ethernet.
++	 */
++	ath11k_nss_vdev_cmd(ab, ifnum, NSS_WIFI_VDEV_ENCAP_TYPE_CMD,
++			    ATH11K_NSS_ENCAP_TYPE, "ENCAP_TYPE");
++	ath11k_nss_vdev_cmd(ab, ifnum, NSS_WIFI_VDEV_DECAP_TYPE_CMD,
++			    ATH11K_NSS_DECAP_TYPE, "DECAP_TYPE");
++	ath11k_nss_vdev_cmd(ab, ifnum, NSS_WIFI_VDEV_DROP_UNENC_CMD,
++			    0, "DROP_UNENC");
++
++	/*
++	 * MCBC_EXC_TO_HOST is what lets a DHCP discover reach dnsmasq at all.
++	 * AP_BRIDGE is the station-to-station forwarding an AP owes its
++	 * clients.
++	 */
++	ath11k_nss_vdev_cmd(ab, ifnum, NSS_WIFI_VDEV_CFG_MCBC_EXC_TO_HOST_CMD,
++			    1, "MCBC_EXC_TO_HOST");
++	ath11k_nss_vdev_cmd(ab, ifnum, NSS_WIFI_VDEV_CFG_AP_BRIDGE_CMD,
++			    1, "AP_BRIDGE");
++
++	/*
++	 * Where a received frame goes next.  NSS_ETH_RX_INTERFACE hands it to
++	 * NSS's own Ethernet Rx processing - the bridging and routing lookup,
++	 * and from there to an accelerated flow.  It is the reason a WiFi frame
++	 * can reach eth1 without Linux seeing it, and it is worth 27 % of the
++	 * downlink: without it four runs gave 320 Mbit/s scattered 246-373,
++	 * with it 406 inside 383-418.
++	 */
++	if (ath11k_nss_next_hop) {
++		status = nss_wifi_vdev_base_set_next_hop(nss->ctx,
++							 ath11k_nss_next_hop);
++		if (status != NSS_TX_SUCCESS)
++			ath11k_warn(ab, "nss: base next hop -> %u failed (%d)\n",
++				    ath11k_nss_next_hop, status);
++	}
++
++	nss->vdev_if_num = ifnum;
++
++	/*
++	 * Only now, and only after vdev_ndev is set: the per-vdev callbacks
++	 * find their SoC through this, and NSS can call them as soon as the
++	 * interface is up.
++	 */
++	{
++		int slot = ath11k_nss_soc_slot(ab);
++
++		if (slot >= 0 && slot < ATH11K_NSS_SOCS)
++			WRITE_ONCE(ath11k_nss_ndev_owner[slot], ab);
++	}
++
++	ath11k_info(ab, "nss: vdev %d up for vdev_id %u on %s\n",
++		    ifnum, vif->vdev_id,
++		    nss->vdev_ndev ? nss->vdev_ndev->name : "(none)");
++
++	/* The AP's own BSS peer, which NSS needs before it will forward. */
++	ath11k_nss_self_peer_create(ab, vif->mac_addr);
++	return 0;
++}
++
++void ath11k_nss_vdev_delete(struct ath11k_base *ab)
++{
++	struct ath11k_nss_soc *nss = &ab->nss;
++	int ifnum = xchg(&nss->vdev_if_num, -1);
++
++	if (ifnum < 0)
++		return;
++
++	if (nss->peer_created >= 0) {
++		ath11k_nss_peer_delete(ab, nss->peer_created);
++		nss->peer_created = -1;
++		nss->peer_auth_sent = -1;
++	}
++	if (nss->self_peer_id >= 0) {
++		ath11k_nss_peer_delete(ab, nss->self_peer_id);
++		nss->self_peer_id = -1;
++	}
++
++	nss_unregister_wifi_vdev_if(ifnum);
++	nss_dynamic_interface_dealloc_node(ifnum,
++					   NSS_DYNAMIC_INTERFACE_TYPE_VAP);
++
++	{
++		int slot = ath11k_nss_soc_slot(ab);
++
++		if (slot >= 0 && slot < ATH11K_NSS_SOCS)
++			WRITE_ONCE(ath11k_nss_ndev_owner[slot], NULL);
++	}
++	nss->vdev_ndev = NULL;
++}
++
 +/* ------------------------------------------------------------------- setup */
 +
 +bool ath11k_nss_available(void)
@@ -2851,6 +3682,10 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	}
 +
 +	nss->radio_if_num = -1;
++	nss->vdev_if_num = -1;
++	nss->self_peer_id = -1;
++	nss->peer_created = -1;
++	nss->peer_auth_sent = -1;
 +
 +	info = kzalloc(sizeof(*info), GFP_KERNEL);
 +	if (!info)
@@ -2895,9 +3730,11 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	 * reset that is not preceded by a stop is refused outright
 +	 * (NSS_WIFILI_EMSG_RESET_NO_STOP exists for exactly that).
 +	 */
++	ath11k_nss_quiet = true;
 +	ath11k_nss_send_simple(ab, NSS_WIFILI_STOP_MSG, "STOP", true);
 +	msleep(100);
 +	ath11k_nss_send_simple(ab, NSS_WIFILI_SOC_RESET_MSG, "SOC_RESET", true);
++	ath11k_nss_quiet = false;
 +	msleep(200);
 +
 +	ret = ath11k_nss_send_init(ab, info);
@@ -2946,6 +3783,8 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +
 +	if (!nss->ctx)
 +		return;
++
++	ath11k_nss_vdev_delete(ab);
 +
 +	if (nss->enabled) {
 +		ath11k_nss_send_simple(ab, NSS_WIFILI_STOP_MSG, "STOP", false);

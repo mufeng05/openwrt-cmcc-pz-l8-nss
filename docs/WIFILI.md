@@ -105,6 +105,69 @@ and `nss_wifi_vdev_set_peer_next_hop` per peer are all accepted and all made no
 difference, because there was nothing NSS could do with a frame it could not
 read.
 
+## Inside the driver
+
+`nss.c` and `nss.h` in ath11k do what `nss_wifili_probe.ko` did, from where
+Qualcomm's own driver does it. `ath11k_nss_setup()` sends INIT, PDEV_INIT and
+START from `ath11k_core_pdev_create()`, between `ath11k_dp_pdev_alloc()` and
+`ath11k_mac_register()`; the vdev is built from `ath11k_mac_op_add_interface()`,
+peers follow `ath11k_mac_op_sta_state()`, and `ath11k_dp_tx()` hands its frames
+straight to `nss_wifi_vdev_tx_buf()`. State lives on `struct ath11k_base`
+instead of in a slot-indexed array, and nothing is reached through a function
+pointer.
+
+Both implementations are in the image while the port is being finished, and
+`nss_inbuilt` picks between them:
+
+```
+ath11k nss_inbuilt=1 nss_offload_mask=3 nss_refill_hold=3 frame_mode=2
+```
+
+Measured with it set, against the probe path on the same build:
+
+| | uplink | downlink | host frames |
+|---|---|---|---|
+| probe | 503 Mbit/s | 456 Mbit/s | |
+| in-driver | 540-547 | 332-421 | 3199 of 749431 |
+
+CPU is 0.1-1.9 % over the idle baseline, 2.4 GHz does 70/57 Mbit/s, and there
+are no traps on either radio. 3199 host frames per 1.5 GB is the offload
+working: everything else is forwarded inside NSS.
+
+### What the port got wrong, and how it showed
+
+Every vdev command reported the same status as the probe's, both peers were
+created and authorised, and the four-way handshake completed - and a client
+still could not get an address. `reo_reaped` climbed to 239 while
+`rx_deliverd` sat at 2.
+
+The two were the EAPOL pair. Everything else arrived on the *extended*
+callback with `pkt_type = 14`, `NSS_WIFI_VDEV_EXT_DATA_PKT_TYPE_MCBC_RX`, and
+the switch there only accepted NONE, IGMP and WDS_LEARN - so every broadcast a
+station sent was freed as if it were a notification. No DHCP discover, no ARP.
+
+That callback carries both frames NSS is excepting and notifications wearing an
+skb, so it does need a type check; it just needs the right one. MCBC_RX is
+what `MCBC_EXC_TO_HOST` produces, and 4ADDR and EAPOL are frames too.
+
+Finding it took counters rather than reasoning, because `ath11k_dbg()` compiles
+to nothing without `CPTCFG_ATH11K_DEBUG` and this build does not set it - the
+whole peer and vdev path was silent. `nss_rxstats` is what those counters
+became and is worth keeping:
+
+```
+cat /sys/module/ath11k/parameters/nss_rxstats
+data=58 ext=226 noab=0 short=0 eapol=2 up=282 extdrop=0
+```
+
+`extdrop` non-zero with traffic flowing is this bug returning.
+
+### Still the probe's
+
+Nothing yet: vdev, peer and Tx are all in the driver. What remains is removing
+the four hook sets and the 90 s wait, after which the probe stops being able to
+drive a handover and becomes what it should be - an instrument.
+
 ## The Rx descriptor pool
 
 `PROBE_RX_SW_DESC_NUM` is what the probe puts in `num_rx_swdesc` in PDEV_INIT,
