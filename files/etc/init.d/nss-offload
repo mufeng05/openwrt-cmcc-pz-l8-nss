@@ -28,9 +28,14 @@ PBUF_HIGH_WATER=16336    # (high_water - 11720 NSS+OCM buffers) * 160 B/pbuf
 nss_log() { logger -t nss-offload "$@"; }
 
 nss_load() {
-	lsmod | grep -q '^qca_nss_drv' && return 0
-
-	insmod qca-nss-drv || { nss_log "insmod qca-nss-drv failed"; return 1; }
+	# qca-nss-drv is loaded by kmodloader from /etc/modules.d/32-qca-nss-drv
+	# so that it is up before ath11k probes - the WiFi handover runs inside
+	# ath11k's QMI worker and cannot wait for START=99.  Only insmod it here
+	# if that did not happen; and do NOT return early when it is already
+	# loaded, or the pbuf tuning and the ECM stack below are skipped.
+	if ! lsmod | grep -q '^qca_nss_drv'; then
+		insmod qca-nss-drv || { nss_log "insmod qca-nss-drv failed"; return 1; }
+	fi
 
 	# The core answers messages only once it has finished booting; the pbuf
 	# sysctls below are synchronous and fail with -EINVAL if it has not.
@@ -61,7 +66,7 @@ nss_confirm() {
 	# not depend on anything outside the box.
 	( sleep 25
 	  if [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "1" ]; then
-		rm -f "$FLAG"; sync
+		rm -f "$FLAG" /etc/nss-wifi-pending; sync
 		nss_log "confirmed: eth0 has carrier, offload kept"
 	  else
 		nss_log "eth0 has no carrier after loading NSS - leaving the flag armed, next boot will disarm"

@@ -1,0 +1,14 @@
+# The NSS core, loaded by kmodloader rather than from an init script.
+#
+# It used to come up from /etc/init.d/nss-offload at START=99, after S95done,
+# so that a hang could not cost the rootfs_data overlay.  The WiFi handover
+# runs inside ath11k's QMI worker about 25 s into boot and cannot wait for
+# that, so the core has to be up first.  nss-failsafe (START=05) carries the
+# same protection now, by disarming the handover rather than by delaying it.
+#
+# 32 and not 28: qca-nss-dp is 31, and the tested order is nss-dp first -
+# qca-nss-drv takes over its data plane and reopens eth0/eth1 through NSS.
+#
+# nss-offload still runs at START=99 for the pbuf tuning and the ECM stack;
+# it notices the module is already loaded and skips the insmod.
+qca-nss-drv

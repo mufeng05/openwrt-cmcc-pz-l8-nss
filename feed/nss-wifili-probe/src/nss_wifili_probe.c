@@ -98,14 +98,23 @@ static struct nss_ctx_instance *probe_ctx;
  * dynamic-interface type for its radio, which is the same split the vendor
  * driver makes on target type.
  *
- * One at a time for now: everything below this line is single-instance state,
- * so offloading both radios at once needs it made per-slot first.  This at
- * least answers whether the external path works at all.
+ * A bitmask, not an index: bit 0 is the internal IPQ5018 radio, bit 1 the
+ * external QCN6122.  ath11k has already decided which slots are offloaded -
+ * that is what its own nss_offload_mask is - and it calls probe_dp_ready()
+ * once per slot.  This exists only to be able to take one of them back
+ * without rebuilding, so the default is both.
+ *
+ * Refusing a slot here is not free: ath11k clears that slot from its offload
+ * mask and falls back to the host data path, but nss_refill_hold is a
+ * load-time parameter and still holds the refill ring empty.  A radio refused
+ * here therefore cannot receive at all.  Refuse a slot only together with the
+ * matching bit of nss_refill_hold.
  */
-static unsigned int probe_slot;
-module_param_named(slot, probe_slot, uint, 0444);
+static unsigned int probe_slots = 3;
+module_param_named(slot, probe_slots, uint, 0444);
 MODULE_PARM_DESC(slot,
-		 "ath11k slot to offload: 0 the internal radio, 1 the QCN6122");
+		 "bitmask of ath11k slots to offload: bit 0 the internal"
+		 " radio, bit 1 the QCN6122");
 
 /* moved into struct probe_slot_state */
 
@@ -670,7 +679,7 @@ module_param_named(target_type, probe_target_type, uint, 0644);
 /*
  * Which wifili interface to register on, independently of which radio runs.
  *
- * probe_slot currently decides both: slot 0 takes the internal interface (203)
+ * The slot being run decides both: slot 0 takes the internal interface (203)
  * and slot 1 an external one (215).  So "which radio" and "which firmware code
  * path" have never been varied separately, and every slot-0-is-clean result is
  * ambiguous between "the QCN6122 is the problem" and "the external-interface
@@ -1120,7 +1129,7 @@ static void probe_vdev_deliver(struct net_device *dev, struct sk_buff *skb)
 	/*
 	 * Hand EAPOL to the mac80211 control port of the radio it arrived on.
 	 *
-	 * This used to pass probe_slot, the module parameter, which is one
+	 * This used to pass the module parameter, which is one
 	 * number for the whole module.  With both radios armed that injected
 	 * the 2.4 GHz station M2 into the 5 GHz control port: the probe counted
 	 * eapol=20 and hostapd on phy0-ap0 still saw nothing and deauthenticated
@@ -1591,7 +1600,7 @@ static int probe_alloc_tx_pages(struct device *dev)
  * wrong one gets a node NSS will not associate with the pdev.
  */
 /*
- * Gate on the wifili interface actually in use, not on probe_slot.  The two
+ * Gate on the wifili interface actually in use, not on the slot number.  The two
  * agreed only while one SoC was ever registered; running soc 0 with slot=1
  * asked for an EXTERNAL0 radio node on the INTERNAL interface, which is the
  * exact mismatch the comment above warns about.  The firmware took the
@@ -1927,6 +1936,7 @@ static int probe_vdev_create(const struct ath11k_nss_vif *vif)
 	uint32_t reg;
 	int ifnum;
 	const char *nm;
+	char nmbuf[IFNAMSIZ];
 
 	if (probe_vdev_ifnum >= 0) {
 		pr_info(PFX "vdev if=%d already created\n", probe_vdev_ifnum);
@@ -1990,6 +2000,31 @@ static int probe_vdev_create(const struct ath11k_nss_vif *vif)
 	nm = (probe_cur < PROBE_MAX_SOC) ? probe_vdev_name[probe_cur] : NULL;
 	if (!nm || !nm[0])
 		nm = probe_vdev_netdev;
+
+	/*
+	 * Trim the value into a local buffer.  Setting a charp parameter from
+	 * the shell is the normal way to do it and `echo name > vdev_netdev0`
+	 * stores the trailing newline, so dev_get_by_name() looks up
+	 * "phy0-ap0\n" and misses.  The failure is quiet - registration falls
+	 * back to the dummy netdev, and the only symptom is that excepted
+	 * frames go to the wrong radio.
+	 *
+	 * A copy rather than strim() in place: nm is const because it can also
+	 * point at whatever was given on the insmod line, and nothing here
+	 * needs to modify the parameter itself.
+	 */
+	if (nm) {
+		size_t n = strlen(nm);
+
+		while (n && (nm[n - 1] == '\n' || nm[n - 1] == '\r' ||
+			     nm[n - 1] == ' ' || nm[n - 1] == '\t'))
+			n--;
+		if (n >= sizeof(nmbuf))
+			n = sizeof(nmbuf) - 1;
+		memcpy(nmbuf, nm, n);
+		nmbuf[n] = '\0';
+		nm = nmbuf;
+	}
 
 	probe_vdev_ndev = NULL;
 	if (nm && nm[0]) {
@@ -2160,7 +2195,14 @@ static int probe_vdev_create(const struct ath11k_nss_vif *vif)
 	}
 	pr_info(PFX "tx hook armed for vdev if=%d\n", ifnum);
 
-	probe_self_peer_create(probe_slot, vif->mac_addr, probe_peer_dma_dev);
+	/*
+	 * probe_cur, not the module parameter.  This runs from the vif hook,
+	 * which sets probe_cur to the slot that owns the vdev; passing the
+	 * parameter put the second radio's BSS peer on the first radio's
+	 * wifili instance.  Same mistake, and same signature, as the EAPOL
+	 * routing bug recorded in probe_vdev_deliver().
+	 */
+	probe_self_peer_create(probe_cur, vif->mac_addr, probe_peer_dma_dev);
 
 	probe_warm_peers_run(probe_peer_dma_dev);
 
@@ -2859,7 +2901,7 @@ static int probe_run(unsigned int soc_idx, unsigned int stage,
 				goto out;
 			}
 			pr_info(PFX "slot %u -> external wifili interface %d\n",
-				probe_slot, probe_wifili_if);
+				probe_cur, probe_wifili_if);
 		}
 
 		probe_ctx = nss_register_wifili_if(probe_wifili_if,
@@ -3430,9 +3472,8 @@ static int probe_dp_ready(void *ctx, unsigned int slot)
 		return -ENODEV;
 	}
 
-	if (slot != probe_slot) {
-		pr_info(PFX "slot %u is not ours (offloading %u)\n",
-			slot, probe_slot);
+	if (slot >= PROBE_MAX_SOC || !(probe_slots & BIT(slot))) {
+		pr_info(PFX "slot %u not in our mask %#x\n", slot, probe_slots);
 		return -ENODEV;
 	}
 

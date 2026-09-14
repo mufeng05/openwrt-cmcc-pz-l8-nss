@@ -1,5 +1,17 @@
 # ath11k parameters that must be in place before the driver probes.
 #
+# nss_offload_mask bitmask of NSS-owned slots.  Setting it here rather than
+#                  from userspace is what makes the handover happen at boot:
+#                  ath11k_nss_dp_ready() is gated on it, and it runs inside
+#                  ath11k_core_pdev_create() between ath11k_dp_pdev_alloc() and
+#                  ath11k_mac_register().  With the mask clear the function
+#                  returns immediately and the radios come up on the host path.
+#                  Note the cost of setting it: ath11k_nss_dp_owned() is true
+#                  from module load, so ath11k_dp_tx() diverts to the NSS path
+#                  and returns -ESHUTDOWN until the vdev Tx hook is armed.  That
+#                  is survivable only because mac80211 does not exist yet - the
+#                  handover completes before ath11k_mac_register() is called.
+#
 # nss_refill_hold  bitmask of NSS slots whose Rx refill ring ath11k must never
 #                  fill.  ath11k fills it in ath11k_dp_pdev_alloc(), at core
 #                  start, long before anything sets nss_offload_mask from
@@ -11,8 +23,10 @@
 #                  later trips its Tx free path over a NULL buffer and traps the
 #                  core.  Holding the ring empty leaves nothing to cache.
 #                  3 = both radios.  A held radio cannot receive until NSS takes
-#                  the ring over, so its boot-time AP fails and comes up on the
-#                  arm script instead.
+#                  the ring over; with the mask set above that now happens
+#                  before mac80211 sees the radio, so the boot-time AP no longer
+#                  fails with -110.  A radio whose handover FAILS is still stuck,
+#                  because clearing the offload bit does not refill the ring.
 #
 # frame_mode=2     Ethernet encap/decap rather than native wifi.  The probe
 #                  tells NSS DECAP_TYPE=2, and with native wifi the frames NSS
@@ -21,4 +35,4 @@
 #                  Linux.  Measured: 138 Mbit/s at 41% CPU before, 121-152 at
 #                  2.8% after, and host deliveries per 268 MB fell from 131343
 #                  to 11.
-ath11k nss_refill_hold=3 frame_mode=2
+ath11k nss_offload_mask=3 nss_refill_hold=3 frame_mode=2

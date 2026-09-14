@@ -1,0 +1,24 @@
+# The module that answers ath11k's handover hook.
+#
+# 33 puts it after ath11k (29, for its parameters) and after qca-nss-drv (32),
+# whose symbols it links against, and before ath11k_ahb - which has no numeric
+# prefix, so kmodloader runs it last, and which is what actually probes the
+# hardware.  So the hook is registered before anything can call it and
+# ath11k_nss_dp_ready() never has to use its 90 s wait.
+#
+# vdev_netdev0/1  the AP netdev of each slot, 0 = internal 2.4 GHz, 1 = the
+#                 QCN6122.  Without them the vdev registers against a dummy
+#                 netdev and excepted frames - EAPOL among them - are delivered
+#                 to whichever slot answers first.  These are names rather than
+#                 something resolved at run time because the alternatives were
+#                 tried: dev_getbyhwaddr_rcu() from ath11k's add_interface
+#                 faults on pcpu_refcnt, and vif->netdev is not safe to
+#                 dereference there either.  Moving the glue into ath11k is what
+#                 removes the guess - the driver knows its own netdev.
+#
+# next_hop=158    NSS_ETH_RX_INTERFACE, the vdev base next hop.  Worth 27% of
+#                 the downlink: without it four runs gave 320 Mbit/s scattered
+#                 246-373, with it 406 inside 383-418.  It has to be set at load
+#                 time - writing it at run time and recreating the vdevs
+#                 crashed the board.
+nss_wifili_probe vdev_netdev0=phy0-ap0 vdev_netdev1=phy1-ap0 next_hop=158

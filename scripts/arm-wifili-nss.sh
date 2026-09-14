@@ -1,5 +1,10 @@
 #!/bin/sh
-# Arm the QSDK NSS wifili offload on the CMCC PZ-L8.
+# Arm the QSDK NSS wifili offload on the CMCC PZ-L8, by hand.
+#
+# NOT the normal path any more.  A stock boot arms both radios on its own -
+# see docs/WIFILI.md, "How to run it".  This is for a box that booted with the
+# handover disarmed, which is what /etc/nss-wifi-disabled means.  It refuses to
+# run if the probe is already loaded, which on a normal boot it is.
 #
 # This is the sequence the measurements in docs/WIFILI.md were taken with,
 # stripped of the diagnostic scaffolding (netconsole, log streaming, the NSS

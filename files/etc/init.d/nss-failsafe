@@ -1,0 +1,73 @@
+#!/bin/sh /etc/rc.common
+# Disarm the boot-time WiFi handover if the previous boot never confirmed.
+#
+# START=05, so this runs before /etc/init.d/boot (START=10) calls kmodloader.
+# By the time the modules load the decision has already been made, which is
+# the only place it can be made: qca-nss-drv now comes from /etc/modules.d and
+# nothing at START=99 can un-load it.
+#
+# nss-offload carries the same contract for the ECM stack and keeps its own
+# pair of flags.  These are deliberately separate: the wired offload works and
+# is not what changed, so a bad WiFi boot must not switch it off.
+#
+#   boot()  arms /etc/nss-wifi-pending.  Finding it already armed means the
+#           previous boot armed the handover and never reported healthy, so it
+#           rewrites the ath11k module line without the offload parameters and
+#           writes /etc/nss-wifi-disabled.
+#   nss-offload's nss_confirm() clears the flag once eth0 has carrier.
+#
+# Re-arm with:  rm /etc/nss-wifi-disabled && reboot
+
+START=05
+
+FLAG=/etc/nss-wifi-pending
+DISABLED=/etc/nss-wifi-disabled
+MODCONF=/etc/modules.d/29-ath11k-nss
+
+# frame_mode=2 stays in the safe line.  It selects Ethernet encap/decap, it is
+# what every throughput number was measured with, and it has nothing to do with
+# the handover - dropping it would change the fallback into a configuration
+# that has never been measured.
+SAFE='ath11k frame_mode=2'
+
+nss_log() { logger -t nss-failsafe "$@"; }
+
+disarm() {
+	echo "$SAFE" > "$MODCONF"
+	rm -f "$FLAG"
+	sync
+}
+
+boot() {
+	if [ -f "$DISABLED" ]; then
+		[ "$(cat $MODCONF 2>/dev/null)" = "$SAFE" ] || disarm
+		nss_log "WiFi offload disabled ($DISABLED); rm it and reboot to re-arm"
+		return 0
+	fi
+
+	if [ -f "$FLAG" ]; then
+		touch "$DISABLED"
+		disarm
+		nss_log "the previous boot armed the handover and never confirmed - disabling"
+		return 0
+	fi
+
+	# Nothing to arm if the line is already the safe one.
+	case "$(cat $MODCONF 2>/dev/null)" in
+		*nss_offload_mask*) ;;
+		*) return 0 ;;
+	esac
+
+	touch "$FLAG"; sync
+	nss_log "handover armed; waiting for nss-offload to confirm carrier"
+}
+
+start() {
+	# Manual start is a no-op: arming has to happen before kmodloader, and by
+	# the time anyone can run this by hand the modules are already loaded.
+	:
+}
+
+stop() {
+	rm -f "$FLAG"; sync
+}

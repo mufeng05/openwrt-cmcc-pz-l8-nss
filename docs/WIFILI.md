@@ -26,6 +26,13 @@ Both halves of the CPU figure are given because the per-second sampler costs
 2–5 % on these cores by itself; what forwarding adds is the difference, 0.3 %
 on either radio and nothing measurable on wired.
 
+`next_hop=158` (`NSS_ETH_RX_INTERFACE`) is not optional. Left unset, four runs
+gave 413 up / 320 down with the downlink scattered from 246 to 373; set at
+module load, four runs gave 448 up / 406 down with the downlink inside 383–418.
+The reference implementation sends the same
+`nss_wifi_vdev_base_set_next_hop(ctx, NSS_ETH_RX_INTERFACE)` at the end of
+`ath11k_nss_setup()`.
+
 A single stream gets 226–337 down and 121–197 up on 5 GHz at the same CPU.
 That is the stream, not the offload. An earlier revision of this file quoted
 those single-stream numbers under a 4-stream heading.
@@ -160,22 +167,73 @@ netdev that is still being registered, and `dev_hold()` on it faults on
 
 ## How to run it
 
-```
-# once, before ath11k probes - shipped as files/etc/modules.d/29-ath11k-nss
-ath11k nss_refill_hold=3 frame_mode=2
+Nothing. It arms itself at boot, on both radios, and the radios come up
+offloaded the first time — there is no window in which they run on the host
+path and no `wifi down` / `wifi up` cycle.
 
-# after the NSS core and qca-nss-drv are up
-sh scripts/arm-wifili-nss.sh
+Four files in `files/` do it, and the whole mechanism is load order plus
+parameters:
+
 ```
+etc/modules.d/29-ath11k-nss        ath11k nss_offload_mask=3 nss_refill_hold=3 frame_mode=2
+etc/modules.d/32-qca-nss-drv       qca-nss-drv
+etc/modules.d/33-nss-wifili-probe  nss_wifili_probe vdev_netdev0=phy0-ap0 vdev_netdev1=phy1-ap0 next_hop=158
+etc/init.d/nss-failsafe            START=05
+```
+
+kmodloader walks `/etc/modules.d` in name order, so:
+`ath11k` with its parameters (29) → `qca-nss-dp` (31) → `qca-nss-drv` (32) →
+the probe (33) → `ath11k_ahb`, which has no numeric prefix and therefore sorts
+last. That last one is what actually probes the hardware, so by the time
+ath11k's QMI worker reaches `ath11k_core_pdev_create()` the NSS core has been
+up for three seconds and the probe has already registered its hook. A measured
+boot:
+
+```
+21.33  NSS core 0 booted successfully
+21.57  WIFILIPROBE: auto-start armed; ath11k drives the handover
+24.74  nss: handing the data path of slot 1 over
+25.82  nss: slot 1 data path is NSS-owned
+26.89  nss: slot 0 data path is NSS-owned
+35.03  slot 0 netdev 'phy0-ap0' resolved (held)
+37.79  slot 1 netdev 'phy1-ap0' resolved (held)
+```
+
+`ath11k_nss_dp_ready()` will wait up to 90 s at that point if the probe is not
+loaded yet, so the ordering is a latency optimisation rather than a
+correctness requirement — but it is what keeps WiFi registration on time.
+
+`scripts/arm-wifili-nss.sh` is still there for a box that booted disarmed. It
+refuses to run if the probe is already loaded, which on a normal boot it is.
+
+### If a boot goes wrong
+
+`nss-failsafe` runs at START=05, before kmodloader, and arms
+`/etc/nss-wifi-pending`. `nss-offload` clears it once `eth0` has carrier. A
+boot that hangs, or that comes up with the LAN dead, never clears it — so the
+next boot finds it still armed, rewrites `29-ath11k-nss` to `ath11k
+frame_mode=2` and writes `/etc/nss-wifi-disabled`. One bad boot disarms the
+WiFi handover without needing anything to work.
+
+    rm /etc/nss-wifi-disabled && reboot        # re-arm
+
+It is deliberately a separate pair of flags from the ones `nss-offload` keeps
+for the ECM stack: the wired offload works and is not what changed, so a bad
+WiFi boot must not switch it off.
 
 ## Known limitations
 
-- A held radio cannot receive until NSS takes the ring over, so its boot-time AP
-  fails with `failed to vdev 0 create peer for AP: -110` and only comes up when
-  the arm script runs `wifi up`. A production form should either clear the hold
-  if NSS has not claimed the slot, or drain ath11k's buffers and flush the
-  hardware cache at handover instead. Re-announcing the ring over HTT does
-  **not** flush it — tested.
+- A radio whose handover *fails* is worse off than one that was never offloaded:
+  `nss_refill_hold` is a load-time parameter, so the ring stays empty even
+  after `ath11k_nss_dp_ready()` clears the slot from the offload mask, and the
+  radio cannot receive at all. It has not happened since the ordering above was
+  put in place — the NSS core is up 3 s before ath11k asks — but the failure
+  mode is real. The fix is for the failure path to refill the ring, not just
+  clear the hold; re-announcing it over HTT does **not** flush the hardware
+  cache, which was tested.
+- `next_hop` must be set when the module loads. Writing 158 to it at runtime
+  and recreating the vdevs crashed the board. Set at load time it is stable and
+  worth 27 % of the downlink — see below.
 - The two radios were tested one client at a time, not with a client on each
   simultaneously.
 - `auth_early=1` authorises the peer at create time instead of after the

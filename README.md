@@ -48,9 +48,9 @@ offload.
 
 ## Known limitations
 
-- WiFi offload is armed by a script after boot rather than by an init script,
-  and a held radio cannot receive until it runs. See
-  [docs/WIFILI.md](docs/WIFILI.md).
+- WiFi offload arms itself at boot now, but the handover still lives in an
+  out-of-tree module rather than in ath11k, and a radio whose handover fails
+  cannot receive at all. See [docs/WIFILI.md](docs/WIFILI.md).
 - **Memory is tight.** 256 MB board; ath11k's data-path rings are patched down
   from the upstream sizes or nothing fits alongside NSS.
 - Monitor-mode capture on the radios is effectively disabled by those ring sizes.
