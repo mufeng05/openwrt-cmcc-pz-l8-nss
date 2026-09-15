@@ -10,7 +10,8 @@
 #   4. rootfs overlay + config seed           -> files/, config/
 #
 # Idempotent: re-running on an already-prepared tree is a no-op for 1 and safe
-# for the rest.
+# for the rest, including .config - an existing one is kept, so a menuconfig
+# selection survives.  RESEED=1 goes back to the seed.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -68,9 +69,41 @@ find "$OW/files" -type f | sed "s|$OW/|  |"
 chmod +x "$OW"/files/etc/init.d/* 2>/dev/null || true
 
 # ---------------------------------------------------------------- 6. config
-say "Seeding .config"
-cp "$HERE/config/cmcc_pz-l8.config" "$OW/.config"
+# An existing .config is someone's menuconfig session and is left alone.
+# RESEED=1 throws it away and starts from the seed again.
+if [ -f "$OW/.config" ] && [ "${RESEED:-0}" != 1 ]; then
+    say "Keeping the existing .config  (RESEED=1 to replace it with the seed)"
+else
+    say "Seeding .config"
+    cp "$HERE/config/cmcc_pz-l8.config" "$OW/.config"
+fi
+
+# Always run this: it fills in defaults for anything new since the config was
+# written, which is the point of re-running setup.sh at all.
 ( cd "$OW" && make defconfig >/dev/null )
 grep -E '^CONFIG_TARGET_(BOARD|SUBTARGET|PROFILE)' "$OW/.config" || true
 
+# These are not packages, so nothing reminds you about them in menuconfig, and
+# make defconfig will not put them back if they get turned off.  The workflow
+# checks the same list.
+missing=0
+for sym in \
+    CONFIG_NSS_DRV_WIFIOFFLOAD_ENABLE \
+    CONFIG_NSS_FIRMWARE_VERSION_12_5 \
+    CONFIG_PACKAGE_kmod-qca-nss-drv \
+    CONFIG_PACKAGE_nss-firmware-ipq50xx
+do
+    grep -q "^${sym}=y" "$OW/.config" || { echo "  MISSING: $sym"; missing=1; }
+done
+if [ "$missing" != 0 ]; then
+    echo
+    echo "WARNING: the above are required by the NSS offload in this tree."
+    echo "         Without WIFIOFFLOAD, qca-nss-drv is built with no wifili and"
+    echo "         ath11k.ko fails to link.  Without the 12.5 firmware choice the"
+    echo "         build succeeds and the wifili peer-stats ABI is silently wrong."
+    echo "         Re-enable them in menuconfig, or run RESEED=1 $0 $OW"
+fi
+
 say "Ready.  Build with:  cd $OW && make -j\$(nproc)"
+echo "        Pick packages with:  cd $OW && make menuconfig"
+echo "        Keep your selection: cd $OW && ./scripts/diffconfig.sh > $HERE/config/cmcc_pz-l8.config"

@@ -75,6 +75,44 @@ cd openwrt && make -j$(nproc)
 
 `setup.sh` is idempotent and prints what it touches.
 
+### Choosing your own packages
+
+After `setup.sh`, the tree is an ordinary OpenWrt tree:
+
+```sh
+cd openwrt
+make menuconfig        # add LuCI apps, tools, whatever you want
+make -j$(nproc)
+```
+
+`setup.sh` seeds `.config` only when there is not one already, so re-running it
+to pick up new commits will not discard your selection. `RESEED=1
+pzl8-nss/scripts/setup.sh ./openwrt` goes back to the shipped config on
+purpose. Either way it finishes with `make defconfig`, so packages added
+upstream since your config was written get their defaults filled in.
+
+Four symbols must stay on, and menuconfig will not stop you turning them off
+because two of them are not packages. `setup.sh` checks them on every run and
+warns:
+
+| | |
+|---|---|
+| `CONFIG_NSS_DRV_WIFIOFFLOAD_ENABLE` | builds the wifili and wifi_vdev half of qca-nss-drv. Without it `ath11k.ko` does not link - ten undefined `nss_wifili_*` symbols at modpost |
+| `CONFIG_NSS_FIRMWARE_VERSION_12_5` | picks the firmware blob **and**, through qca-nss-drv's patch 0022, the wifili message ABI. Turning it off does not fail the build; it leaves the peer-stats array stride 16 bytes short of what the firmware sends |
+| `CONFIG_PACKAGE_kmod-qca-nss-drv` | the NSS driver itself |
+| `CONFIG_PACKAGE_nss-firmware-ipq50xx` | the blob |
+
+To keep a selection in the repo, write it back over the seed:
+
+```sh
+cd openwrt
+./scripts/diffconfig.sh > ../pzl8-nss/config/cmcc_pz-l8.config
+```
+
+The workflow re-checks the same four symbols after `defconfig`, so a seed that
+loses one fails in seconds with `MISS <symbol>` instead of forty minutes later
+in modpost.
+
 ## Flashing
 
 `sysupgrade -n` from a running OpenWrt, or the U-Boot web recovery at
