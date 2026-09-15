@@ -76,8 +76,10 @@ jobs:
           fetch-depth: 0
 
       - name: Prepare the tree
+        # No chmod here on purpose: git records setup.sh as 100755 and
+        # actions/checkout preserves it, so if this ever fails with Permission
+        # denied the repository has lost the bit and that is worth seeing.
         run: |
-          chmod +x pzl8-nss/scripts/setup.sh
           pzl8-nss/scripts/setup.sh "$GITHUB_WORKSPACE/openwrt"
 
       - name: Verify the expected packages are selected

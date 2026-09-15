@@ -1,14 +1,4 @@
 #!/bin/sh
 /etc/init.d/nss-offload enable
 /etc/init.d/nss-ecm enable
-
-# nss-failsafe was archived out of the image (scripts/archive/nss-failsafe).
-# Remove it here as well as from files/: an in-place sysupgrade keeps /etc, so
-# without this it survives, keeps arming /etc/nss-wifi-pending, and nothing
-# clears it any more - which is exactly the state that rewrites the ath11k
-# module line and turns the WiFi offload off on the next boot.
-/etc/init.d/nss-failsafe disable 2>/dev/null
-rm -f /etc/init.d/nss-failsafe /etc/rc.d/S05nss-failsafe \
-      /etc/nss-wifi-pending /etc/nss-wifi-disabled
-
 exit 0
