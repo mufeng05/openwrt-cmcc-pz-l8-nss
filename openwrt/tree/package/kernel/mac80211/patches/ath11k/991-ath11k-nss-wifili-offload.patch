@@ -2462,7 +2462,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +#endif /* ATH11K_NSS_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -0,0 +1,2163 @@
+@@ -0,0 +1,2235 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * NSS wifili offload for ath11k.  See nss.h for why this is here.
@@ -2493,6 +2493,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +#include "peer.h"
 +#include "dp_rx.h"
 +#include "hal_rx.h"
++#include "hal_desc.h"
 +#include "mac.h"
 +#include "ath11k_nss_export.h"
 +#include "nss.h"
@@ -2667,6 +2668,16 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + */
 +static struct ath11k_vif *ath11k_nss_vdev_owner[ATH11K_NSS_MAX_VDEVS];
 +
++/*
++ * The same slots, in terms that outlive the interface.  ath11k_nss_teardown()
++ * runs on paths where the arvifs have already been freed - a crash recovery
++ * that fails after ath11k_mac_destroy() is the vendor's own example - so it
++ * must not have to dereference one to find out whose it was or what its NSS
++ * interface number is.
++ */
++static struct ath11k_base *ath11k_nss_vdev_soc[ATH11K_NSS_MAX_VDEVS];
++static int ath11k_nss_vdev_ifnum[ATH11K_NSS_MAX_VDEVS];
++
 +static struct ath11k_vif *ath11k_nss_arvif_of_netdev(struct net_device *dev)
 +{
 +	unsigned int i;
@@ -2734,6 +2745,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	switch (msg->cm.type) {
 +	case 10:	/* NSS_WIFILI_STATS_MSG */
 +	case 12:	/* NSS_WIFILI_PEER_STATS_MSG */
++	case 20:	/* NSS_WIFILI_LINK_DESC_INFO_MSG */
 +	case 16:	/* NSS_WIFILI_WDS_ACTIVE_INFO_MSG */
 +	case 41:	/* NSS_WIFILI_PEER_4ADDR_EVENT_MSG */
 +	case 53:	/* NSS_WIFILI_ASTENTRY_SYNC_MSG */
@@ -2988,6 +3000,44 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	peer->nss.rxrate = rate;
 +}
 +
++/*
++ * NSS_WIFILI_LINK_DESC_INFO_MSG.
++ *
++ * NSS takes link descriptors out of the idle list to reassemble fragments and
++ * hands them back here for the host to return - it cannot reach the WBM idle
++ * ring itself.  Dropping the message, which is what classing it as an event
++ * did, takes those descriptors out of circulation for good.
++ *
++ * The descriptor set is ath11k's own: ath11k_dp_rx_link_desc_return() does the
++ * same thing from the host's error paths, and the same helper writes the
++ * release entry.
++ */
++static void ath11k_nss_link_desc_return(struct ath11k_base *ab,
++					const struct nss_wifili_soc_linkdesc_buf_info_msg *info)
++{
++	struct hal_wbm_release_ring src = {};
++	struct hal_srng *srng;
++	u32 *desc;
++
++	srng = &ab->hal.srng_list[ab->dp.wbm_desc_rel_ring.ring_id];
++
++	src.buf_addr_info.info0 = info->buffer_addr_low;
++	src.buf_addr_info.info1 = info->buffer_addr_high;
++
++	spin_lock_bh(&srng->lock);
++	ath11k_hal_srng_access_begin(ab, srng);
++
++	desc = ath11k_hal_srng_src_get_next_entry(ab, srng);
++	if (desc)
++		ath11k_hal_rx_msdu_link_desc_set(ab, desc, &src,
++						 HAL_WBM_REL_BM_ACT_PUT_IN_IDLE);
++	else
++		ath11k_warn(ab, "nss: no room to return a link descriptor\n");
++
++	ath11k_hal_srng_access_end(ab, srng);
++	spin_unlock_bh(&srng->lock);
++}
++
 +static void ath11k_nss_event_cb(void *app_data, struct nss_wifili_msg *msg)
 +{
 +	struct ath11k_base *ab;
@@ -2998,8 +3048,12 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	ab = ath11k_nss_ab_of_ifnum(msg->cm.interface);
 +
 +	if (ath11k_nss_msg_is_event(msg)) {
-+		if (ab && msg->cm.type == NSS_WIFILI_PEER_STATS_MSG)
++		if (!ab)
++			return;
++		if (msg->cm.type == NSS_WIFILI_PEER_STATS_MSG)
 +			ath11k_nss_peer_stats_rx(ab, &msg->msg.peer_stats.stats);
++		else if (msg->cm.type == NSS_WIFILI_LINK_DESC_INFO_MSG)
++			ath11k_nss_link_desc_return(ab, &msg->msg.linkdescinfomsg);
 +		return;
 +	}
 +
@@ -4290,6 +4344,8 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	 */
 +	for (slot = 0; slot < ATH11K_NSS_MAX_VDEVS; slot++) {
 +		if (!READ_ONCE(ath11k_nss_vdev_owner[slot])) {
++			WRITE_ONCE(ath11k_nss_vdev_ifnum[slot], ifnum);
++			WRITE_ONCE(ath11k_nss_vdev_soc[slot], ab);
 +			WRITE_ONCE(ath11k_nss_vdev_owner[slot], arvif);
 +			break;
 +		}
@@ -4420,8 +4476,10 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +					   NSS_DYNAMIC_INTERFACE_TYPE_VAP);
 +
 +	for (slot = 0; slot < ATH11K_NSS_MAX_VDEVS; slot++)
-+		if (READ_ONCE(ath11k_nss_vdev_owner[slot]) == arvif)
++		if (READ_ONCE(ath11k_nss_vdev_owner[slot]) == arvif) {
 +			WRITE_ONCE(ath11k_nss_vdev_owner[slot], NULL);
++			WRITE_ONCE(ath11k_nss_vdev_soc[slot], NULL);
++		}
 +
 +	arvif->nss.ndev = NULL;
 +}
@@ -4597,12 +4655,26 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	if (!nss->ctx)
 +		return;
 +
-+	/* every interface this SoC still has, not just the one it used to */
++	/*
++	 * Every interface this SoC still has registered.  In the ordinary
++	 * order mac80211 has already removed them and this loop finds
++	 * nothing; it is here for the paths where it has not, and on those
++	 * the arvif may be freed - hence the SoC and the interface number
++	 * from the registry rather than from the interface.  Unregistering
++	 * is all that is needed: the SOC_RESET below is what clears NSS's
++	 * own state.
++	 */
 +	for (slot = 0; slot < ATH11K_NSS_MAX_VDEVS; slot++) {
-+		struct ath11k_vif *arvif = READ_ONCE(ath11k_nss_vdev_owner[slot]);
++		if (READ_ONCE(ath11k_nss_vdev_soc[slot]) != ab)
++			continue;
 +
-+		if (arvif && arvif->ar->ab == ab)
-+			ath11k_nss_vdev_delete(arvif);
++		nss_unregister_wifi_vdev_if(READ_ONCE(ath11k_nss_vdev_ifnum[slot]));
++		nss_dynamic_interface_dealloc_node(
++			READ_ONCE(ath11k_nss_vdev_ifnum[slot]),
++			NSS_DYNAMIC_INTERFACE_TYPE_VAP);
++
++		WRITE_ONCE(ath11k_nss_vdev_owner[slot], NULL);
++		WRITE_ONCE(ath11k_nss_vdev_soc[slot], NULL);
 +	}
 +
 +	if (nss->enabled) {
