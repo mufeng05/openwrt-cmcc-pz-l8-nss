@@ -508,6 +508,131 @@ Wi-Fi is out of reach either way: the script's own header notes that Wi-Fi
 vdevs are not valid IGS sources, so wireless upload rides the egress
 `nssfq_codel`.
 
+## Which NSS firmware
+
+The package offers 11.4, 12.2-156 and 12.5-210, and its help used to say 12.2
+was the only line that accepted VAP allocation on IPQ5018. That is not true:
+12.5 allocates VAPs here, brings all three vdevs up, and is measurably faster.
+
+**The blob and the driver ABI move together.** `qca-nss-drv`'s patch 0022 puts
+four `uint32_t` behind `NSS_FIRMWARE_VERSION_12_5` - `ucast_rcv_cnt` and
+`ucast_rcv_bytes` in `nss_wifili_rx_ctrl_stats`, `tx_mpdu_retry_count` and
+`tx_mpdu_total_retry_count` in `nss_wifili_retry_ctrl_stats`. Both structs are
+members of `nss_wifili_peer_ctrl_stats`, and the peer-stats message carries
+that as an array, so the define is worth 16 bytes of *array stride*. Run 12.5
+firmware against a driver built without it and the first peer reads correctly
+while every peer after it is read at the wrong offset - silently, which is the
+worst way for it to be wrong. The Makefile used to have the define commented
+out with a note that the blob was pinned to 12.2; it now follows the config
+symbol, so choosing the firmware chooses the ABI.
+
+Measured with one Intel AX201 on 5 GHz at -57 dBm, four parallel TCP streams
+of 20 s, routed LAN-to-WAN through the box. Two full A/B cycles, same client,
+same position, same driver code - only the firmware and its ABI differ:
+
+| | rounds | median | range |
+|---|---|---|---|
+| 12.2-156 | 8 | 253 Mbit/s | 237 - 312 |
+| 12.5-210 | 8 | 417 Mbit/s | 348 - 526 |
+
+12.5's worst round beats 12.2's best. It is not an RF artefact either, and the
+link rates say so backwards: during the 12.2 runs the station negotiated
+HE-MCS 8 at 864.8 Mbit/s, during the 12.5 runs HE-MCS 6 at 648.5 - 12.5 moved
+*more* TCP over a *slower* PHY.
+
+One thing 12.5 does not change: the sojourn-stats message is still refused.
+Only the error code moves, 99 on 12.2 and 100 on 12.5.
+
+The wired path cannot tell the two apart, because it is not the bottleneck:
+1 GiB LAN-to-WAN lands at 899 Mbit/s on a 1 Gbit/s client NIC for 70 jiffies
+of CPU - 1.7 % across both cores - on either firmware.
+
+## Patches that were weighed and not taken
+
+### The performance set
+
+`999-800` (threaded NAPI), `237-003` (cacheable dst ring descriptors),
+`237-006` (fast rx bypassing stats), `244` (dp-tx-perf), `335-0001/0002/0003`
+(tx completions, bitmap idr, TID overwrite) and `999-336-0001/0002` (idr).
+
+All of them optimise ath11k's own data path, and on this board that path does
+not run. `/proc/interrupts` after several gigabytes of offloaded Wi-Fi:
+
+```
+wbm2host-tx-completions-ring1          0          0
+wbm2host-tx-completions-ring2          0          0
+wbm2host-tx-completions-ring3          0          0
+wbm2host-rx-release                    0          0
+reo2host-destination-ring1             0          0
+reo2ost-exception                      0          0
+reo2host-status                        0          0
+ce2                                17638          0
+nss_queue0                        270259          0
+```
+
+Every ring those patches touch has never fired. The REO destination ring and
+the WBM completion rings belong to NSS - the driver hands them over at
+PDEV_INIT and `ath11k_nss_dp_reo_to_ring0()` points every hash bucket at the
+one NSS reaps. What is left on the host is the copy engines, which carry WMI
+and HTT control, and those are what `ce2` counts.
+
+That makes the measurement conclusive rather than suggestive: this is not
+"probably a small gain", it is a gain on code with zero executions. The single
+partial exception is `999-800`, whose threaded NAPI also covers the CE poll -
+17638 interrupts since boot against 270259 on the NSS queue, and CE work is a
+few WMI commands.
+
+### The feature set
+
+| | verdict |
+|---|---|
+| mesh, `300` (3365 lines) | **excluded by the firmware.** 802.11s needs 11.4; every line after it refuses mesh interface allocation, so it cannot coexist with the 12.5 choice above. |
+| WDS / 4-address, `211-001/002` (1661 lines) | no scenario here - no repeater, no wireless bridge, no 4-address STA. |
+| AP_VLAN + dynamic VLAN, `235-*` `236-*` (2516 lines) | the real candidate, and it needs two more mac80211 patches. The guest SSID is served by AP isolation today, which is a weaker thing than a VLAN but is the thing that was needed. |
+| dynamic MU-EDCA, `203` (422 lines) | needs a mac80211 patch; pays off with many simultaneous HE clients, which is not this board's test load. |
+| HE and UL-OFDMA peer stats, `069` `084` `087` `108` (1359 lines) | the cheapest of the set to adopt, because the plumbing is already here: these read the PPDU TLVs, and `ath11k_nss_ext_rx_stats()` already subscribes to `PPDU_START` and `PPDU_END_USER_STATS` for the receive rate. Pure diagnostics though - they add per-station HE histograms, not throughput. |
+
+`999-957` (hybrid-bus BAR) needs nothing: `qmi.c` already takes `mem_pa` from
+`resp.bar_addr` and `ath11k_nss_reg_phys()` already does the QCN6122 window
+translation, with constants measured on this board rather than computed.
+
+### The thread scheme
+
+`nss_wifili_thread_scheme_db_init()` builds four entries - index 0 high,
+index 1 low, indices 2 and 3 high - and the allocator returns the first free
+entry whose priority matches what the radio asked for. This driver asked low
+for both radios, so the first to attach took the single low entry and the
+second fell through to `nss_wifili_thread_scheme_alloc()`'s no-match path,
+whose own comment says it exists to prevent catastrophic failure during
+attach. It worked, and on this board it even landed the right way round, but
+only because 2.4 GHz attaches first.
+
+Each radio now asks for what it should have - 5 GHz high, 2.4 GHz low, which
+is the arrangement the vendor's per-radio ini produces on a 2+5 board - so
+both take matching entries and attach order stops mattering. It is a
+correctness change, not a throughput one.
+
+## The 2.4 GHz radio
+
+Two things were wrong with it, and only one could be fixed.
+
+It was on channel 1 with **14 overlapping BSSes**; channel 11's 40 MHz block
+has 4. That is a straightforward move and it is now channel 11.
+
+It is configured `HE40` and operates at 20 MHz anyway, because hostapd's
+20/40 coexistence scan refuses 40 MHz wherever there is an overlapping BSS,
+and on this site there is one in every block:
+
+```
+20/40 MHz operation not permitted on channel pri=11 sec=7 based on overlapping BSSes
+```
+
+`HE40` is left configured because it costs only the two-second `HT_SCAN` at
+startup and takes 40 MHz if the band ever clears. Forcing it needs
+`option noscan '1'` on the wifi-device, which overrides a coexistence rule
+that exists for the neighbours' benefit - left as a deliberate choice rather
+than a default.
+
 ## Known limitations
 
 - **`tx failed` reads zero.** `tx retries` is real - 24566 over a run - but it

@@ -2462,7 +2462,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +#endif /* ATH11K_NSS_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -0,0 +1,2235 @@
+@@ -0,0 +1,2257 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * NSS wifili offload for ath11k.  See nss.h for why this is here.
@@ -3271,6 +3271,26 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +}
 +
 +/*
++ * Which worker-thread scheme priority this SoC's radio should ask for.
++ *
++ * One ath11k_base is one radio on this board - 2.4 GHz on the IPQ5018 and
++ * 5 GHz on the QCN6122 - so the band of the pdev decides it.  The scheme
++ * database has exactly one low entry, so two radios asking low cannot both be
++ * satisfied and the second one takes the fallback.
++ */
++static enum nss_wifili_thread_scheme_priority
++ath11k_nss_radio_priority(struct ath11k_base *ab)
++{
++	int i;
++
++	for (i = 0; i < ab->num_radios; i++)
++		if (ab->pdevs[i].cap.supported_bands & WMI_HOST_WLAN_5G_CAP)
++			return NSS_WIFILI_HIGH_PRIORITY_SCHEME;
++
++	return NSS_WIFILI_LOW_PRIORITY_SCHEME;
++}
++
++/*
 + * The vendor does this before every PDEV_INIT: allocate a dynamic interface of
 + * the wifili radio type, register it, then ask for a thread scheme against it.
 + * scheme_id is the only part that reaches the firmware, but the firmware
@@ -3279,6 +3299,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 + */
 +static int ath11k_nss_radio_if_alloc(struct ath11k_base *ab)
 +{
++	enum nss_wifili_thread_scheme_priority prio;
 +	struct ath11k_nss_soc *nss = &ab->nss;
 +	struct nss_ctx_instance *rctx;
 +	int ifnum;
@@ -3306,11 +3327,12 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	}
 +
 +	nss->radio_if_num = ifnum;
-+	nss->scheme_id = nss_wifili_thread_scheme_alloc(nss->ctx, ifnum,
-+						NSS_WIFILI_LOW_PRIORITY_SCHEME);
++	prio = ath11k_nss_radio_priority(ab);
++	nss->scheme_id = nss_wifili_thread_scheme_alloc(nss->ctx, ifnum, prio);
 +
-+	ath11k_dbg(ab, ATH11K_DBG_BOOT, "nss: radio if=%d scheme_id=%u\n",
-+		   ifnum, nss->scheme_id);
++	ath11k_info(ab, "nss: radio if=%d scheme_id=%u priority=%s\n",
++		    ifnum, nss->scheme_id,
++		    prio == NSS_WIFILI_HIGH_PRIORITY_SCHEME ? "high" : "low");
 +	return 0;
 +}
 +

@@ -155,9 +155,13 @@ else ifdef CONFIG_NSS_MEM_PROFILE_LOW
 endif
 
 ifdef CONFIG_NSS_FIRMWARE_VERSION_12_5
-  # DEBUG E21: blob wymuszony na 12.2-156 (nss-firmware/Makefile), wiec
-  # NIE definiujemy ABI 12.5 - latka 0022 przelacza layout na 12.2.
-  # EXTRA_CFLAGS += -DNSS_FIRMWARE_VERSION_12_5
+  # Patch 0022 hides four u32s behind this define, two in
+  # nss_wifili_rx_ctrl_stats and two in nss_wifili_retry_ctrl_stats.  Both are
+  # members of nss_wifili_peer_ctrl_stats, which the peer-stats message carries
+  # as an array, so the define is worth 16 bytes of array stride.  Leaving it
+  # out while running 12.5 firmware reads every peer after the first at the
+  # wrong offset - quietly, because the first peer still looks right.
+  EXTRA_CFLAGS += -DNSS_FIRMWARE_VERSION_12_5
 endif
 
 ifdef CONFIG_NSS_FIRMWARE_VERSION_11_4

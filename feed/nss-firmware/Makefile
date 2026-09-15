@@ -77,16 +77,19 @@ define Package/nss-firmware/config
     config NSS_FIRMWARE_VERSION_12_5
           bool "NSS Firmware 12.5 Release 210"
           help
-               The firmware line the qca-nss-drv source in this tree
-               is pinned against. Does NOT work with NSS MESH
+               The line the qca-nss-drv source is written against, so
+               selecting it also selects the 12.5 wifili ABI - the two
+               must match. Verified on IPQ5018: VAPs allocate and all
+               three vdevs come up. Does NOT work with NSS MESH
                (802.11s).
 
     config NSS_FIRMWARE_VERSION_12_2
           bool "NSS Firmware 12.2 Release 156"
           help
-               The newest firmware published for IPQ5018 (2025-05-01,
-               nine months after 12.5) and the only line that accepts
-               VAP allocation there. Use this one on ipq50xx.
+               The most recently published blob for IPQ5018 (2025-05-01
+               against 12.5's 2024-07-23), built with the 12.2 wifili
+               ABI. It was long the only tested choice here; 12.5 has
+               since been shown to work too.
 
     config NSS_FIRMWARE_VERSION_11_4
           bool "NSS Firmware 11.4.0.5 Release 6"
