@@ -900,6 +900,50 @@ difference is run-to-run spread - the same configuration spans 264 to 525
 Mbit/s across a session. The memory-saving pairing is not slower, so it is the
 one shipped.
 
+### What the vendor image does about this, which is almost nothing
+
+Worth checking rather than assuming, since the comparison that prompted the
+work was "the vendor leaves more free". Its rootfs is extracted in `refs/nwrt`.
+
+It does not tune memory down. `ini/global.ini` has `low_mem_system=0`,
+`max_descs=0`, `max_peers=0`, `max_vdevs=0` - every override at the default.
+`ini/QCA5018.ini` and `ini/QCN6122.ini` are two-line stubs with no settings in
+them at all. `/etc/init.d/sysctl` is the same stock OpenWrt script with the
+same flat `min_free_kbytes=16384`. The reserved-memory layout is the one this
+tree already matches, because `0819` was written from it.
+
+What it does do, on the `MP_256` device-tree marker, is four things:
+
+| | |
+|---|---|
+| `dp_nss_comp_ring_size 0x2000` for QCA5018 and QCN6122 | 8192, which is what `DP_TX_COMP_RING_SIZE` already is here after `990`. It is the only ring size the 256 MB profile changes. |
+| forces NSS offload, and refuses host mode | `"HOST mode not supported in low memory profile"`, printed to the console and the bring-up aborted |
+| disables the skb recycler | `max_skbs=512`, `skb_recycler_enable=0`. Not a feature this build has, so there is nothing to disable and nothing being paid |
+| disables coldboot calibration | already off for IPQ5018 here, via `907` |
+
+So the configuration is not where the difference is. The third row is, and it
+says so out loud: on a 256 MB board the closed driver will not run its own
+datapath, only NSS's. ath11k allocates its host datapath either way, because
+the offload was added to a driver designed to own one - which is visible from
+the other end in this tree as well, where every host REO and WBM ring reads
+zero interrupts and is nonetheless allocated and sized.
+
+Measured here, with page cache held constant across the unload so the figure
+is clean: ath11k is 46.2 MB, and only 6.6 MB of that is slab. Of the rest,
+5.6 MB is the QMI target memory that shows up as reserved in `/proc/iomem`.
+
+One number in their internal ini is lower than anything reachable from here:
+`dp_max_peer_id=64`, against the 128 that `qcom,ath11k-fw-memory-mode = <1>`
+asks the firmware for. The DT property only offers 512, 128 and 128, so 64
+would need a patch, and the saving lands in the QMI chunks - which are 5.6 MB
+in total, so it is worth single-digit megabytes at most.
+
+What is not knowable from here is the closed driver's own footprint, because
+that image cannot be booted on this board to measure it. What is knowable is
+that its *configuration* is not the explanation, and that after the two
+changes above this build reports 40 MB of MemAvailable, which is at or above
+the figure the vendor image was reported to show.
+
 ### Together
 
 MemFree and MemAvailable both move with page cache, so single readings are
