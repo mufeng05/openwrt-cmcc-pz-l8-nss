@@ -95,7 +95,7 @@ release does not. Pull requests build but do not publish, and a manual
 
 ```sh
 git clone https://github.com/openwrt/openwrt -b v25.12.5
-git clone <this repo> pzl8-nss
+git clone https://github.com/mufeng05/openwrt-cmcc-pz-l8-nss pzl8-nss
 pzl8-nss/scripts/setup.sh ./openwrt
 cd openwrt && make -j$(nproc)
 ```
@@ -191,7 +191,19 @@ scripts/setup.sh applies all of the above to a clean checkout
 
 ## Credits
 
-QSDK sources are Qualcomm's. Packaging skeletons and many kernel-6.x fixes
-derive from the community NSS feeds by Julius Bairaktaris and Stanislaw Pal
-(kuncy7), both GPL. The ath11k ring-size reduction follows the approach of
-openwrt/openwrt PR #21495, which was not merged.
+QSDK sources are Qualcomm's, from
+<https://git.codelinaro.org/clo/qsdk>.
+
+Packaging skeletons and many kernel-6.x fixes derive from community NSS feeds,
+all GPL:
+
+- Stanislaw Pal (kuncy7) — <https://github.com/kuncy7/nss-packages>
+- Sean K (qosmio), who repackages the NSS firmware blobs —
+  <https://github.com/qosmio/qca-sdk-nss-fw>
+- Julius Bairaktaris, whose Signed-off-by is on the iproute2 NSS qdisc and
+  nssmirred patches and several of the qualcommax kernel patches carried in
+  `openwrt/tree/`. Nothing in this tree records an upstream URL for them, so
+  none is guessed at here.
+
+The ath11k ring-size reduction follows the approach of
+<https://github.com/openwrt/openwrt/pull/21495>, which was not merged.

@@ -84,7 +84,7 @@ artifact 附在构建上，但 artifact 会过期，release 不会。Pull reques
 
 ```sh
 git clone https://github.com/openwrt/openwrt -b v25.12.5
-git clone <本仓库> pzl8-nss
+git clone https://github.com/mufeng05/openwrt-cmcc-pz-l8-nss pzl8-nss
 pzl8-nss/scripts/setup.sh ./openwrt
 cd openwrt && make -j$(nproc)
 ```
@@ -174,6 +174,17 @@ scripts/setup.sh 把以上全部应用到一棵干净的源码树
 
 ## 致谢
 
-QSDK 源码属于高通。打包骨架和大量 kernel 6.x 修复来自 Julius Bairaktaris 和
-Stanislaw Pal（kuncy7）的社区 NSS feed，均为 GPL。ath11k 缩环的做法参考了
-openwrt/openwrt PR #21495，该 PR 未被合并。
+QSDK 源码属于高通，来自
+<https://git.codelinaro.org/clo/qsdk>。
+
+打包骨架和大量 kernel 6.x 修复来自社区 NSS feed，均为 GPL：
+
+- Stanislaw Pal（kuncy7）—— <https://github.com/kuncy7/nss-packages>
+- Sean K（qosmio），NSS 固件 blob 的重新打包者 ——
+  <https://github.com/qosmio/qca-sdk-nss-fw>
+- Julius Bairaktaris，`openwrt/tree/` 里的 iproute2 NSS qdisc、nssmirred
+  补丁以及多个 qualcommax 内核补丁都带着他的 Signed-off-by。本仓库里没有
+  记录它们的上游地址，所以这里不猬一个。
+
+ath11k 缩环的做法参考了
+<https://github.com/openwrt/openwrt/pull/21495>，该 PR 未被合并。
