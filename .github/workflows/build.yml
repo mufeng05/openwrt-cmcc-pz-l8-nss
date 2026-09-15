@@ -77,7 +77,9 @@ jobs:
             CONFIG_PACKAGE_kmod-qca-mcs \
             CONFIG_PACKAGE_kmod-qca-nss-dp \
             CONFIG_PACKAGE_kmod-qca-ssdk \
-            CONFIG_PACKAGE_nss-firmware-ipq50xx
+            CONFIG_PACKAGE_nss-firmware-ipq50xx \
+            CONFIG_NSS_DRV_WIFIOFFLOAD_ENABLE \
+            CONFIG_NSS_FIRMWARE_VERSION_12_5
           do
             if grep -q "^${sym}=y" .config; then
               echo "  ok   $sym"
