@@ -1397,6 +1397,54 @@ per-station counters. Its `tx bitrate` line does track the real rate (the
 firmware reports completions back), but the packet and retry counts are not
 usable. `htt_stats` is the instrument for anything on the transmit side.
 
+### 40 MHz on 2.4 GHz, the one lever that moves it
+
+Everything in the previous section says the MCS index is the medium's answer,
+not a setting. The remaining lever is not the index but the width.
+
+Both references ask for HT40 in their config and both run at 20 MHz, because
+802.11 coexistence makes an AP fall back when it sees overlapping BSSs, and
+this location has 25 of them. `noscan=1` skips that scan:
+
+```sh
+uci set wireless.radio0.htmode='HE40'
+uci set wireless.radio0.noscan='1'
+```
+
+| 2.4 GHz, four parallel streams | width | median | rounds |
+|---|---|---|---|
+| this build | 20 MHz, ch11 | 75.0 | 75.2 / 75.0 / 74.4 |
+| this build | 20 MHz, ch6 | 74.9 | 74.5 / 74.9 / 79.4 |
+| **this build** | **40 MHz, ch6** | **112.5** | 107 / 125.6 / 112.5 / 116.4 / 115.6 / 107.3 / 104.5 |
+| v1.6 | 20 MHz, ch11 | 98.8 | |
+| nwrt | 20 MHz, ch6 | 119.4 | |
+
+**+50 % over this build's own 20 MHz, +14 % over v1.6, and 6 % short of nwrt.**
+
+The MCS index did not improve - it got slightly worse, which is what the loss
+rate predicts:
+
+| | 20 MHz | 40 MHz |
+|---|---|---|
+| `mpdus_ack_failed` / `mpdu_count_tqm` | 13.5 % | **16.5 %** |
+| `mpdu_requeued` | 22 % | 24 % |
+| dominant `tx_mcs` | 7 | 6 |
+
+So the gain is bandwidth, bought at a slightly higher collision rate, and it
+nets out clearly positive here. `tx_bw` confirms 25,623 of 28,592 PPDUs went
+out at 40 MHz.
+
+**Why this is not turned on by default.** `noscan=1` is the setting that tells
+the AP to ignore the coexistence scan - it holds 40 MHz in a band where 25
+other networks are asking it not to, and the airtime it gains comes from them.
+On a test bench that is a fair experiment. On a deployed router it is a
+decision about other people's networks, and this image should not make it for
+its user.
+
+It also does not close the comparison honestly: the references were measured at
+20 MHz because they obeyed the rule this setting breaks. Whether they would
+gain the same 50 % with `noscan` was not tested.
+
 ### Where high_water ended up
 
 Restored to the vendor's **16336**, matching both reference images, in

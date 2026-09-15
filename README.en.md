@@ -43,7 +43,8 @@ table instead of into the empty cells above:
 | wired LAN → WAN | 912.1 | 901.8 | **912.6** |
 | 5 GHz at 80 MHz | - | - | 462 |
 | **5 GHz at 160 MHz** | **730** | **722** | **697** |
-| 2.4 GHz LAN → WAN | 98.8 | **119.4** | 75.0 |
+| 2.4 GHz at 20 MHz | 98.8 | **119.4** | 75.0 |
+| 2.4 GHz at 40 MHz | - | - | **112.5** |
 | host CPU during 5 GHz | not measurable, see below | 16.1 % at 537 | **2.9 % at 441** |
 
 **At matched width this build lands within 3.5-4.6 % of both references.** The
