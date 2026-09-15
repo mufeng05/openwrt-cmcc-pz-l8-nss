@@ -1,0 +1,34 @@
+From: QSDK 13.1.5.R2, oss/system/feeds/wlan-open
+Origin: 0092-ath11k-avoid-stack-corrupt-in-nwifi-undecap.patch
+
+DP_MAX_NWIFI_HDR_LEN is 30, and ath11k_dp_rx_h_undecap_nwifi() copies
+the 802.11 header into a stack array of that size.  A four-address QoS header
+is 36 bytes: 2 frame control, 2 duration, three addresses, 2 sequence, a
+fourth address and 2 QoS control.  One line, and it is a stack overflow.
+
+Taken unmodified from Qualcomm's open-source ath11k patch set at
+win.wlan_host_opensource.4.0.r35.
+
+From fdda5eaa59b9503aec403eb365a16725885c008e Sat Jun 26 11:34:09 2021 +0530
+From: Karthikeyan Periyasamy <periyasa@codeaurora.org
+Date: Sat Jun 26 11:34:09 2021 +0530
+Subject: ath11k: avoid stack corruption in ath11k_dp_rx_h_undecap_nwifi
+
+In ath11k_dp_rx_h_undecap_nwifi(), local array decap_hdr get copied
+beyond the array size 30 when QoS data recieved in 4adrr format.
+In 4addr format the max header length is 36. So increase the array
+size as 36 to avoid local array overflow
+
+Change-Id: I5941738b21ae235f5feec0b650a40300b14e1041
+Signed-off-by: Karthikeyan Periyasamy <periyasa@codeaurora.org>
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.h
+@@ -9,7 +9,7 @@
+ #include "rx_desc.h"
+ #include "debug.h"
+ 
+-#define DP_MAX_NWIFI_HDR_LEN	30
++#define DP_MAX_NWIFI_HDR_LEN	36
+ 
+ #define DP_RX_MPDU_ERR_FCS			BIT(0)
+ #define DP_RX_MPDU_ERR_DECRYPT			BIT(1)

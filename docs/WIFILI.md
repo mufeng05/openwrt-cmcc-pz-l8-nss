@@ -693,6 +693,94 @@ Two radios always match an entry today, so this is a guard rather than a fix.
 difference - theirs still pairs `spin_lock_bh` with a plain `spin_unlock`, at
 r35, which is the bug their own `999-934` exists to fix.
 
+### Going through all 254
+
+Reading 254 patches is not the way to do this. Applying them is: for each one,
+`patch --dry-run` against the fully-patched ath11k here, forwards and in
+reverse. Reverse succeeds means the change is already present; forwards
+succeeds means it is absent and would apply as-is; neither means the context
+has moved.
+
+```
+applied     3
+clean      68
+conflict  183
+```
+
+Only three reverse-apply, which says less than it looks like: their base is
+backports 6.6.15 and this is 6.18.26, so context has drifted almost
+everywhere, and the conflict bucket mixes "already upstream" with "would need
+porting" beyond what the tool can separate. The 68 that apply cleanly are the
+actionable set, because for those the surrounding code still matches and the
+change is demonstrably absent.
+
+Two rules decided the rest:
+
+- **Correctness fixes are worth taking even where the path is dead under
+  offload.** `nss_offload_mask=0` is a supported fallback here and the host
+  datapath runs in it.
+- **Performance patches for those same paths are not**, on the measurement
+  already recorded: every REO and WBM host ring reads zero interrupts.
+
+#### Taken
+
+| ours | QSDK | |
+|---|---|---|
+| `992-ath11k-take-peer-keys-under-base_lock` | `0009` | `ath11k_clear_peer_keys()` drops `base_lock` and then walks `peer->keys[]`, which a softirq may be freeing. This one is not a dead path - it runs on every WPA2 peer removal. |
+| `993-ath11k-nwifi-header-length-is-36` | `0092` | `DP_MAX_NWIFI_HDR_LEN` is 30; a four-address QoS header is 36, and it is copied onto the stack. One line. |
+| `994-ath11k-rx-coalesce-reads-freed-skb` | `0199` | `ath11k_dp_rx_msdu_coalesce()` reads `rxcb->is_continuation` after freeing the skb the rxcb lives in. |
+| `995-ath11k-reg-tolerates-a-radioless-pdev` | `0212` | `ath11k_reg_get_ar_vdev_type()` dereferences `ar` unchecked, and during a regulatory channel update the pdevs may not be allocated. |
+
+#### Five that apply cleanly and would break the build
+
+Worth naming, because it is the trap in the method above. `patch` checks
+context, not semantics:
+
+| | |
+|---|---|
+| `0003-UPSTREAM-PROTOCOL` | adds a `radio_id` argument to `get_antenna`/`set_antenna`; this mac80211 does not pass one |
+| `0118` | fixes `ar->ops` being NULL - there is no `ar->ops` here, it is a QSDK construct |
+| `0135-002` | re-adds `WMI_TLV_SERVICE_MBSS_PARAM_IN_VDEV_START_SUPPORT = 253`, which the tree already has on the next line |
+| `0180` | sets `IEEE80211_HW_HAS_TX_QUEUE`, which this mac80211 does not define |
+| `0202` | references `ab->stats_disable`, which does not exist here |
+
+Everything taken was compile-tested rather than trusted.
+
+#### Rejected with a reason worth keeping
+
+- **`0148`, drop `NETIF_F_HW_CSUM`.** The rationale in the commit is SFE, which
+  does not run here. Locally-generated traffic over Wi-Fi works - the client
+  gets its address by DHCP over the air - so checksums are being produced.
+  Removing the advertisement would move that work to the CPU.
+- **`0136`, revert "clear the keys properly when DISABLE_KEY".** A workaround
+  for a firmware assert, which also drops a NULL guard around a `memcpy`.
+  Sixteen associate/disassociate cycles on WPA2 produced no assert, so this
+  trades an upstream correctness fix for protection against something this
+  firmware does not do.
+- **`0003`, VHT on 2.4 GHz.** Real, and it would give 256-QAM to clients that
+  do VHT but not HE. The radio already runs HE20 there, VHT on 2.4 GHz is a
+  vendor extension rather than something the spec asks for, and 2.4 GHz is the
+  secondary band on this board. Available if wanted; not taken by default.
+- **`0176`, flush management frames before waiting.** Fixes a "failed to flush
+  mgmt transmit queue" warning that does not appear here across a day of
+  `wifi reload`.
+
+The rest are 6 GHz, monitor mode, spectral, CFR, QDSS, btcoex, TKIP, dynamic
+VLAN, 160 MHz and other-SoC work that this board either does not have or does
+not enable.
+
+### One cost worth naming
+
+`rxdma2host-destination-ring-mac1` fires about 107 times a second with one
+station associated and nothing happening, and had taken 350,299 interrupts by
+the time it was first looked at - while every RXDMA error counter and
+`err ring pkts` read zero. That is the PPDU TLV subscription
+`ath11k_nss_ext_rx_stats()` turns on for the receive rate, picking up every
+PPDU on the channel including the neighbours'. It is the price of the rx
+bitrate in `iw station dump`, it is being paid continuously, and host CPU
+still measures 1.7 % forwarding at line rate - but it is a cost this driver
+chose, not one it inherited.
+
 ### What it did not apply
 
 `0085-ath11k-poll-reo-status-ipq5018` looked like the find of the day. Its
