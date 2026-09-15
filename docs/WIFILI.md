@@ -818,7 +818,7 @@ smaller - both came from defaults that were sized for a different machine.
 
 | | | |
 |---|---|---|
-| `wcss@4b000000` | 49 MB | the Q6 firmware for both radios. **Not reducible**: `0819` widened it from 27 MB on purpose, because ath11k hands the firmware raw physical addresses (`qcom,bdf-addr`, `qcom,m3-dump-addr`) that fall outside the narrower span and both radios then fail BDF download with -12. The span matches what the vendor firmware reserves for this board. |
+| `wcss@4b000000` | 48 MB | the Q6 firmware for both radios. **Not reducible**: `0819` widened it from 27 MB on purpose, because ath11k hands the firmware raw physical addresses (`qcom,bdf-addr`, `qcom,m3-dump-addr`) that fall outside the narrower span and both radios then fail BDF download with -12. The span matches what the vendor firmware reserves for this board. |
 | `memory@40000000` | 8 MB | the NSS core's own DDR; `0818` already trimmed this to what the vendor uses |
 | tz, tz_apps, bootloader, smem | 9 MB | |
 | kernel image and dynamic | ~20 MB | |

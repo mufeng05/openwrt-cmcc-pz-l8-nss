@@ -31,6 +31,11 @@ jobs:
   build:
     runs-on: ubuntu-24.04
 
+    # Only the release step needs this, and without it GITHUB_TOKEN is
+    # read-only by default and action-gh-release fails with 403.
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout this project
         uses: actions/checkout@v4
@@ -122,6 +127,34 @@ jobs:
         if: success()
         run: ls -lh "$FIRMWARE" && cat openwrt/bin/targets/qualcommax/ipq50xx/*.manifest | head -40
 
+      - name: Write the release notes
+        if: success()
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          IPQ=openwrt/bin/targets/qualcommax/ipq50xx
+          {
+            echo "OpenWrt \`$OPENWRT_REF\` with Qualcomm NSS offload for the CMCC PZ-L8."
+            echo
+            echo "| file | use |"
+            echo "|---|---|"
+            echo "| \`*-squashfs-sysupgrade.bin\` | upgrading a router that already runs OpenWrt - \`sysupgrade -n\` |"
+            echo "| \`*-squashfs-factory.ubi\` | writing from U-Boot / first install |"
+            echo "| \`*-initramfs-uImage.itb\` | boots from RAM without touching flash, for recovery |"
+            echo
+            echo "Default LAN address is **192.168.10.1**. Flashing, including the"
+            echo "U-Boot web recovery at 192.168.10.10, is in [docs/RECOVERY.md](docs/RECOVERY.md)."
+            echo
+            echo '```'
+            cat build-info.txt
+            echo '```'
+            echo
+            echo "sha256:"
+            echo '```'
+            grep -E 'sysupgrade\.bin|factory\.ubi|initramfs-uImage\.itb' $IPQ/sha256sums || cat $IPQ/sha256sums
+            echo '```'
+          } > release-notes.md
+          cat release-notes.md
+
       - name: Upload images
         if: success()
         uses: actions/upload-artifact@v4
@@ -135,18 +168,28 @@ jobs:
             build-info.txt
           if-no-files-found: error
 
+      # Every green build of main gets a release, because run artifacts expire
+      # and need a login to fetch.  Pull requests do not, and a manual run can
+      # opt out by unticking make_release.
       - name: Publish release
-        if: success() && github.event_name == 'workflow_dispatch' && github.event.inputs.make_release == 'true'
+        if: >-
+          success() && github.ref == 'refs/heads/main' &&
+          (github.event_name == 'push' ||
+           (github.event_name == 'workflow_dispatch' &&
+            github.event.inputs.make_release == 'true'))
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ env.DATE }}
           name: CMCC PZ-L8 NSS ${{ env.DATE }}
-          body_path: build-info.txt
+          body_path: release-notes.md
+          make_latest: true
           files: |
-            ${{ env.FIRMWARE }}/*.bin
-            ${{ env.FIRMWARE }}/*.ubi
+            ${{ env.FIRMWARE }}/*-sysupgrade.bin
+            ${{ env.FIRMWARE }}/*-factory.ubi
+            ${{ env.FIRMWARE }}/*-initramfs-uImage.itb
+            ${{ env.FIRMWARE }}/*.manifest
             ${{ env.FIRMWARE }}/sha256sums
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
 
       - name: Upload build log on failure
         if: failure()
