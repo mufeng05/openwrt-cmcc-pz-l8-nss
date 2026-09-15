@@ -607,10 +607,17 @@ whose own comment says it exists to prevent catastrophic failure during
 attach. It worked, and on this board it even landed the right way round, but
 only because 2.4 GHz attaches first.
 
-Each radio now asks for what it should have - 5 GHz high, 2.4 GHz low, which
-is the arrangement the vendor's per-radio ini produces on a 2+5 board - so
+Each radio now asks for what it should have - 5 GHz high, 2.4 GHz low - so
 both take matching entries and attach order stops mattering. It is a
 correctness change, not a throughput one.
+
+Where the priority comes from differs. The closed driver reads it from an ini
+file, and this was first written down here as though the open one did too; it
+does not. QSDK 13.1.5's `0088-ath11k-configure-nss-thread-priority-during-
+pdev_init` reads a device-tree property, `nss-radio-priority`, and calls the
+allocator only when it is present. There is no such property in this board's
+DTS, so the priority is derived from the pdev's band instead and is always
+configured.
 
 ## The 2.4 GHz radio
 
@@ -632,6 +639,85 @@ startup and takes 40 MHz if the band ever clears. Forcing it needs
 `option noscan '1'` on the wifi-device, which overrides a coexistence rule
 that exists for the neighbours' benefit - left as a deliberate choice rather
 than a default.
+
+## QSDK 13.1.5, and what it is worth here
+
+`AU_LINUX_QSDK_NHSS.QSDK.13.1.5.R2_TARGET_ALL.13.15.02.1099.023.xml`, dated
+2026-04-28, is an **all-open-source manifest** - 77 projects, every one of them
+under `oss/`, including the WLAN host driver. Its mac80211 feed
+(`oss/system/feeds/wlan-open`) carries 254 ath11k patches, 13 of them NSS:
+
+```
+0038-001/002  the nss driver interface, and hooking it into ath11k
+0044-001/002  WDS offload
+0063-002/003  AP_VLAN ext vdev            0128  a later fix to the same
+0067-001/002  dynamic VLAN
+0076          mesh offload                0077  MCBC exception
+0088          per-radio thread priority
+0170          link descriptor event handler
+```
+
+This is the authoritative vendor ath11k+NSS set, open, and newer than the
+`openwrt-nss-edma` tree the rest of this document compares against. IPQ5018 is
+still referenced by 19 of the 254.
+
+**It is a patch reference, not an upgrade path**, for three separate reasons:
+
+| | |
+|---|---|
+| firmware | `oss/feeds/nss` at r35 contains one Makefile: `BIN-NSS.FW.13.1-300-AL.E`, `DEPENDS:=@TARGET_ipq95xx`, fetched from an internal Qualcomm host. There is no IPQ5018 blob, so 12.5-210 remains the newest this board can run. |
+| the wifi glue | both `nss-plugins` and `nss-wifi-plugins` are PPE and PPE-DS glue - `ppe_drv_public.h`, `ppe_vp_public.h`, `ppeds_plugins/`. PPE is the accelerator that replaced the NSS cores; IPQ5018 does not have one. |
+| the base | backports 6.6.15 on kernel 6.6 and OpenWrt 24, against 6.18.26 on 6.12 and OpenWrt 25.12 here. |
+
+### What it corrected
+
+`0088` sets `WIFILI_MULTISOC_THREAD_MAP_ENABLE` (0x10) in the init message
+whenever a per-radio priority is configured. The note against
+`ATH11K_NSS_INIT_FLAGS` here used to say the documented bits "all apply to
+configurations this board does not have", and for that bit it was wrong: two
+wifili SoCs, an internal IPQ5018 and an external QCN6122, is the multi-SoC
+case. The bit is now set. It changed nothing measurable - six rounds gave a
+median of 442 Mbit/s against 427 without it, well inside the run-to-run spread
+- so it is adopted on the vendor's authority rather than on a number.
+
+`0088` also treats an out-of-schemes allocation as a fallback to 0.
+`nss_wifili_thread_scheme_alloc()` signals failure with
+`NSS_WIFILI_INVALID_SCHEME_ID`, which is -1 through a `uint8_t` return and so
+255, and the firmware validates the field, so passing it on costs the radio.
+Two radios always match an entry today, so this is a guard rather than a fix.
+
+### What it confirmed
+
+`0170` is the link-descriptor handler, and it matches what is here: same
+`wbm_desc_rel_ring`, same `PUT_IN_IDLE`, same source-entry pattern. With one
+difference - theirs still pairs `spin_lock_bh` with a plain `spin_unlock`, at
+r35, which is the bug their own `999-934` exists to fix.
+
+### What it did not apply
+
+`0085-ath11k-poll-reo-status-ipq5018` looked like the find of the day. Its
+header says REO status interrupts are never received on IPQ5018 because the
+interrupt line is mismapped, and that without reaping the ring you get
+backpressure and ring-full errors in multi-client setups. That matches an
+observation here exactly: `reo2host-status` reads 0, it sits alone in ring
+mask group 3, upstream gives IPQ5018 the IPQ8074 mask, and nothing else shares
+the group - so `ath11k_dp_process_reo_status()` is never called.
+
+It still does not apply, for three reasons that had to be checked rather than
+assumed:
+
+- QSDK 13.1.5 sets `reo_status_poll = false` on **every** hardware entry, 22 of
+  them, and `true` on none. The workaround is from 2021, says "can be reverted
+  once HW solution is available", and by r35 is dead code.
+- Sixteen associate/disassociate cycles, 19 peer events, produced no REO error
+  of any kind.
+- If TID buffers were leaking per peer delete the growth would be linear.
+  Slab grew 3020 kB over the first eight cycles and 1568 kB over the next
+  eight, for identical work - decelerating, which is allocator warm-up, not a
+  leak.
+
+Worth writing down because it is the shape of thing that looks like a gap and
+is not.
 
 ## Known limitations
 

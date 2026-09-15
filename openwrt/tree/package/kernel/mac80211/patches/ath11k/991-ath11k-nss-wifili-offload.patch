@@ -2462,7 +2462,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +#endif /* ATH11K_NSS_H */
 --- /dev/null
 +++ b/drivers/net/wireless/ath/ath11k/nss.c
-@@ -0,0 +1,2257 @@
+@@ -0,0 +1,2286 @@
 +// SPDX-License-Identifier: BSD-3-Clause-Clear
 +/*
 + * NSS wifili offload for ath11k.  See nss.h for why this is here.
@@ -2543,11 +2543,25 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +/*
 + * nss_wifili_init_msg.flags.  The stripped vendor wifi_3_0.ko sets 0x40
 + * unconditionally in two QSDK generations, which makes it a premise rather
-+ * than a feature.  The four documented bits (CCE_DISABLED, ADDTL_MEM_SEG_SET,
-+ * PEXT_STATS_ENABLED, MULTISOC_THREAD_MAP_ENABLE) all apply to configurations
-+ * this board does not have.
++ * than a feature.
++ *
++ * 0x10 is MULTISOC_THREAD_MAP_ENABLE, and QSDK 13.1.5's open ath11k sets it
++ * in exactly the case this board is in: two wifili SoCs - the internal
++ * IPQ5018 and the external QCN6122 - with a per-radio thread scheme priority
++ * configured.  Their 0088 patch gates it on the presence of an
++ * "nss-radio-priority" device-tree property, which is how the open driver
++ * carries what the closed one reads from an ini file; the priority here is
++ * derived from the band instead, and is always configured, so the bit is
++ * always set.
++ *
++ * The other two documented bits, CCE_DISABLED and ADDTL_MEM_SEG_SET, do
++ * describe configurations this board does not have.
 + */
-+#define ATH11K_NSS_INIT_FLAGS		0x40
++/* nss_wifili.c keeps this private; it is the allocator's failure return. */
++#define NSS_WIFILI_INVALID_SCHEME_ID	-1
++
++#define ATH11K_NSS_MULTISOC_THREAD_MAP	0x10
++#define ATH11K_NSS_INIT_FLAGS		(0x40 | ATH11K_NSS_MULTISOC_THREAD_MAP)
 +
 +/* soc_mem_profile: the vendor binary writes 1 unconditionally. */
 +#define ATH11K_NSS_MEM_PROFILE		1
@@ -3303,6 +3317,7 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +	struct ath11k_nss_soc *nss = &ab->nss;
 +	struct nss_ctx_instance *rctx;
 +	int ifnum;
++	u8 scheme;
 +
 +	if (nss->radio_if_num >= 0)
 +		return 0;
@@ -3328,7 +3343,21 @@ Diagnostic aid for bring-up, not for shipping as-is.
 +
 +	nss->radio_if_num = ifnum;
 +	prio = ath11k_nss_radio_priority(ab);
-+	nss->scheme_id = nss_wifili_thread_scheme_alloc(nss->ctx, ifnum, prio);
++	scheme = nss_wifili_thread_scheme_alloc(nss->ctx, ifnum, prio);
++
++	/*
++	 * The allocator returns NSS_WIFILI_INVALID_SCHEME_ID, which is -1
++	 * through a uint8_t return and so 255, when the database has nothing
++	 * left.  The firmware validates this field - PDEV_INIT answers
++	 * NSS_WIFILI_EMSG_PDEV_INIT_FAIL_INVALID_THREAD_SCHEME_ID - so passing
++	 * it on would cost the radio.  Scheme 0 always exists.
++	 */
++	if (scheme == (u8)NSS_WIFILI_INVALID_SCHEME_ID) {
++		ath11k_warn(ab, "nss: no thread scheme left, falling back to 0\n");
++		scheme = 0;
++	}
++
++	nss->scheme_id = scheme;
 +
 +	ath11k_info(ab, "nss: radio if=%d scheme_id=%u priority=%s\n",
 +		    ifnum, nss->scheme_id,
