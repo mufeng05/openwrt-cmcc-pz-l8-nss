@@ -41,9 +41,26 @@ table instead of into the empty cells above:
 | four parallel HTTP streams, 20 s | v1.6 | nwrt | this build |
 |---|---|---|---|
 | wired LAN → WAN | 912.1 | 901.8 | **912.6** |
-| **5 GHz LAN → WAN** | **730** | **722** | 462 |
+| 5 GHz at 80 MHz | - | - | 462 |
+| **5 GHz at 160 MHz** | **730** | **722** | **697** |
 | 2.4 GHz LAN → WAN | 98.8 | **119.4** | 75.0 |
-| host CPU during 5 GHz | not measurable, see below | 16.1 % at 537 | **5.9 % at 347** |
+| host CPU during 5 GHz | not measurable, see below | 16.1 % at 537 | **2.9 % at 441** |
+
+**At matched width this build lands within 3.5-4.6 % of both references.** The
+5 GHz gap was attributed to channel width on an arithmetic argument (722/425 is
+1.70 against a bandwidth ratio of 2.0); running this build at 160 MHz turns
+that into a measurement - 461.6 to 696.9, worth +51 %, leaving a remainder too
+small to need its own explanation.
+
+The CPU cell is a like-for-like comparison for the first time - same band, same
+width, same method, each with its own idle control. nwrt spends 5.6x the CPU to
+move 22 % more data.
+
+160 MHz needs a country code set: under the default `country 00` the 5 GHz band
+is split into two 80 MHz regulatory blocks and no 160 MHz channel exists. The
+resulting channel covers DFS spectrum, so hostapd runs a 62 s CAC before it
+beacons, on every start. That is why this is not the shipped default - and a
+regulatory domain is not something an image should choose for its user.
 
 This build's column was re-measured after flashing back onto the board, with
 `n2h_high_water_core0` restored to the vendor's 16336. The CPU cell has an idle

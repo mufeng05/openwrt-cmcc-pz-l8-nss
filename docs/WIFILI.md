@@ -1020,10 +1020,11 @@ else's practice.
 | | v1.6 | nwrt | this build |
 |---|---|---|---|
 | wired LAN to WAN | 912.1 | 901.8 | **912.6** (912.4-915.8) |
-| **5 GHz LAN to WAN** | **730.3** (720.7-749) | 722 (718-728) | 462 (403-504) |
+| 5 GHz at 80 MHz | - | - | 462 (403-504) |
+| **5 GHz at 160 MHz** | **730.3** (720.7-749) | 722 (718-728) | **696.9** (651.4-713.5) |
 | 2.4 GHz LAN to WAN | 98.8 (94.6-101.1) | **119.4** | 75.0 (74.4-75.2) |
-| 5 GHz single stream | 523.5 | 537 | 346.9 |
-| host CPU during 5 GHz | not measurable, see below | 16.1 % at 537 | **5.9 % at 347** |
+| 5 GHz single stream | 523.5 at 160 | 537 at 160 | 441.2 at 160, 346.9 at 80 |
+| host CPU during 5 GHz | not measurable, see below | 16.1 % at 537 | **2.9 % at 441** |
 
 This build's rows were re-measured after reflashing over v1.6, with
 `n2h_high_water_core0` restored to the vendor's 16336. The 5 GHz median of 462
@@ -1032,9 +1033,10 @@ at the new setting are not evidence that it changed anything.
 
 | client association | channel | width | rate |
 |---|---|---|---|
-| v1.6 5 GHz | 60 | **160 MHz** | **2162 Mbps** |
+| v1.6 5 GHz | 60 | 160 MHz | **2162 Mbps** |
 | nwrt 5 GHz | 40 | 160 MHz | 1922 |
-| this build 5 GHz | 36 | 80 MHz | 961 under load (1201 seen earlier) |
+| **this build 5 GHz** | 36 | **160 MHz** | **1729** (1441 under load) |
+| this build 5 GHz | 36 | 80 MHz | 961 under load |
 | v1.6 2.4 GHz | 11 | 20 MHz | **287** |
 | nwrt 2.4 GHz | 6 | 20 MHz | 206 |
 | this build 2.4 GHz | 11 | 20 MHz | 155 |
@@ -1240,6 +1242,85 @@ ubi32-thermal 63000   cpu-thermal 65000   top-glue-thermal 62000   gephy-thermal
 
 plus six hwmon devices, two of which are `ath11k_hwmon`. The earlier note that
 only one zone (`cpu-thermal`) was defined and unverified is superseded.
+
+### 160 MHz, which settles the 5 GHz question
+
+The gap to the reference images was attributed to channel width on an
+arithmetic argument - 722/425 is 1.70 against a bandwidth ratio of 2.0, so most
+of it is width. That was inference. Running this build at the same 160 MHz the
+references use replaces it with a measurement:
+
+| 5 GHz, four parallel streams | width | median | rounds |
+|---|---|---|---|
+| this build | 80 MHz | 461.6 | 420 / 503 / 504 / 403 |
+| **this build** | **160 MHz** | **696.9** | 713.5 / 707.7 / 686.1 / 651.4 |
+| v1.6 | 160 MHz | 730.3 | 749 / 733 / 721 / 727 |
+| nwrt | 160 MHz | 722 | 718 / 720 / 725 / 728 |
+
+**At matched width this build is within 3.5 % of nwrt and 4.6 % of v1.6.**
+Widening is worth +51 % here (461.6 to 696.9), and what is left is small enough
+that it needs no separate explanation. The association rate moves the same way:
+961 Mbps at 80 MHz, 1729 at 160, against 1922 and 2162.
+
+The spread is still wider than theirs - 651-714, about ±4.5 %, against ±0.7 %
+on nwrt - so the rate-control difference noted earlier is real and survives the
+width change. It is just much smaller than the width effect was.
+
+### CPU, now a like-for-like comparison
+
+Both sides on 5 GHz at 160 MHz, same board, client, server and method. Each
+figure has its own idle control taken in the same session:
+
+| | idle | during transfer | throughput | marginal |
+|---|---|---|---|---|
+| this build, 160 MHz | 0.83 % | **2.87 %** | 441.2 Mbit/s | +2.04 pp |
+| this build, 80 MHz | 3.13 % | 5.88 % | 346.9 | +2.75 pp |
+| nwrt, 160 MHz | (large idle headroom) | **16.1 %** | 537 | - |
+
+nwrt spends **5.6x the CPU to move 22 % more data**. Per Mbit/s that is
+0.0065 % here against 0.0300 % there, a factor of 4.6.
+
+Two caveats worth keeping. The two idle baselines here differ by more than the
+effect being measured - 3.13 % was taken minutes after heavy testing and 0.83 %
+after a longer quiet period - so the marginal columns compare better than the
+totals do. And nwrt's own idle baseline was never taken; it had 4650 jiffies of
+idle in that window, so 16.1 % is close to the traffic cost but is not a
+controlled figure the way these two are.
+
+### How to run 160 MHz, and why it is not the shipped default
+
+```sh
+uci set wireless.radio1.country='CN'      # or the correct domain
+uci set wireless.radio1.htmode='HE160'
+uci set wireless.radio1.channel='36'
+uci commit wireless && wifi reload
+```
+
+The country code is load-bearing. With the default `country 00`, `iw reg get`
+splits 5 GHz into `5170-5250 @ 80` and `5250-5330 @ 80` with the upper half
+DFS and passive-scan, and no 160 MHz channel exists. Under CN the same spectrum
+comes back as a usable pair and hostapd can place a 160 MHz channel at
+center 5250 - the same one v1.6 and nwrt use.
+
+That channel covers DFS spectrum, so hostapd runs a CAC before it beacons:
+
+```
+hostapd: phy0-ap0: DFS-CAC-START freq=5180 chan=36 sec_chan=1, width=2, seg0=50, cac_time=60s
+hostapd: phy0-ap0: DFS-CAC-COMPLETED success=1 ... radar_detected=0
+hostapd: phy0-ap0: interface state DFS->ENABLED
+```
+
+62 seconds with no beacon, on every start. Radar detection can also move the
+channel later. Neither is a defect, but both are reasons this is a choice the
+operator makes rather than something the image decides - and the regulatory
+domain is not something an image should pick on the user's behalf at all.
+
+Offload is unaffected: a `wifi reload` renumbers the wiphys (the 2.4 GHz radio
+came back as phy1) but the per-SoC data path handover persists and new vdevs
+register normally. Over the 160 MHz runs: 5,692,465 packets sent, zero
+`tx_enqueue_drop`, zero `tx_hw_enqueue_fail`, zero `tcl_ring_full`, 464,926
+reaped, zero `reo_error`, zero `rx_desc_alloc_fail`, zero radar events, zero
+call traces.
 
 ### Where high_water ended up
 
