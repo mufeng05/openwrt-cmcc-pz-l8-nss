@@ -99,6 +99,65 @@ on WiFi, through the router with NAT, to a wired host — because traffic source
 on the router itself measures its own userspace and says nothing about the
 offload.
 
+## Wi-Fi defaults, which come up on their own
+
+A fresh flash is connectable without going through LuCI first:
+
+| | SSID | channel | width |
+|---|---|---|---|
+| 2.4 GHz | `PZ-L8-2G` | auto (ACS) | asks for HE40, usually settles at 20 MHz |
+| 5 GHz | `PZ-L8-5G` | 36 | **HE160 (160 MHz)** |
+
+Encryption `psk2+ccmp`, key `pzl8test2026`.
+
+### Two things to change
+
+**The key.** This image is published, so this key is public - anyone who reads
+the repository can join a router still using it. **Change it first.**
+
+```sh
+uci set wireless.default_radio0.key='your key'
+uci set wireless.default_radio1.key='your key'
+uci commit wireless && wifi reload
+```
+
+**The country code, which ships as `CN`.** Not a cosmetic preference: under the
+default world domain (`country 00`), `iw reg get` splits 5 GHz into
+`5170-5250 @ 80` and `5250-5330 @ 80` with the upper half DFS and passive-scan,
+**no 160 MHz channel exists at all**, and radio1 silently falls back to 80 MHz.
+Set it to where the board actually is.
+
+### Two behaviours that follow
+
+**5 GHz takes about a minute to appear on every boot.** Under CN the only
+160 MHz segment is 5170-5330 centred on 5250, and it covers DFS spectrum, so
+hostapd must finish a channel-availability check before the first beacon:
+
+```
+hostapd: phy0-ap0: DFS-CAC-START ... cac_time=60s
+hostapd: phy0-ap0: DFS-CAC-COMPLETED success=1 ... radar_detected=0
+hostapd: phy0-ap0: interface state DFS->ENABLED
+```
+
+5 GHz is invisible until it finishes; 2.4 GHz is unaffected and comes up first.
+Radar can also move the channel later. Both are the price of 160 MHz on this
+board - `HE80` removes them and costs about a third of the throughput
+(697 to 462 Mbit/s measured).
+
+**2.4 GHz usually runs at 20 MHz, not 40.** The config asks for `HE40` but does
+not set `noscan`, so the 802.11 coexistence scan drops it to 20 MHz where
+neighbouring BSSs are dense - which is exactly what both reference images
+(v1.6 and nwrt) do. To hold 40 MHz regardless:
+
+```sh
+uci set wireless.radio0.noscan='1'
+uci commit wireless && wifi reload
+```
+
+Worth about +50 % here (75.0 to 112.5 Mbit/s), at the cost of ignoring what 25
+other networks are asking for; the airtime it gains comes from them. **Off by
+default.**
+
 ## What works
 
 - NSS core boots, ECM offload stack loads automatically at every boot, with a

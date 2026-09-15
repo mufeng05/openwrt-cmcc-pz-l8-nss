@@ -1,0 +1,58 @@
+# Shipped by this build. Stock OpenWrt leaves both radios disabled with an
+# SSID of "OpenWrt"; this comes up ready.
+#
+# CHANGE THESE TWO BEFORE YOU RELY ON IT:
+#
+#   country  Set it to where the board actually is. This is not cosmetic:
+#            under the default world domain (country 00) the 5 GHz band is two
+#            separate 80 MHz regulatory blocks and no 160 MHz channel exists,
+#            so radio1 below would silently fall back to 80 MHz.
+#
+#   key      This image is published, so this key is public. Anyone who reads
+#            the repository can join a router still using it.
+#
+# 2.4 GHz uses ACS and asks for HE40 without `noscan`, which is what both
+# reference images do: hostapd picks the channel, and the 802.11 coexistence
+# scan decides whether 40 MHz is allowed. Where neighbours are dense it settles
+# at 20 MHz, which is correct and neighbourly. Setting `noscan '1'` holds 40 MHz
+# regardless - worth about +50 % here, at the cost of ignoring what 25 other
+# networks are asking for.
+#
+# 5 GHz is fixed at channel 36 / HE160. That segment covers DFS spectrum, so
+# hostapd runs a 62 s channel-availability check before the first beacon on
+# every boot, and radar can move it later. Both are the price of 160 MHz on
+# this board; HE80 removes them and costs about a third of the throughput.
+
+config wifi-device 'radio0'
+	option type 'mac80211'
+	option path 'platform/soc@0/c000000.wifi'
+	option band '2g'
+	option channel 'auto'
+	option htmode 'HE40'
+	option country 'CN'
+	option cell_density '0'
+
+config wifi-iface 'default_radio0'
+	option device 'radio0'
+	option network 'lan'
+	option mode 'ap'
+	option ssid 'PZ-L8-2G'
+	option encryption 'psk2+ccmp'
+	option key 'pzl8test2026'
+
+config wifi-device 'radio1'
+	option type 'mac80211'
+	option path 'platform/soc@0/b00a040.wifi'
+	option band '5g'
+	option channel '36'
+	option htmode 'HE160'
+	option country 'CN'
+	option cell_density '0'
+
+config wifi-iface 'default_radio1'
+	option device 'radio1'
+	option network 'lan'
+	option mode 'ap'
+	option ssid 'PZ-L8-5G'
+	option encryption 'psk2+ccmp'
+	option key 'pzl8test2026'

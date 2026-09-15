@@ -83,6 +83,61 @@ v1.6 那一格填不出数字，是因为它空闲时 CPU 就已经被四个卡�
 经路由器 NAT 到一台有线主机——因为由路由器自身发起的流量测的是它自己的用户态，
 说明不了卸载的效果。
 
+## 开箱即用的无线配置
+
+刷完就能连，不需要先进 LuCI 配一遍。默认值：
+
+| | SSID | 信道 | 带宽 |
+|---|---|---|---|
+| 2.4 GHz | `PZ-L8-2G` | 自动（ACS） | 申请 HE40，通常落在 20 MHz |
+| 5 GHz | `PZ-L8-5G` | 36 | **HE160（160 MHz）** |
+
+加密 `psk2+ccmp`，密钥 `pzl8test2026`。
+
+### 两处你需要自己改
+
+**密钥。** 这个镜像是公开发布的，所以这个密钥也是公开的——任何看过本仓库的人
+都能连上还在用默认值的路由器。**先改它。**
+
+```sh
+uci set wireless.default_radio0.key='你的密钥'
+uci set wireless.default_radio1.key='你的密钥'
+uci commit wireless && wifi reload
+```
+
+**国家码，默认 `CN`。** 这不是可有可无的偏好：在默认的世界域（`country 00`）
+下，`iw reg get` 把 5 GHz 切成 `5170-5250 @ 80` 和 `5250-5330 @ 80` 两个独立
+规则块，上半段还是 DFS + 被动扫描，**根本不存在 160 MHz 信道**，radio1 会
+悄悄退回 80 MHz。设成板子实际所在的地区。
+
+### 两个行为上的代价
+
+**5 GHz 每次开机要等约一分钟。** 160 MHz 在 CN 下只有 5170–5330 这一段
+（中心 5250），它覆盖 DFS 频段，所以 hostapd 必须先做完信道可用性检查（CAC）
+才发第一个信标：
+
+```
+hostapd: phy0-ap0: DFS-CAC-START ... cac_time=60s
+hostapd: phy0-ap0: DFS-CAC-COMPLETED success=1 ... radar_detected=0
+hostapd: phy0-ap0: interface state DFS->ENABLED
+```
+
+期间 5 GHz 不可见（2.4 GHz 不受影响，先起来）。之后检测到雷达还会换信道。
+这是这块板子上 160 MHz 的固有代价；改成 `HE80` 可以免掉，但吞吐要少三分之一
+（697 → 462 Mbit/s 实测）。
+
+**2.4 GHz 通常跑在 20 MHz 而不是 40。** 配置里写的是 `HE40`，但没有加
+`noscan`，所以 802.11 共存扫描发现周围有重叠 BSS 时会自动退回 20 MHz——
+两个参照固件（v1.6、nwrt）是完全一样的做法。想强制 40 MHz：
+
+```sh
+uci set wireless.radio0.noscan='1'
+uci commit wireless && wifi reload
+```
+
+实测值约 +50%（75.0 → 112.5 Mbit/s），代价是无视周围 25 个网络的共存请求，
+多出来的空口时间是从它们那里拿的。**默认不开。**
+
 ## 已经可用的部分
 
 - NSS 核正常启动，ECM 卸载栈每次开机自动加载，带一个会自行解除的安全网
