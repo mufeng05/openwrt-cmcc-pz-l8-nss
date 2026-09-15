@@ -48,9 +48,9 @@ offload.
 
 ## Known limitations
 
-- One AP interface per radio: a second BSS on the same radio is not
-  offloaded, and AP isolation is not passed to NSS. See
-  [docs/WIFILI.md](docs/WIFILI.md).
+- QoS must use the `nss-edma` SQM script: the data path is in the NSS
+  cores, so Linux qdiscs never see the traffic and cake or fq_codel
+  silently do nothing. See [docs/WIFILI.md](docs/WIFILI.md).
 - **Memory is tight.** 256 MB board; ath11k's data-path rings are patched down
   from the upstream sizes or nothing fits alongside NSS.
 - Monitor-mode capture on the radios is effectively disabled by those ring sizes.

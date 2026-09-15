@@ -343,9 +343,12 @@ Structurally, what the vendor does and this driver now does too:
 |---|---|---|
 | peer state | on `struct ath11k_peer` | same |
 | peer create | from `ath11k_peer_map_event()` | at `AUTH->ASSOC` - see below |
+| vdev state | per interface (`struct arvif_nss`, or the VAP object) | same |
 | cipher | `ath11k_nss_cipher_type()` from the installed key | same, plus WEP, which their switch omits |
 | statistics | NSS's peer reports into the netdev and `sinfo` | same, minus the host-side part |
+| receive rate | the monitor status ring's per-PPDU stats | same, with two corrections below |
 | vdev up/down | from `ath11k_control_beaconing()` and the channel switch | same |
+| AP isolation | `NSS_WIFI_VDEV_CFG_AP_BRIDGE_CMD` from a mac80211 op of their own | same command, from a smaller mac80211 change |
 | teardown | `pdev_destroy`, the crash path, `pdev_create`'s error label | same three |
 | MIC errors | SoC ext callback to `cfg80211_michael_mic_failure()` | same |
 | radio buffers | four range messages at `pdev_init` | same |
@@ -358,24 +361,159 @@ run that created the same peer two seconds later and was stable. So the create
 sits at `AUTH->ASSOC`, after `ath11k_station_assoc()` and still before the
 station is authorised and can have a frame forwarded.
 
+### Two corrections the vendor's receive-rate code needs here
+
+Their `ath11k_nss_update_sta_rxrate()` transliterates cleanly, but neither of
+these is visible in it:
+
+**One TLV is not enough.** `PPDU_END_USER_STATS` carries the peer id and the
+preamble type, and without it the per-PPDU block in
+`ath11k_dp_rx_process_mon_status()` never runs at all - it bails on an invalid
+peer id, and the peer id is in that TLV. The rate is not: mcs, nss and bw come
+from the HT/VHT/HE SIG TLVs and the legacy rate from L-SIG, which arrive with
+`PPDU_START`. With only the first, every station read 6.0 Mbit/s.
+
+**Their data-frame guard is unconditionally false here.** `ieee80211_is_data()`
+reads `ppdu_info->frame_control`, which this firmware never fills from the TLVs
+the monitor status ring carries. Counted over one iperf run: 1489 PPDUs reached
+the function, 1489 were rejected, and 1466 of them were HE carrying the mcs and
+nss the station was really using. The guard is honoured where the field says
+something and ignored where it does not.
+
+Measured during traffic, sampled every six seconds: 1020.6 Mbit/s HE-MCS 10
+NSS 2 80MHz, then 864.8 at MCS 8, then 960.7 at MCS 9 - against 676 Mbit/s of
+real throughput. After traffic stops it decays to the last PPDU received, which
+is what `iw` shows on any AP.
+
+### AP isolation, and why it needed a mac80211 patch
+
+nl80211 SET_BSS carries `ap_isolate` down to `ieee80211_change_bss()`, which
+sets `IEEE80211_SDATA_DONT_BRIDGE_PACKETS` on its own sdata, checks it in its
+own Rx path, and tells nobody. An offloaded frame never reaches that check, so
+`option isolate` did nothing at all.
+
+Qualcomm carry `BSS_CHANGED_NSS_AP_ISOLATE` plus a mac80211 operation of their
+own. `399-mac80211-tell-the-driver-about-ap-isolation.patch` is the same idea in
+the smallest form that fits an unmodified tree: one free bit in the existing
+changed mask (32 - 31 and 33 were taken) and one bool in the existing
+`bss_conf`, so an ordinary `bss_info_changed` sees it and no new op is needed.
+The driver then sends `NSS_WIFI_VDEV_CFG_AP_BRIDGE_CMD`, which it was already
+sending, hardcoded to 1.
+
+Measured with three stations on one BSS. With isolation on, a ping between two
+of them fails at ARP - the AP does not forward the request - and NSS's own
+`rx_intra_bss_ucast` stays 0. With it off the ping succeeds in 5 to 105 ms and
+the counter reads 9.
+
+### The bug many interfaces exposed
+
+An excepted EAPOL arrives as 802.3 and has to be rebuilt into the 802.11 frame
+mac80211 expects. `addr1` decides which interface mac80211 hands it to, and it
+was taken from the first AP vif on the radio - right while a radio had one.
+
+`ar->arvifs` is head-inserted, so with two the first is the *most recently
+added* interface: every EAPOL on that radio went to the guest BSS's hostapd.
+Its own clients worked by accident; the other BSS's associated, failed the
+handshake and retried every three seconds, the peer id climbing each time. The
+2.4 GHz radio, having one BSS, was unaffected.
+
+An uplink EAPOL's destination address is the AP's own MAC, so it says which
+interface the frame was for. That is what the lookup matches on now.
+
+## QoS
+
+Nothing Linux schedules can shape this router's traffic: the frames are
+forwarded inside the NSS cores and never reach a qdisc. Configuring cake or
+fq_codel here is not a mistake that produces bad shaping - it produces none,
+silently.
+
+`sqm-scripts-nss` carries `nss-edma.qos`, which builds the same shape out of
+qdiscs that run on the NSS cores: `nsstbl` (the shaper) -> `nssprio` (a
+strict-priority fast lane ahead of the default band) -> `nssfq_codel` (the AQM),
+per direction, with the ingress direction redirected into an IFB by the
+firmware's IGS engine.
+
+It needs four pieces, and leaving any one out fails differently:
+
+| | without it |
+|---|---|
+| `kmod-qca-nss-drv-qdisc` | the qdiscs do not exist |
+| `kmod-qca-nss-drv-igs` | no ingress redirect, so no download shaping |
+| iproute2 `400-add-nss-qdisc.patch` | `tc`: `Unknown qdisc "nsstbl"` |
+| iproute2 `500-add-nssmirred.patch` | `tc` cannot install the IGS action |
+
+The IGS module includes `linux/tc_act/tc_nss_mirred.h`, which is not a kernel
+header - it arrives through `target/linux/qualcommax/files/`.
+
+Two settings are not optional and neither is obvious:
+
+```
+option script 'nss-edma.qos'
+option qdisc  'nssfq_codel'
+```
+
+The script is the whole point. The `qdisc` field looks redundant next to it and
+is not: sqm-scripts' own `get_target()` and `get_limit()` only emit their
+arguments when `$QDISC` matches `*codel|*pie`, so leaving the stock `cake` there
+makes them produce nothing and `tc` refuses the command with a usage error that
+names a parameter the script did pass everywhere else.
+
+Measured on a link that runs 692 up / 552 down unshaped, configured to 200 up /
+300 down: 191 up and 253 down, which is where a token bucket lands - the
+script's header explains that the rates are gross L2 including encapsulation,
+so 95 % of the configured figure is the expected result and not a loss.
+
+Host CPU across the shaped run was 5.1 %, against an idle baseline of 4 to
+5.5 % - the scheduling is on the NSS cores, which is the point of using these
+qdiscs rather than the kernel's.
+
+What it is actually for is latency, and that is where it shows. Pinging through
+the router while the download is saturated:
+
+| | throughput | RTT under load |
+|---|---|---|
+| idle, for reference | - | 4 ms avg, 12 max |
+| unshaped | 477 Mbit/s | 14 ms avg, 23 max |
+| shaped 300/200 | 257 Mbit/s | **5 ms avg, 11 max** |
+
+Shaped, the loaded round trip is the idle round trip. The queueing delay is
+gone, and it was removed on the NSS cores.
+
+### The other two features, on this board
+
+`nss-edma.qos` was written and verified against IPQ807x on NSS.FW.12.5-210.
+Both of its remaining features work here, with one of them pointless:
+
+**The DSCP fast lane works.** The tree carries a strict-priority `nsspfifo`
+ahead of the default `nssfq_codel`, and classification is by `skb->priority`,
+not by a tc filter - mark a flow `meta priority set 100:0` in an nftables
+mangle forward chain. Marking ICMP and saturating the upload put 12 packets and
+888 bytes through band 0, which had been empty, while the 176 Mbit/s of iperf
+stayed in band 1.
+
+**`option igs_upload` installs but buys nothing here.** This board's LAN is one
+`eth0` behind a QCA8337 managed by swconfig, not a DSA switch with per-port
+netdevs, so the option takes `eth0` and gives the whole wired side one IGS tree
+rather than one per port - which it does without complaint, at 93 % of the
+configured upload rate. It changes nothing measurable: wired upload saturated
+at 176 Mbit/s holds 1 ms RTT with the tree and 1 ms without it.
+
+That is not a failure, it is the feature not applying. Its purpose is flow
+isolation when the WAN egress is encapsulated, where the shaper's hash cannot
+see the inner 5-tuple through PPPoE and VLAN headers. This WAN is plain DHCP on
+`eth1`, so the egress `nssfq_codel` hashes the real flows and there is nothing
+left for an IGS tree to separate.
+
+Wi-Fi is out of reach either way: the script's own header notes that Wi-Fi
+vdevs are not valid IGS sources, so wireless upload rides the egress
+`nssfq_codel`.
+
 ## Known limitations
 
-- **One AP vdev per radio.** A second BSS on the same radio - a guest network -
-  would need the vdev state per `arvif` rather than per SoC, which is what the
-  vendor's `struct arvif_nss` is for. Nothing here assumes it is impossible; it
-  has not been built.
-- **AP isolation is not passed to NSS.** Intra-BSS forwarding happens inside
-  NSS, so `option isolate` cannot work without telling it. The vendor adds a
-  `nss_bss_info_changed` mac80211 op and a `BSS_CHANGED_NSS_AP_ISOLATE` flag to
-  carry it; both are QSDK mac80211 additions, and this project builds on an
-  unmodified one.
-- **`tx retries` and `tx failed` read zero.** The fields exist now and come from
-  NSS's peer report, but 650k packets with no retries is not believable - this
-  firmware appears not to fill them. The byte and packet counts it does fill
-  agree with `reo_reaped` and `tx_sent_count` to within a dozen frames.
-- **Rx bitrate is missing from `iw station dump`.** The vendor fills it from the
-  monitor PPDU path (`ath11k_nss_update_sta_rxrate`), which needs the
-  PPDU_END_USER_STATS TLV filter enabled. Tx bitrate is unaffected and correct.
+- **`tx failed` reads zero.** `tx retries` is real - 24566 over a run - but it
+  comes from the report's own retry sub-struct, not from `tx.retries`, which is
+  what the vendor reads and this firmware leaves empty. Both are summed and
+  whichever is filled is reported; `tx_failed` has never been non-zero.
 - **The MIC error path is untested.** It is written and it compiles, but the
   test network is WPA2-CCMP, where Michael MIC does not apply.
 - `next_hop` must be set when the module loads. Writing 158 to it at runtime
@@ -386,3 +524,22 @@ station is authorised and can have a frame forwarded.
   radio). The message is the vendor's and is kept for a later firmware.
 - The probe is a diagnostic harness with a lot of knobs, several of which exist
   only to have refuted something. It is not a driver.
+
+## Editing this driver
+
+The ath11k half lives in `991-ath11k-nss-wifili-offload.patch`, regenerated
+from `build_dir` by `gen991.py`. Changes made in `build_dir` and left there are
+not safe: three separate things re-run `Build/Prepare` and throw the tree away -
+editing anything under a `patches/` directory, adding files under
+`target/linux/*/files/`, and `make target/linux/clean`. Each of them caught this
+work once.
+
+The second time was the expensive one: the reverted tree still compiled, so a
+clean `rc=0` looked like success and a driver with none of the day's changes in
+it went onto the board. Regenerate the patch as soon as a change set is
+verified, and treat a build that succeeds after a re-extract as evidence of
+nothing.
+
+`peer.h` and `dp_rx.h` were not in the pristine set `gen991.py` diffs against,
+so their hunks were dropped from the patch without a word. If a new file joins
+the patch, it needs a `.pristine` alongside it.
