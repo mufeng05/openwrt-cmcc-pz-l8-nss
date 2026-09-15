@@ -337,6 +337,10 @@ and 12.5's qca-wifi for a flat 2048; 4096 is what was measured here to take
 `rx_desc_alloc_fail` from two thirds of `reo_reaped` to zero, and larger is the
 safe direction.
 
+Zero is the better outcome, but it is not the threshold it was once treated as:
+the closed driver runs 2048 and 42 % failures while delivering 730 Mbit/s. See
+"rx_desc_alloc_fail is a tuning signal" below.
+
 Structurally, what the vendor does and this driver now does too:
 
 | | vendor | here |
@@ -979,87 +983,199 @@ Eight rounds of saturating Wi-Fi on the final configuration: 368 to 479
 Mbit/s, median 425, which is the session's normal band. Zero page-allocation
 failures, zero `rx_desc_alloc_fail`, zero `tx_enqueue_drop`, zero call traces.
 
-## The vendor image, measured rather than remembered
+## Two reference images, measured rather than remembered
 
-Everything here was taken on this board with nwrt flashed over it, no config
-kept beyond setting the LAN address, on the same afternoon as the corresponding
-figures for this build - same client (one Intel AX201), same server, same four
-parallel HTTP streams of 20 s, same host route forcing the traffic through the
-router. The numbers in README.md's table predate this and were taken with
-iperf3; these are not those, and the two should not be mixed.
+Both were flashed onto this board, no config kept beyond setting the LAN
+address, and measured on the same afternoon as the corresponding figures for
+this build - same client (one Intel AX201), same server, same four parallel
+HTTP streams of 20 s, same host route forcing the traffic through the router.
+The numbers in README.md's main table predate this and were taken with iperf3;
+these are not those, and the two should not be mixed.
 
-### What it is
+Neither reference is a pristine OEM image, and it is worth being exact about
+that, because a previous version of this section was not:
 
-| | nwrt | this build |
-|---|---|---|
-| kernel | 5.4.250, **armv7l** | 6.12.94, aarch64 |
-| OpenWrt | 23.05-SNAPSHOT | 25.12.5 |
-| WiFi driver | closed qca-wifi, started from userspace at S22 | ath11k, offload inside the QMI worker |
-| NSS firmware | **12.5-210**, md5 b3d25c97 | **12.5-210, byte-identical** |
+- **v1.6** - a community build on the CMCC 4.4 SDK, keeping the closed
+  qca-wifi driver. Carries passwall, adblock, haproxy, aliddns.
+- **nwrt** - a community build on 5.4, also closed qca-wifi.
 
-That last row settles something. The firmware package's help said 12.2-156 was
-the only line that accepted VAP allocation on IPQ5018, and this project shipped
-12.2 on that basis for a long time. The vendor image for this exact board ships
-12.5-210.
+### What they are
+
+| | v1.6 | nwrt | this build |
+|---|---|---|---|
+| kernel | 4.4.60, armv7l | 5.4.250, armv7l | 6.12.94, aarch64 |
+| OpenWrt | built 2023-03-04 | 23.05-SNAPSHOT | 25.12.5 |
+| WiFi driver | closed qca-wifi, hostapd at S15 | closed qca-wifi, S22 | ath11k, offload inside the QMI worker |
+| **NSS firmware** | **11.4-3-R**, md5 9ded57e7 | **12.5-210**, md5 b3d25c97 | 12.5-210, byte-identical to nwrt's |
+
+**Withdrawn:** this section used to say the firmware package's help was wrong
+about 12.2-156 because "the vendor image for this exact board ships 12.5-210".
+The image that says so is nwrt, which is not the vendor's. The CMCC-SDK image
+runs the 11.4 line. Running 12.5 here is justified by its own A/B - median 253
+to 417 Mbit/s over eight rounds each, non-overlapping - and not by anyone
+else's practice.
 
 ### Throughput
 
-| | nwrt | this build |
-|---|---|---|
-| wired LAN to WAN | 901.8 Mbit/s | 900.9 |
-| **5 GHz LAN to WAN** | **722** (718-728) | 425 (368-530) |
-| 2.4 GHz LAN to WAN | 119.4 (119-122) | not yet measured this way |
-| host CPU during 5 GHz | **16.1 %** at 537 Mbit/s single stream | not yet measured this way |
-
-Wired is a tie, and both are at the client NIC's line rate rather than the
-router's limit.
-
-5 GHz is not a tie, and the reason is visible in the association: nwrt runs the
-QCN6122 at **160 MHz** (channel 40, HT160) and the client associates at 1922
-Mbit/s. ath11k runs the same radio at 80 MHz and the same client associates at
-1201. 722/425 is 1.70 against a bandwidth ratio of 2.0, so the channel width
-accounts for most of the gap and there is no second mystery to chase.
-
-Two things beside the medians are worth noting. nwrt's spread is 718-728, a
-±0.7 % band, against ±20 % here - that is a rate-control or scheduling
-difference and it is not explained by bandwidth. And nwrt spends 16.1 % of two
-host cores to do it, where this build's wired and bridged figures are under
-2 %; the CPU comparison is not like-for-like yet, because the 16.1 % is 5 GHz
-to WAN and the sub-2 % numbers here are wired and bridged.
-
-### Configuration differences that are not throughput
-
-| | nwrt | this build | |
+| | v1.6 | nwrt | this build |
 |---|---|---|---|
-| `n2h_empty_pool_buf_core0` | 4096 | 4096 | agrees |
-| `n2h_high_water_core0` | **16336** | **4096** | we diverge |
-| `extra_pbuf_core0` | 802816 | 802816 | agrees |
-| `vm.min_free_kbytes` | 16384 | 8192 | we diverge |
-| `dev.nss.general.redirect` | 1 | 0 | only gates nss_virt_if, unused here |
-| `bridge-nf-call-iptables` | 1, bridge netfilter built in | absent entirely | |
-| thermal zones | 4, tsens, 59-62 C | 1 (`cpu-thermal`), unverified at runtime | |
+| wired LAN to WAN | **912.1** | 901.8 | 900.9 |
+| **5 GHz LAN to WAN** | **730.3** (720.7-749) | 722 (718-728) | 425 (368-530) |
+| 2.4 GHz LAN to WAN | 98.8 (94.6-101.1) | **119.4** | not yet measured this way |
+| 5 GHz single stream | 523.5 | 537 | - |
 
-The high water mark is the one to look at again. This build lowered it to match
-the pool on the reasoning that a mark above the cap makes the firmware grow
-past it, which it measurably does - 28.5 MB free against 35.3. The vendor
-nevertheless runs 4096 with 16336, which is the combination that costs the
-memory. Whether they have a reason beyond inertia is not visible from here.
+| client association | channel | width | rate |
+|---|---|---|---|
+| v1.6 | 60 | **160 MHz** | **2162 Mbps** |
+| nwrt | 40 | 160 MHz | 1922 |
+| this build | 36 | 80 MHz | 1201 |
 
-### Memory, which is the same total by different arithmetic
+Wired is a three-way tie at the client NIC's line rate, so it measures the
+client, not the router.
+
+5 GHz: **the two references are level** - 730 against 722 is inside the
+round-to-round spread. Both run 160 MHz. The gap to this build is still mostly
+width, and there is now a second data point for that reading: v1.6 associates
+12 % faster than nwrt (2162 against 1922) and delivers 1 % more, so both have
+reached the same ceiling and association rate is not what sets it.
+
+2.4 GHz: v1.6 is 17 % *below* nwrt. Two explanations are available and this
+measurement cannot separate them - v1.6 sits on channel 11 and nwrt on 6, with
+unknown neighbours, and v1.6 has the CPU problem below. Recorded, not concluded.
+
+### v1.6 has no idle CPU, and that turns out to be informative
+
+Freshly flashed, nothing configured, 24 minutes up:
 
 ```
-nwrt   Memory: 173916K / 184320K available,  10404K reserved
-this   Memory: 174348K / 262144K available,  86216K reserved
+$ cat /proc/loadavg
+7.48 6.21 4.24
+$ top -bn1
+CPU:  50% usr  50% sys   0% nic   0% idle   0% io   0% irq   0% sirq
+  11801 root R 23% hostapd_cli -i ath0 -a /lib/wifi/wps-hostapd-update-uci -B
+  12640 root R 18% hostapd_cli -i ath1 -a /lib/wifi/wps-hostapd-update-uci -B
+  14058 root R 18% hostapd_cli -i ath0 -a /lib/wifi/wps-hostapd-update-uci -B
+  14903 root R 18% hostapd_cli -i ath1 -a /lib/wifi/wps-hostapd-update-uci -B
 ```
 
-nwrt's kernel is handed 180 MB and reserves 10; this one is handed the whole
-256 MB and reserves 86. Both land within 500 kB of the same MemTotal, so the
-earlier claim here that the reserved layout is "the same" was only true of the
-wcss span - the accounting is not.
+Four stuck `hostapd_cli`, two per radio, burning about 80 % of two cores. Same
+four PIDs 30 s later, so it is a hang and not a spawn loop. The `idle` field of
+`/proc/stat` gained **0** over a 20 s window; an idle control run confirmed the
+counter works and the box really is saturated.
 
-MemAvailable read 35,040 kB on nwrt against 39,156 kB here, but both move with
-page cache and uptime and neither was idle for long, so treat that as "the same
-order" rather than a win.
+So nwrt's busy/(busy+idle) has a zero denominator on v1.6 and yields no
+comparable number. What is still readable is the interrupt-side increment:
+
+| | idle | during 523 Mbit/s | marginal |
+|---|---|---|---|
+| v1.6 irq+softirq | 137 / 4010 = 3.4 % | 431 / 4004 = 10.8 % | **+7.4 pp** |
+| nwrt irq+softirq | (4650 jiffies of idle headroom) | 538 / 5540 = 9.7 % | - |
+
+The accident is worth more than the measurement it cost. **v1.6 reaches
+730 Mbit/s with both cores already pinned by userspace**, level with an nwrt
+that has cores to spare. Forwarding is demonstrably not going through the host
+CPU on either - which is the claim NSS offload exists to make, tested here by
+something nobody designed.
+
+### rx_desc_alloc_fail is a tuning signal, not a health signal
+
+During the 5 GHz run on v1.6:
+
+```
+wifili[0]_reo_reaped         = 70853
+wifili[0]_rx_deliverd        = 70853      <- equal, nothing lost on delivery
+wifili[0]_rx_desc_alloc_fail = 29684      <- 42 % of reaped
+```
+
+Both counters freeze together when traffic stops, so those failures are from
+the transfer, not a burst at boot. The closed driver runs at 42 % and hits full
+speed.
+
+This build reaches zero by asking for `num_rx_swdesc` 4096 where the vendor
+asks 2048, and zero remains the better outcome. But a non-zero value is not
+evidence of a broken path, and should not be read as one. **`reo_reaped ==
+rx_deliverd` is the line that carries meaning.**
+
+### Configuration
+
+| | v1.6 | nwrt | this build |
+|---|---|---|---|
+| `n2h_empty_pool_buf_core0` | 4096 | 4096 | 4096 |
+| `n2h_high_water_core0` | **16336** | **16336** | **4096** |
+| `extra_pbuf_core0` | 802816 | 802816 | 802816 |
+| `vm.min_free_kbytes` | **1640** (kernel default) | 16384 | 8192 |
+| `dev.nss.general.redirect` | 1 | 1 | 0 |
+| `bridge-nf-call-iptables` | 0 | 1 | absent |
+| thermal zones | 4, tsens, **bare °C** | 4, tsens, **m°C** | 1 defined, unverified at runtime |
+
+Both references run `high_water` 16336 against a 4096 pool; only this build
+lowers it. The 7 MB that change bought (MemFree 28.5 to 35.3) is real and
+measured, but it is now two to one against, on their reasoning rather than
+ours. **Recorded, not reverted.**
+
+The thermal unit changed between 4.4 and 5.4 - v1.6 returns `67`, nwrt returns
+`59000`. Any status display has to branch on that rather than dividing by 1000.
+
+### Memory
+
+| | v1.6 | nwrt | this build |
+|---|---|---|---|
+| MemTotal | 169,232 kB | 174,188 | 176,888 |
+| MemFree | 32,920 / 28,232 | 27,296 | 27,968-31,892 |
+| **MemAvailable** | **72,568 / 69,404** | 35,040 | 39,156 |
+| Slab / SUnreclaim | 48,648 / 44,556 | 58,204 / 50,928 | 55,0xx / 49,2xx |
+
+v1.6 has the lowest MemTotal of the three and nearly double the MemAvailable.
+Keeping `min_free_kbytes` at the kernel's 1640 is one contributor and the
+smaller 4.4 kernel with less slab is another; no full accounting was done, so
+no single cause is claimed here.
+
+The remembered "the vendor still had thirty-odd MB" matches v1.6's **MemFree**
+of 28-33 MB, and this build's MemFree is 28-32 MB - that comparison is level.
+What separates them is MemAvailable.
+
+4.4 does not print the `Memory: xxxK/yyyK available` line, so reserved memory
+cannot be compared line for line with the other two. What it does print is
+`avl 185544704` - 181,196 KiB - so roughly 75 MB is taken before Linux starts.
+
+### Boot order
+
+```
+v1.6   ... S16qca-ssdk  S19cnss_diag  [S19qca-nss-ecm]  S20network ...
+       ... S60dnsmasq  [S70qca-nss-drv]  S75mcsd ...
+nwrt   ... S16qca-ssdk  S19cnss_diag  S22qcawifi-legacy  [S26qca-nss-ecm] ...
+this   ... [S26 nss-ecm] ...  S99 nss-offload
+```
+
+v1.6 starts ECM at **S19, ahead of `S20network`** - earlier than nwrt's S26,
+which this build was moved to match. The two references disagree, so there is
+no single "vendor position" to align on, and S26 stays.
+
+v1.6 has no `S22qcawifi-legacy`; hostapd starts the radios at S15 with
+`S00wifi_fw_mount` / `S96wifi_fw_done` bracketing. Module order
+`30-qca-ssdk-nohnat -> 31-qca-nss-dp -> 32-qca-nss-drv` matches nwrt. v1.6 has
+no `09-qca-nss-sfe`.
+
+### The LuCI readouts are nwrt's work, not the vendor's
+
+```
+/www/luci-static/resources/view/status/include/10_system.js
+  1682 bytes, Mar 4 2023, md5 5e0bd883179223bdde8d7dcd5330f0d5   <- stock
+/usr/libexec/rpcd/  contains only luci                            <- no argon
+```
+
+v1.6 shows no CPU model, temperature or NSS utilisation, and could not show the
+last of them if it wanted to:
+
+```
+/proc/sys/dev/nss/clock/inst_per_sec  = (empty)
+/proc/sys/dev/nss/clock/current_freq  = (empty)
+/proc/sys/dev/nss/clock/freq_table    = (empty)
+```
+
+Those are populated on nwrt. The NSS utilisation figure is something the 12.5
+firmware provides and 11.4 does not - so the data source is a thing this build
+already has. What is missing here is still only the presentation layer.
 
 ### Still missing
 

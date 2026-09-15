@@ -32,25 +32,34 @@ it.
 
 The 5 GHz row predates the NSS firmware moving from 12.2 to 12.5.
 
-The vendor column has gaps because nwrt was not measured for every row at the
-time. It has since been flashed onto this board and measured properly - same
-client, same server, same afternoon - but with four parallel HTTP streams
-rather than iperf3, so those numbers go in their own table instead of into the
-empty cells above:
+That column has gaps because the reference images were not measured for every
+row at the time. Both v1.6 and nwrt have since been flashed onto this board and
+measured properly - same client, same server, same afternoon - but with four
+parallel HTTP streams rather than iperf3, so those numbers go in their own
+table instead of into the empty cells above:
 
-| four parallel HTTP streams, 20 s | nwrt | this build |
-|---|---|---|
-| wired LAN → WAN | 901.8 Mbit/s | 900.9 |
-| **5 GHz LAN → WAN** | **722** | 425 |
-| 2.4 GHz LAN → WAN | 119.4 | not yet measured this way |
-| host CPU during 5 GHz | 16.1 % | not yet measured this way |
+| four parallel HTTP streams, 20 s | v1.6 | nwrt | this build |
+|---|---|---|---|
+| wired LAN → WAN | **912.1** | 901.8 | 900.9 |
+| **5 GHz LAN → WAN** | **730** | **722** | 425 |
+| 2.4 GHz LAN → WAN | 98.8 | **119.4** | not yet measured this way |
+| host CPU during 5 GHz | not measurable, see below | 16.1 % | not yet measured this way |
 
-The 5 GHz gap is mostly channel width and not a mystery: nwrt runs the QCN6122
-at **160 MHz** and the client associates at 1922 Mbit/s, ath11k runs it at
-80 MHz and the same client associates at 1201. It costs nwrt 16 % of two host
-cores to do it. [docs/WIFILI.md](docs/WIFILI.md) has the rest, including the
-configuration differences and the one place this build diverges from the vendor
-on purpose.
+Neither reference is an unmodified OEM image: v1.6 is a community build on the
+vendor's 4.4 SDK, nwrt one on 5.4, both with the closed qca-wifi driver.
+
+The 5 GHz gap is mostly channel width: both references run **160 MHz** and the
+client associates at 1922-2162 Mbit/s, ath11k runs 80 MHz and the same client
+associates at 1201. v1.6 associates 12 % above nwrt and delivers 1 % more, so
+both have hit the same ceiling.
+
+v1.6's CPU cell is empty because that box has no idle time to begin with - four
+hung `hostapd_cli` processes pin both cores (load average 7.5, 0 % idle). Which
+turns out to prove the point: it still reaches 730 Mbit/s with both cores
+saturated, so the forwarding is not going through the host CPU.
+
+[docs/WIFILI.md](docs/WIFILI.md) has the rest, including the configuration
+differences and the places this build diverges from both references on purpose.
 
 Wired forwarding runs at line rate with the host CPU **completely idle** — the
 packets never enter Linux. **WiFi forwarding now does too**, on both radios and
