@@ -27,6 +27,14 @@ env:
   OPENWRT_REF: ${{ github.event.inputs.openwrt_ref || 'v25.12.5' }}
   TZ: Asia/Shanghai
 
+# One build per branch. A newer push cancels the older run rather than racing
+# it to the Releases page - both would publish with make_latest, and the loser
+# of that race is whichever finishes second, not whichever is newer. Manual
+# runs get their own group per run id so a push cannot cancel them.
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-24.04

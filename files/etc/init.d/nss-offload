@@ -9,7 +9,9 @@
 #                           closes and reopens eth0/eth1 through NSS
 #   2. the N2H buffer tuning, which needs the core already up (the sysctl
 #      handlers send a synchronous message and return -EINVAL on timeout)
-#   3. the ECM stack, with qca-mcs strictly before ecm
+#   3. the ECM stack - which no longer happens here.  It needs none of the
+#      above beyond the module being loaded, so it is /etc/init.d/nss-ecm at
+#      START=26, where the vendor image has it.
 #
 # Self-disarm: boot() arms /etc/nss-boot-pending before loading and a delayed
 # check clears it once eth0 has carrier again.  A boot that hangs, or that
@@ -39,7 +41,7 @@ PBUF_HIGH_WATER=4096
 # rx_desc_alloc_fail, no tx_enqueue_drop, no page-allocation failure.
 PBUF_EMPTY_POOL=4096
 
-nss_log() { logger -t nss-offload "$@"; }
+nss_log() { logger -t nss-offload "[+$(cut -d. -f1 /proc/uptime)s] $@"; }
 
 nss_load() {
 	# qca-nss-drv is loaded by kmodloader from /etc/modules.d/32-qca-nss-drv
@@ -70,13 +72,6 @@ nss_load() {
 	echo $PBUF_HIGH_WATER > /proc/sys/dev/nss/n2hcfg/n2h_high_water_core0 2>/dev/null
 	nss_log "pbuf: extra=$(cat /proc/sys/dev/nss/n2hcfg/extra_pbuf_core0 2>/dev/null) high_water=$(cat /proc/sys/dev/nss/n2hcfg/n2h_high_water_core0 2>/dev/null) empty_pool=$(cat /proc/sys/dev/nss/n2hcfg/n2h_empty_pool_buf_core0 2>/dev/null)"
 
-	# qca-mcs must be in place before ecm: ecm's multicast front end binds to
-	# it at init and silently loses multicast acceleration otherwise.
-	for m in qca-mcs qca-nss-pppoe qca-nss-vlan qca-nss-qdisc ecm; do
-		insmod $m 2>/dev/null || nss_log "insmod $m failed (continuing)"
-	done
-
-	nss_log "loaded: $(lsmod | awk 'NR>1{print $1}' | grep -cE 'nss|ecm|mcs') modules"
 	return 0
 }
 
@@ -107,7 +102,7 @@ nss_confirm() {
 	  esac
 
 	  if [ "$ok" = 1 ]; then
-		rm -f "$FLAG" /etc/nss-wifi-pending; sync
+		rm -f "$FLAG"; sync
 		if [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "1" ]; then
 			nss_log "confirmed: NSS core up, eth0 up with carrier - offload kept"
 		else

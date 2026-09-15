@@ -1,3 +1,16 @@
+# ARCHIVED - not installed into the image.
+#
+# This guarded the boot-time WiFi handover while it was new: a boot that armed
+# the handover and never reported healthy left /etc/nss-wifi-pending behind, and
+# the next boot rewrote 34-ath11k-nss without the offload parameters. The
+# handover has since been stable across many boots, so it is no longer shipped -
+# it costs a flag file write on every boot and can disable the feature on a
+# single bad reading.
+#
+# To put it back: copy this to files/etc/init.d/nss-failsafe, make it
+# executable, and rebuild. It needs no other change; nss-offload still clears
+# /etc/nss-wifi-pending when it confirms.
+#
 #!/bin/sh /etc/rc.common
 # Disarm the boot-time WiFi handover if the previous boot never confirmed.
 #

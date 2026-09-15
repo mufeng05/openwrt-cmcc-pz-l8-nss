@@ -1,0 +1,45 @@
+#!/bin/sh /etc/rc.common
+# Load the NSS ECM stack.
+#
+# START=26 is where the vendor image has it - its boot runs S16qca-ssdk,
+# S22qcawifi-legacy, S26qca-nss-ecm - and there is nothing here that has to wait
+# any longer than that. qca-nss-drv is already loaded: kmodloader brings it up
+# from /etc/modules.d/32-qca-nss-drv during /etc/init.d/boot at START=10.
+#
+# These modules only register with qca-nss-drv; they do not exchange messages
+# with the NSS core, so unlike the n2h tuning in nss-offload they do not have to
+# wait for it to finish booting. That tuning is why this used to sit at START=99
+# behind it, which put the stack 49 s into a boot where the core was ready at 20.
+START=26
+
+nss_log() { logger -t nss-ecm "[+$(cut -d. -f1 /proc/uptime)s] $@"; }
+
+boot() {
+	[ -f /etc/nss-disabled ] && {
+		nss_log "disabled (/etc/nss-disabled); rm it and reboot to re-arm"
+		return 0
+	}
+
+	# kmodloader runs at START=10, so this should never spin; it is here so a
+	# reordering shows up in the log rather than as a silent missing stack.
+	local i=0
+	while [ $i -lt 10 ]; do
+		lsmod | grep -q '^qca_nss_drv' && break
+		i=$((i + 1)); sleep 1
+	done
+	lsmod | grep -q '^qca_nss_drv' || {
+		nss_log "qca-nss-drv is not loaded - not loading the ECM stack"
+		return 1
+	}
+
+	# qca-mcs must be in place before ecm: ecm's multicast front end binds to
+	# it at init and silently loses multicast acceleration otherwise.
+	for m in qca-mcs qca-nss-pppoe qca-nss-vlan qca-nss-qdisc ecm; do
+		insmod $m 2>/dev/null || nss_log "insmod $m failed (continuing)"
+	done
+
+	nss_log "ECM stack loaded: $(lsmod | awk 'NR>1{print $1}' | grep -cE 'nss|ecm|mcs') modules"
+}
+
+start() { :; }
+stop() { :; }
