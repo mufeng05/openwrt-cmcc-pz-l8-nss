@@ -1445,6 +1445,103 @@ It also does not close the comparison honestly: the references were measured at
 20 MHz because they obeyed the rule this setting breaks. Whether they would
 gain the same 50 % with `noscan` was not tested.
 
+### Is the 160 MHz CAC avoidable
+
+Not in any way this build can reach.
+
+**No contiguous 160 MHz channel anywhere avoids DFS.** The non-DFS blocks are
+not wide enough to hold one:
+
+| block | width | DFS |
+|---|---|---|
+| 5150-5250 (UNII-1, ch36-48) | 100 MHz | no |
+| 5250-5350 (UNII-2A, ch52-64) | 100 MHz | **yes** |
+| 5725-5850 (UNII-3 / CN, ch149-165) | 125 MHz | no |
+
+160 MHz needs 160 contiguous, so every 160 MHz channel in 5 GHz spans into
+5250-5350 or 5470-5725. The CAC is a regulatory requirement on that spectrum,
+not a driver choice, and mac80211 does not persist a completed CAC across
+reboots.
+
+**The one architectural escape is 80+80**, two non-contiguous 80 MHz segments
+that can both sit outside DFS - ch36-48 centred on 5210 plus ch149-161 centred
+on 5775. The radio supports it; `iw phy0 info` reports
+`Supported Channel Width: 160 MHz, 80+80 MHz`, `HE160/HE80+80/5GHz`, and both
+RX and TX MCS sets for 80+80. So does the vendor driver: v1.6's detect script
+has an `ht80_80` branch that sets `htmode="HT80_80"`.
+
+What is missing is the configuration path. OpenWrt's
+`/lib/netifd/wireless/mac80211.sh` knows `HE20`, `HE40`, `HE80`, `HE160` and
+`NOHT` and has no 80+80 mode at all, so reaching it means patching the htmode
+handling and the hostapd config generation. Client support is the other half
+and was not tested here.
+
+**What is left is the trade.** Channel 36 at HE80 is 5170-5250, entirely inside
+the non-DFS block, and beacons immediately:
+
+| | first beacon | 5 GHz throughput |
+|---|---|---|
+| ch36 HE80 | immediate | 462 Mbit/s |
+| ch36 HE160 | after CAC, ~60 s | **697** |
+
+Only the 5 GHz radio waits; 2.4 GHz is unaffected and comes up first. And it is
+a per-boot cost, not a running one.
+
+### How the reference images bring Wi-Fi up
+
+Neither ships `/etc/config/wireless` in its rootfs. Both patch the vendor's
+detect script so that the config it generates on first boot is already enabled.
+
+**nwrt**, in `/lib/wifi/qcawificfg80211.sh`:
+
+```sh
+2.4 GHz:  htmode=HT40   channel=6    ssid=Nwrt_2.4G_0
+5 GHz:    htmode=HT160  channel=40   ssid=Nwrt_5G_1
+set wireless.wifi${devidx}.disabled=0
+set wireless.wifinet${devidx}.encryption=psk2+ccmp
+set wireless.wifinet${devidx}.key='12345678'
+```
+
+Channels are hardcoded, not ACS.
+
+**v1.6** reads its defaults out of `/etc/config/sysinfo`, which the image ships:
+
+```
+config wificfg 'wifi'
+    option ssidprefix2 'Router-Pzl8_2.4G_ap'
+    option ssidprefix5 'Router-Pzl8_5G_ap'
+    option pwd '12345678'
+    option defch2 '0'      # 0 = ACS
+    option defch5 '0'
+    option ht160 '1'
+```
+
+The SSID is the prefix plus the last two bytes of the MAC, which is where
+`Router-Pzl8_5G_ap8F79` comes from. Both channels are ACS; `ht160 '1'` selects
+HT160, and ACS placed it on channel 60. The script's fallback when `defch5` is
+unset is channel **149 at HT80** - non-DFS, no CAC - but this image overrides it
+to ACS with 160 MHz, which lands on DFS spectrum.
+
+Three things follow.
+
+**Both ship the same fixed key, `12345678`.** A published image with a known key
+is not something this project invented; it is what both references do. It is
+still worth changing on any of them.
+
+**Both run 160 MHz on channels that span DFS** - nwrt fixed at 40, v1.6 wherever
+ACS puts it, which was 60. So both are on spectrum that requires a CAC.
+
+**Whether they actually perform one was not measured.** Their DFS handling is
+inside the closed driver rather than mac80211, and nothing in their scripts
+settles it. The observable that would is boot-to-first-beacon on 5 GHz: a
+compliant implementation cannot beacon for 60 s. That needs one of them flashed
+and timed, which has not been done.
+
+This build ships a file rather than patching a detect script, because ath11k
+goes through OpenWrt's own `wifi config`, and `mac80211.uc`'s `radio_exists()`
+skips radios whose `path` already appears - verified on a cold boot, two
+wifi-device sections and no duplicates.
+
 ### Where high_water ended up
 
 Restored to the vendor's **16336**, matching both reference images, in
