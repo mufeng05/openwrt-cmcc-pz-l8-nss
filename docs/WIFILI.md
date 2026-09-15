@@ -921,12 +921,26 @@ What it does do, on the `MP_256` device-tree marker, is four things:
 | disables the skb recycler | `max_skbs=512`, `skb_recycler_enable=0`. Not a feature this build has, so there is nothing to disable and nothing being paid |
 | disables coldboot calibration | already off for IPQ5018 here, via `907` |
 
-So the configuration is not where the difference is. The third row is, and it
-says so out loud: on a 256 MB board the closed driver will not run its own
-datapath, only NSS's. ath11k allocates its host datapath either way, because
-the offload was added to a driver designed to own one - which is visible from
-the other end in this tree as well, where every host REO and WBM ring reads
-zero interrupts and is nonetheless allocated and sized.
+So the configuration is not where the difference is. The third row is the
+closest thing to an answer, but it is worth being
+careful about what it implies here. On a 256 MB board the closed driver will
+not run its own datapath, only NSS's.
+
+It does not follow that this tree's host rings are waste. `ath11k_nss_fill_srng()`
+copies `srng->ring_base_paddr` out of ath11k's own rings into the wifili init
+message, so NSS reads and writes *those* rings - the REO and WBM rings that
+read zero interrupts are being used, by the other processor. Zero interrupts
+means the host is not servicing them, which is the point of the offload, not
+that the memory behind them is idle. The same goes for the link descriptor
+pool, which is exactly what `NSS_WIFILI_LINK_DESC_INFO_MSG` hands back into.
+
+So the honest position on "ath11k allocates a datapath the closed driver does
+not" is that it is true of the *structure* - ath11k is a driver that owns a
+datapath, with an offload bolted on - but that most of the 46 MB is shared
+with NSS rather than dead, and no large easy saving has been identified in it.
+What the host does hold on its own is the monitor rings, already 128 entries
+after `990`, and the Rx refill pool, which `nss_refill_hold` stops it from
+filling.
 
 Measured here, with page cache held constant across the unload so the figure
 is clean: ath11k is 46.2 MB, and only 6.6 MB of that is slab. Of the rest,
