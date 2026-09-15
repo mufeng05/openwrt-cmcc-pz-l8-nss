@@ -1322,6 +1322,81 @@ register normally. Over the 160 MHz runs: 5,692,465 packets sent, zero
 reaped, zero `reo_error`, zero `rx_desc_alloc_fail`, zero radar events, zero
 call traces.
 
+### Why 2.4 GHz associates below both references
+
+The three association rates decode to HE20, two spatial streams, 0.8 us guard
+interval, and differ only in MCS index:
+
+| | rate | MCS |
+|---|---|---|
+| this build | 155 / 172 | **6 / 7** |
+| nwrt | 206 | 8 |
+| v1.6 | 287 | **11** |
+
+So the question is narrow: why does the downlink settle at MCS 6-7. Three
+things it is not.
+
+**Not a capability limit.** The AP advertises, for the AP iftype on band 1,
+`1 streams: MCS 0-11` and `2 streams: MCS 0-11`. The firmware's own transmit
+histogram confirms it uses what it advertises: `tx_nss` is 60101 at two streams
+against 1116 at one, `tx_bw` is entirely 20 MHz, and every count sits in
+`tx_gi[0]`, the 0.8 us bucket.
+
+**Not signal.** -42 to -47 dBm against a -101 dBm noise floor, the strongest of
+the three measurements; `ack_rssi` 96.
+
+**Not a refusal to try high MCS.** From `htt_stats` type 9 on the 2.4 GHz
+radio:
+
+```
+tx_mcs = 0:0, 1:0, 2:24, 3:253, 4:1457, 5:6360, 6:18444, 7:33218,
+         8:1370, 9:9, 10:26, 11:56
+```
+
+It reaches for 9, 10 and 11 and retreats - 91 PPDUs out of 61,217, 0.15 %.
+
+**What it is: the medium.** From `htt_stats` type 1 on the same radio:
+
+```
+mpdu_count_tqm   = 859646
+mpdus_ack_failed = 116063     <- 13.5 % of MPDUs never acknowledged
+mpdu_requeued    = 189372     <- 22 %
+tx_xretry        =  11361
+rts_cnt = 14977, rts_success = 12770   <- 14.7 % of RTS attempts fail
+```
+
+with the channel measured at 44 % busy on 11 and 58 % on 6, almost none of it
+ours, and 16 of the 25 neighbouring APs in range sitting on channel 11. At a
+13.5 % loss rate MCS 6-7 is the correct choice; a higher index loses more than
+it gains.
+
+**The control that makes this an answer rather than a guess** is the 5 GHz
+radio - same build, same driver, same rate control, quieter air:
+
+```
+tx_mcs = ... 6:1447, 7:70201, 8:4082, 9:2800, 10:5833, 11:2616
+```
+
+13 % of PPDUs at MCS 9-11. The rate control is not capped and not broken; on
+2.4 GHz it is answering a link that drops one frame in seven.
+
+Moving the radio from channel 11 (16 neighbouring APs) to channel 6 (about 4)
+changed the throughput from 75.0 to 74.9 Mbit/s and left the downlink at MCS7.
+The whole band is saturated at this location, not just one channel.
+
+**What this does not establish.** v1.6 and nwrt were measured hours earlier, in
+air that was not sampled at the time, and their loss statistics were never
+captured. A residual difference in how aggressively their rate control chases
+high MCS cannot be ruled out from these data - only that this build's choice is
+a response to measured loss rather than a configuration defect.
+
+**A tooling note worth keeping.** `iw dev <ap> station dump` reports
+`tx packets: 0` and `tx retries: 0` for a station that has just pulled several
+GB, because the transmit path is offloaded and never passes the host's
+per-station counters. Its `tx bitrate` line does track the real rate (the
+firmware reports completions back), but the packet and retry counts are not
+usable. `htt_stats` is the instrument for anything on the transmit side.
+
 ### Where high_water ended up
 
 Restored to the vendor's **16336**, matching both reference images, in
