@@ -979,6 +979,95 @@ Eight rounds of saturating Wi-Fi on the final configuration: 368 to 479
 Mbit/s, median 425, which is the session's normal band. Zero page-allocation
 failures, zero `rx_desc_alloc_fail`, zero `tx_enqueue_drop`, zero call traces.
 
+## The vendor image, measured rather than remembered
+
+Everything here was taken on this board with nwrt flashed over it, no config
+kept beyond setting the LAN address, on the same afternoon as the corresponding
+figures for this build - same client (one Intel AX201), same server, same four
+parallel HTTP streams of 20 s, same host route forcing the traffic through the
+router. The numbers in README.md's table predate this and were taken with
+iperf3; these are not those, and the two should not be mixed.
+
+### What it is
+
+| | nwrt | this build |
+|---|---|---|
+| kernel | 5.4.250, **armv7l** | 6.12.94, aarch64 |
+| OpenWrt | 23.05-SNAPSHOT | 25.12.5 |
+| WiFi driver | closed qca-wifi, started from userspace at S22 | ath11k, offload inside the QMI worker |
+| NSS firmware | **12.5-210**, md5 b3d25c97 | **12.5-210, byte-identical** |
+
+That last row settles something. The firmware package's help said 12.2-156 was
+the only line that accepted VAP allocation on IPQ5018, and this project shipped
+12.2 on that basis for a long time. The vendor image for this exact board ships
+12.5-210.
+
+### Throughput
+
+| | nwrt | this build |
+|---|---|---|
+| wired LAN to WAN | 901.8 Mbit/s | 900.9 |
+| **5 GHz LAN to WAN** | **722** (718-728) | 425 (368-530) |
+| 2.4 GHz LAN to WAN | 119.4 (119-122) | not yet measured this way |
+| host CPU during 5 GHz | **16.1 %** at 537 Mbit/s single stream | not yet measured this way |
+
+Wired is a tie, and both are at the client NIC's line rate rather than the
+router's limit.
+
+5 GHz is not a tie, and the reason is visible in the association: nwrt runs the
+QCN6122 at **160 MHz** (channel 40, HT160) and the client associates at 1922
+Mbit/s. ath11k runs the same radio at 80 MHz and the same client associates at
+1201. 722/425 is 1.70 against a bandwidth ratio of 2.0, so the channel width
+accounts for most of the gap and there is no second mystery to chase.
+
+Two things beside the medians are worth noting. nwrt's spread is 718-728, a
+±0.7 % band, against ±20 % here - that is a rate-control or scheduling
+difference and it is not explained by bandwidth. And nwrt spends 16.1 % of two
+host cores to do it, where this build's wired and bridged figures are under
+2 %; the CPU comparison is not like-for-like yet, because the 16.1 % is 5 GHz
+to WAN and the sub-2 % numbers here are wired and bridged.
+
+### Configuration differences that are not throughput
+
+| | nwrt | this build | |
+|---|---|---|---|
+| `n2h_empty_pool_buf_core0` | 4096 | 4096 | agrees |
+| `n2h_high_water_core0` | **16336** | **4096** | we diverge |
+| `extra_pbuf_core0` | 802816 | 802816 | agrees |
+| `vm.min_free_kbytes` | 16384 | 8192 | we diverge |
+| `dev.nss.general.redirect` | 1 | 0 | only gates nss_virt_if, unused here |
+| `bridge-nf-call-iptables` | 1, bridge netfilter built in | absent entirely | |
+| thermal zones | 4, tsens, 59-62 C | 1 (`cpu-thermal`), unverified at runtime | |
+
+The high water mark is the one to look at again. This build lowered it to match
+the pool on the reasoning that a mark above the cap makes the firmware grow
+past it, which it measurably does - 28.5 MB free against 35.3. The vendor
+nevertheless runs 4096 with 16336, which is the combination that costs the
+memory. Whether they have a reason beyond inertia is not visible from here.
+
+### Memory, which is the same total by different arithmetic
+
+```
+nwrt   Memory: 173916K / 184320K available,  10404K reserved
+this   Memory: 174348K / 262144K available,  86216K reserved
+```
+
+nwrt's kernel is handed 180 MB and reserves 10; this one is handed the whole
+256 MB and reserves 86. Both land within 500 kB of the same MemTotal, so the
+earlier claim here that the reserved layout is "the same" was only true of the
+wcss span - the accounting is not.
+
+MemAvailable read 35,040 kB on nwrt against 39,156 kB here, but both move with
+page cache and uptime and neither was idle for long, so treat that as "the same
+order" rather than a win.
+
+### Still missing
+
+Measuring these needs this build back on the board: its 2.4 GHz by the same
+four-stream method, its host CPU during 5 GHz to WAN, and whether
+`/sys/class/thermal/thermal_zone0/temp` actually appears - the tsens node and
+`CONFIG_QCOM_TSENS=y` are both present, but that has not been seen at runtime.
+
 ## Known limitations
 
 - **`tx failed` reads zero.** `tx retries` is real - 24566 over a run - but it
