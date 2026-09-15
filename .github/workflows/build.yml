@@ -130,7 +130,9 @@ jobs:
             echo "project_commit=$(git -C "$GITHUB_WORKSPACE/pzl8-nss" rev-parse --short HEAD)"
             echo "date=$(date -u '+%Y-%m-%d %H:%M UTC')"
           } | tee "$GITHUB_WORKSPACE/build-info.txt"
-          echo "DATE=$(date '+%Y%m%d_%H%M')" >> "$GITHUB_ENV"
+          # Seconds, because this is the tag: at minute resolution two runs
+          # finishing in the same minute ask GitHub for the same tag name.
+          echo "DATE=$(date '+%Y%m%d_%H%M%S')" >> "$GITHUB_ENV"
           echo "FIRMWARE=$GITHUB_WORKSPACE/openwrt/bin/targets/qualcommax/ipq50xx" >> "$GITHUB_ENV"
 
       - name: List what was produced
@@ -187,7 +189,7 @@ jobs:
           (github.event_name == 'push' ||
            (github.event_name == 'workflow_dispatch' &&
             github.event.inputs.make_release == 'true'))
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3.0.3
         with:
           tag_name: build-${{ env.DATE }}
           name: CMCC PZ-L8 NSS ${{ env.DATE }}
