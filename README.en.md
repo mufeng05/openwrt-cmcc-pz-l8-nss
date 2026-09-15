@@ -40,10 +40,17 @@ table instead of into the empty cells above:
 
 | four parallel HTTP streams, 20 s | v1.6 | nwrt | this build |
 |---|---|---|---|
-| wired LAN → WAN | **912.1** | 901.8 | 900.9 |
-| **5 GHz LAN → WAN** | **730** | **722** | 425 |
-| 2.4 GHz LAN → WAN | 98.8 | **119.4** | not yet measured this way |
-| host CPU during 5 GHz | not measurable, see below | 16.1 % | not yet measured this way |
+| wired LAN → WAN | 912.1 | 901.8 | **912.6** |
+| **5 GHz LAN → WAN** | **730** | **722** | 462 |
+| 2.4 GHz LAN → WAN | 98.8 | **119.4** | 75.0 |
+| host CPU during 5 GHz | not measurable, see below | 16.1 % at 537 | **5.9 % at 347** |
+
+This build's column was re-measured after flashing back onto the board, with
+`n2h_high_water_core0` restored to the vendor's 16336. The CPU cell has an idle
+control behind it: 3.1 % with no traffic, 5.9 % during the transfer, so the
+traffic costs +2.8 points. Per Mbit/s that is 0.017 % against nwrt's 0.030 % -
+but nwrt moves those bits over 160 MHz and this build over 80, so it is not a
+like-for-like radio.
 
 Neither reference is an unmodified OEM image: v1.6 is a community build on the
 vendor's 4.4 SDK, nwrt one on 5.4, both with the closed qca-wifi driver.

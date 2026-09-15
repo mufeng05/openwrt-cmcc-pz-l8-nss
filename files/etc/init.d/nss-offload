@@ -25,10 +25,16 @@ STOP=10
 FLAG=/etc/nss-boot-pending
 DISABLED=/etc/nss-disabled
 PBUF_EXTRA=800000        # vendor MP_256 value; 256 MB board
-# Matched to PBUF_EMPTY_POOL below: the firmware grows the pool towards the
-# high water mark, so a mark above the cap simply undoes the cap.  This was
-# 16336, derived when the pool was 8704.
-PBUF_HIGH_WATER=4096
+# The vendor's value, and nwrt's.  This was 4096 for a while, matched to
+# PBUF_EMPTY_POOL below on the reasoning that the firmware grows the pool
+# towards the high water mark, so a mark above the cap undoes the cap.  That is
+# real and measurable - 28.5 MB free against 35.3, about 7 MB.
+#
+# Restored anyway.  Both reference images measured on this board run 16336
+# against a 4096 pool: v1.6 (CMCC 4.4 SDK) and nwrt (5.4).  Two independent
+# builds pay the 7 MB deliberately; being the only one that does not is worth
+# less than the memory saved.
+PBUF_HIGH_WATER=16336
 
 # How many empty skbs the NSS core keeps pooled.  The driver derives this from
 # the compiled memory profile and this build is NSS_MEM_PROFILE_MEDIUM, which

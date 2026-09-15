@@ -1019,16 +1019,25 @@ else's practice.
 
 | | v1.6 | nwrt | this build |
 |---|---|---|---|
-| wired LAN to WAN | **912.1** | 901.8 | 900.9 |
-| **5 GHz LAN to WAN** | **730.3** (720.7-749) | 722 (718-728) | 425 (368-530) |
-| 2.4 GHz LAN to WAN | 98.8 (94.6-101.1) | **119.4** | not yet measured this way |
-| 5 GHz single stream | 523.5 | 537 | - |
+| wired LAN to WAN | 912.1 | 901.8 | **912.6** (912.4-915.8) |
+| **5 GHz LAN to WAN** | **730.3** (720.7-749) | 722 (718-728) | 462 (403-504) |
+| 2.4 GHz LAN to WAN | 98.8 (94.6-101.1) | **119.4** | 75.0 (74.4-75.2) |
+| 5 GHz single stream | 523.5 | 537 | 346.9 |
+| host CPU during 5 GHz | not measurable, see below | 16.1 % at 537 | **5.9 % at 347** |
+
+This build's rows were re-measured after reflashing over v1.6, with
+`n2h_high_water_core0` restored to the vendor's 16336. The 5 GHz median of 462
+sits inside the 368-530 band recorded at 4096 over eight rounds, so four rounds
+at the new setting are not evidence that it changed anything.
 
 | client association | channel | width | rate |
 |---|---|---|---|
-| v1.6 | 60 | **160 MHz** | **2162 Mbps** |
-| nwrt | 40 | 160 MHz | 1922 |
-| this build | 36 | 80 MHz | 1201 |
+| v1.6 5 GHz | 60 | **160 MHz** | **2162 Mbps** |
+| nwrt 5 GHz | 40 | 160 MHz | 1922 |
+| this build 5 GHz | 36 | 80 MHz | 961 under load (1201 seen earlier) |
+| v1.6 2.4 GHz | 11 | 20 MHz | **287** |
+| nwrt 2.4 GHz | 6 | 20 MHz | 206 |
+| this build 2.4 GHz | 11 | 20 MHz | 155 |
 
 Wired is a three-way tie at the client NIC's line rate, so it measures the
 client, not the router.
@@ -1156,33 +1165,120 @@ v1.6 has no `S22qcawifi-legacy`; hostapd starts the radios at S15 with
 `30-qca-ssdk-nohnat -> 31-qca-nss-dp -> 32-qca-nss-drv` matches nwrt. v1.6 has
 no `09-qca-nss-sfe`.
 
-### The LuCI readouts are nwrt's work, not the vendor's
+### The LuCI readouts are nwrt's work, and this build can source all of them
 
 ```
-/www/luci-static/resources/view/status/include/10_system.js
-  1682 bytes, Mar 4 2023, md5 5e0bd883179223bdde8d7dcd5330f0d5   <- stock
-/usr/libexec/rpcd/  contains only luci                            <- no argon
+v1.6: /www/luci-static/.../status/include/10_system.js
+      1682 bytes, Mar 4 2023, md5 5e0bd883179223bdde8d7dcd5330f0d5   <- stock
+      /usr/libexec/rpcd/ contains only luci                          <- no argon
 ```
 
-v1.6 shows no CPU model, temperature or NSS utilisation, and could not show the
-last of them if it wanted to:
+v1.6 shows no CPU model, temperature or NSS utilisation. So the three readouts
+are nwrt's own modification, not something the vendor line provides.
+
+Every one of them is readable on this build:
+
+| readout | source here | value |
+|---|---|---|
+| CPU cores / clock / governor | cpufreq sysfs | 2, 1008 MHz, `schedutil` |
+| CPU model string | **not in `/proc/cpuinfo`** - aarch64 has no `model name`. `/proc/device-tree/cpus/cpu@0/compatible` gives `arm,cortex-a53`; cpuinfo has implementer `0x51`, part `0x801` | |
+| CPU temperature | `/sys/class/thermal/thermal_zone1` (`cpu-thermal`) | 63-65 °C |
+| **WiFi temperature** | **`ath11k_hwmon` at hwmon4 / hwmon5, one per radio** | phy0 71-73 °C, phy1 62-63 °C |
+| **NSS / PPE utilisation** | **`/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi`** | `Min 0% Avg 4% Max 16%` |
+
+**Correction.** This section previously named
+`/proc/sys/dev/nss/clock/inst_per_sec` as the NSS source and said it is
+populated on nwrt. It reads empty here and on v1.6, and it was never read on
+nwrt - only the directory listing was recorded, so the claim had no measurement
+behind it. `cpu_load_ubi` reports averaged core utilisation over one second and
+its output has exactly the shape nwrt displays; that is the source this build
+would use. `dmesg` explains the empty sysctl: this board reports
+`Frequency Supported -` with an empty table, where v1.6 lists two OPPs.
+
+The WiFi row is the one where this build is ahead. nwrt has no standard hwmon
+for its radios at all - `find /sys -name 'temp*_input'` comes back empty and its
+figure comes out of the closed driver's own channel. ath11k registers a proper
+hwmon per radio.
+
+So what is missing here is still only the presentation layer: stock
+`luci-mod-status` with the bootstrap theme does not draw any of it.
+
+### The gaps, now measured
+
+All three were taken with this build back on the board, `high_water` at 16336,
+both radios up, same rig as the references.
+
+**2.4 GHz, four parallel streams: 75.0 Mbit/s** (74.4 / 75.0 / 75.2 - a ±0.5 %
+band, the tightest of any run in this file). Channel 11 HE20, deliberately the
+same channel as v1.6 so that one comparison is clean. It is the lowest of the
+three: 75.0 against v1.6's 98.8 on the same channel and nwrt's 119.4 on 6.
+
+The association rate goes with it - 155 Mbps where v1.6 gets 287 and nwrt 206,
+all at 20 MHz. The gap is in the rate the client negotiates, not in the
+forwarding path, and diagnosing it is separate work.
+
+**Host CPU during 5 GHz, with an idle control** - the control matters, because
+without one on v1.6 there would have been no way to tell a busy box from a
+broken counter:
+
+| | busy jiffies | total | CPU |
+|---|---|---|---|
+| idle, no traffic | 118 | 3766 | **3.13 %** |
+| 346.9 Mbit/s single stream | 220 | 3740 | **5.88 %** |
+
+The traffic costs **+2.75 points** of two cores. nwrt's comparable figure is
+16.1 % at 537 Mbit/s. Per Mbit/s that is 0.017 % here against 0.030 % there,
+so roughly 1.8x the work per bit on nwrt - though nwrt is moving those bits
+over 160 MHz and this build over 80, which is not a like-for-like radio.
+
+**Thermal at runtime: yes, and more than was expected.** Four zones, all in
+millidegrees:
 
 ```
-/proc/sys/dev/nss/clock/inst_per_sec  = (empty)
-/proc/sys/dev/nss/clock/current_freq  = (empty)
-/proc/sys/dev/nss/clock/freq_table    = (empty)
+ubi32-thermal 63000   cpu-thermal 65000   top-glue-thermal 62000   gephy-thermal 64000
 ```
 
-Those are populated on nwrt. The NSS utilisation figure is something the 12.5
-firmware provides and 11.4 does not - so the data source is a thing this build
-already has. What is missing here is still only the presentation layer.
+plus six hwmon devices, two of which are `ath11k_hwmon`. The earlier note that
+only one zone (`cpu-thermal`) was defined and unverified is superseded.
 
-### Still missing
+### Where high_water ended up
 
-Measuring these needs this build back on the board: its 2.4 GHz by the same
-four-stream method, its host CPU during 5 GHz to WAN, and whether
-`/sys/class/thermal/thermal_zone0/temp` actually appears - the tsens node and
-`CONFIG_QCOM_TSENS=y` are both present, but that has not been seen at runtime.
+Restored to the vendor's **16336**, matching both reference images, in
+`files/etc/init.d/nss-offload`.
+
+The 7 MB that lowering it was said to buy did not reproduce. MemAvailable at
+16336, sampled four times across the test session: 44,976 / 34,468 / 38,992 /
+35,540 kB. The figure recorded at 4096 was 39,156. Those overlap completely,
+and the original 28.5-against-35.3 comparison was a pair of single samples of a
+quantity that moves by 10 MB on its own. A real answer needs an A/B with a
+reboot on each setting, which has not been run.
+
+### State after the reflash
+
+Both radios hand over, which dmesg names explicitly:
+
+```
+ath11k c000000.wifi: nss: radio if=28 scheme_id=1 priority=low
+ath11k c000000.wifi: nss: slot 0 data path is NSS-owned
+ath11k b00a040.wifi: nss: radio if=29 scheme_id=0 priority=high
+ath11k b00a040.wifi: nss: slot 1 data path is NSS-owned
+```
+
+so slot 0 is the 2.4 GHz IPQ5018 radio on the low-priority scheme and slot 1 the
+5 GHz QCN6122 on high, which is what the priority helper is meant to do.
+
+Aggregate wifili counters over the whole session - note these are the second
+block in that file; the first is indexed by SoC slot and reading only the top of
+the file understates it:
+
+```
+tx_enqueue 3985043   tx_sent_count 3985047   tx_enqueue_drop 0   tx_hw_enqueue_fail 0
+reo_reaped  334002   rx_desc_alloc_fail  0   reo_error 0         tcl_ring_full 0
+wifili_wbm_src_reo_code_inv 26
+```
+
+ECM held 94 connections. Zero page-allocation failures and zero call traces.
+`rx_desc_alloc_fail` stays at 0 where the closed driver runs 42 %.
 
 ## Known limitations
 
