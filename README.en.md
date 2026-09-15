@@ -105,10 +105,16 @@ A fresh flash is connectable without going through LuCI first:
 
 | | SSID | channel | width |
 |---|---|---|---|
-| 2.4 GHz | `PZ-L8-2G` | auto (ACS) | asks for HE40, usually settles at 20 MHz |
-| 5 GHz | `PZ-L8-5G` | 36 | **HE160 (160 MHz)** |
+| 2.4 GHz | `PZ-L8-2G-XXXX` | auto (ACS) | asks for HE40, usually settles at 20 MHz |
+| 5 GHz | `PZ-L8-5G-XXXX` | 36 | **HE160 (160 MHz)** |
 
 Encryption `psk2+ccmp`, key `pzl8test2026`.
+
+`XXXX` is the last two bytes of this board's MAC, uppercase and unseparated,
+appended on first boot by `/etc/uci-defaults/97-pzl8-wifi-ssid` - the same
+naming the vendor image uses, so two boards running this image do not collide.
+Rename them to anything; that script only touches a name it still recognises as
+the shipped one.
 
 ### Two things to change
 

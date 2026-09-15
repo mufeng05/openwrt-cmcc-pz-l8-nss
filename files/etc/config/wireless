@@ -1,6 +1,12 @@
 # Shipped by this build. Stock OpenWrt leaves both radios disabled with an
 # SSID of "OpenWrt"; this comes up ready.
 #
+# The SSIDs below gain the board's own MAC suffix on first boot, from
+# /etc/uci-defaults/97-pzl8-wifi-ssid - PZ-L8-5G becomes PZ-L8-5G-8F79 or
+# whatever this board's MAC ends in, so two of them do not collide. Rename them
+# to anything you like; that script only touches a name it still recognises as
+# the shipped one.
+#
 # CHANGE THESE TWO BEFORE YOU RELY ON IT:
 #
 #   country  Set it to where the board actually is. This is not cosmetic:

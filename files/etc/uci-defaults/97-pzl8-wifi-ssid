@@ -1,0 +1,37 @@
+#!/bin/sh
+# Append the board's own MAC suffix to the shipped SSIDs, so two PZ-L8s running
+# this image do not both call themselves PZ-L8-5G.  Same scheme as the vendor
+# image: the last two bytes of the MAC, uppercase, no separator.
+#
+# Only rewrites an SSID that is still exactly what the image shipped.  After a
+# sysupgrade that kept configuration this script runs again, and must not
+# clobber a name its user chose.
+
+mac=
+for f in /sys/class/net/eth0/address /sys/class/net/eth1/address; do
+	[ -r "$f" ] || continue
+	mac=$(cat "$f")
+	[ -n "$mac" ] && break
+done
+
+# No MAC yet - exit non-zero so this is retried on the next boot rather than
+# leaving the generic name in place for good.
+[ -n "$mac" ] || exit 1
+
+sfx=$(echo "$mac" | tr 'a-z' 'A-Z' | awk -F: '{print $5 $6}')
+[ -n "$sfx" ] || exit 1
+
+changed=0
+for r in 0 1; do
+	cur=$(uci -q get wireless.default_radio${r}.ssid) || continue
+	case "$cur" in
+		PZ-L8-2G|PZ-L8-5G) ;;
+		*) continue ;;
+	esac
+	uci set wireless.default_radio${r}.ssid="${cur}-${sfx}"
+	changed=1
+done
+
+[ "$changed" = 1 ] && uci commit wireless
+
+exit 0
