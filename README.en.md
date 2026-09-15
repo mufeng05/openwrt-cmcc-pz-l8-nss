@@ -164,6 +164,42 @@ Worth about +50 % here (75.0 to 112.5 Mbit/s), at the cost of ignoring what 25
 other networks are asking for; the airtime it gains comes from them. **Off by
 default.**
 
+## Hardware readouts on the status page
+
+Stock LuCI's overview shows no CPU model, no temperatures and no acceleration
+engine load. The data sources were always there; what was missing was somewhere
+to put them, so this build adds a section:
+
+| row | source |
+|---|---|
+| Processor | `/proc/device-tree/cpus/cpu@0/compatible` plus cpufreq - aarch64's `/proc/cpuinfo` has no `model name` |
+| CPU load | two `/proc/stat` samples, differenced in the browser |
+| CPU temperature | the `/sys/class/thermal/` zone whose type contains `cpu` |
+| Wi-Fi temperature | the `/sys/class/hwmon/` entries named `ath11k_hwmon`, one per radio |
+| NSS/PPE utilisation | `/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi` |
+
+Three files, and nothing LuCI ships is modified:
+
+```
+files/usr/libexec/rpcd/luci.pzl8                       rpcd plugin, one call for everything
+files/usr/share/rpcd/acl.d/luci-pzl8.json              read access to that one method
+files/www/luci-static/resources/view/status/include/15_pzl8_hardware.js
+```
+
+The status page's `index.js` builds its section list with `fs.list()` over the
+include directory, so **dropping a file in is enough** - no need to rewrite
+`10_system.js` the way nwrt does.
+
+An rpcd plugin rather than a handful of front-end `fs.read` calls, because the
+page polls every few seconds and each read is its own ubus round trip - and
+because `cpu_load_ubi` lives in debugfs, readable only by root, which rpcd
+already is.
+
+**The Wi-Fi temperature rows are labelled by device-tree node, not phy index.**
+phy numbering is not stable: one `wifi reload` moved the 2.4 GHz radio from
+phy0 to phy1 on this board, while `c000000.wifi` and `b00a040.wifi` do not
+move.
+
 ## What works
 
 - NSS core boots, ECM offload stack loads automatically at every boot, with a

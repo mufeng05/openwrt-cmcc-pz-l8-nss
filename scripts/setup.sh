@@ -67,6 +67,8 @@ cp -a "$HERE/files/." "$OW/files/"
 find "$OW/files" -type f | sed "s|$OW/|  |"
 # init scripts must stay executable through the image build
 chmod +x "$OW"/files/etc/init.d/* 2>/dev/null || true
+# rpcd runs these as programs; a 644 plugin never registers its ubus object
+chmod +x "$OW"/files/usr/libexec/rpcd/* 2>/dev/null || true
 
 # ---------------------------------------------------------------- 6. config
 # An existing .config is someone's menuconfig session and is left alone.

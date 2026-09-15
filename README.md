@@ -143,6 +143,38 @@ uci commit wireless && wifi reload
 实测值约 +50%（75.0 → 112.5 Mbit/s），代价是无视周围 25 个网络的共存请求，
 多出来的空口时间是从它们那里拿的。**默认不开。**
 
+## 状态页上的硬件读数
+
+原版 LuCI 的「概览」不显示 CPU 型号、温度和加速引擎占用。数据源一直都在，
+缺的只是展示层，所以这个构建补了一节：
+
+| 显示项 | 数据源 |
+|---|---|
+| 处理器 | `/proc/device-tree/cpus/cpu@0/compatible` + cpufreq（aarch64 的 `/proc/cpuinfo` 没有 `model name`） |
+| CPU 占用 | `/proc/stat` 两次采样求差，在浏览器侧算 |
+| CPU 温度 | `/sys/class/thermal/` 里 type 含 `cpu` 的热区 |
+| Wi-Fi 温度 | `/sys/class/hwmon/` 里名为 `ath11k_hwmon` 的项，每个 radio 一个 |
+| NSS/PPE 占用 | `/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi` |
+
+三个文件，不改 LuCI 自带的任何东西：
+
+```
+files/usr/libexec/rpcd/luci.pzl8                       rpcd 插件，一次调用返回全部
+files/usr/share/rpcd/acl.d/luci-pzl8.json              只授予读取该方法的权限
+files/www/luci-static/resources/view/status/include/15_pzl8_hardware.js
+```
+
+状态页的 `index.js` 是用 `fs.list()` 列出 include 目录再逐个加载的，所以**丢一个
+文件进去就会被自动收录**，不需要像 nwrt 那样改写 `10_system.js`。
+
+用 rpcd 插件而不是在前端做若干次 `fs.read`，是因为这一页每几秒轮询一次，每个
+文件读取都是一次独立的 ubus 往返；另外 `cpu_load_ubi` 在 debugfs 里，只有 root
+读得到，而 rpcd 本来就是 root。
+
+**Wi-Fi 温度的标签按设备树节点区分，不按 phy 编号。** phy 编号不稳定——一次
+`wifi reload` 就能让 2.4G 从 phy0 变成 phy1（本机实测过），而
+`c000000.wifi` / `b00a040.wifi` 不会动。
+
 ## 已经可用的部分
 
 - NSS 核正常启动，ECM 卸载栈每次开机自动加载，带一个会自行解除的安全网

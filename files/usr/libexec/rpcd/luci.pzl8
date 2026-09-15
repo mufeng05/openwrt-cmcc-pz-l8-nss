@@ -1,0 +1,109 @@
+#!/bin/sh
+# rpcd plugin: the hardware readouts the stock status page does not show.
+#
+# One ubus method rather than a handful of file reads, because the status page
+# polls every few seconds and each fs.read is its own round trip. Everything
+# here is a sysfs or debugfs read; nothing is computed, and the CPU percentage
+# is deliberately left to the caller because a delta needs two samples and this
+# script must not sleep inside rpcd.
+
+nss_stats=/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi
+
+read1() { [ -r "$1" ] && head -1 "$1" 2>/dev/null; }
+
+# /proc/cpuinfo carries "model name" on x86 and ARMv7 but not on aarch64, where
+# the readable name is the device-tree compatible string.
+cpu_model() {
+	local m c
+	m=$(grep -m1 '^model name' /proc/cpuinfo 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//')
+	[ -n "$m" ] && { printf '%s' "$m"; return; }
+	c=$(tr '\0' '\n' < /proc/device-tree/cpus/cpu@0/compatible 2>/dev/null | head -1)
+	case "$c" in
+		arm,cortex-*) printf 'ARM %s' "$(printf '%s' "${c#arm,}" | sed 's/^cortex-a/Cortex-A/')" ;;
+		?*)           printf '%s' "$c" ;;
+		*)            printf 'unknown' ;;
+	esac
+}
+
+cpu_temp() {
+	local z
+	for z in /sys/class/thermal/thermal_zone*; do
+		[ -r "$z/type" ] && [ -r "$z/temp" ] || continue
+		case "$(cat "$z/type")" in
+			*cpu*) cat "$z/temp"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# Each ath11k radio registers its own hwmon. The hwmon index follows the phy
+# order, which is not stable across a `wifi reload`, so the device-tree node is
+# reported alongside it and the caller labels from that.
+wifi_temps() {
+	local h n t dev phy node first=1
+	for h in /sys/class/hwmon/hwmon*; do
+		[ -r "$h/name" ] || continue
+		n=$(cat "$h/name")
+		[ "$n" = "ath11k_hwmon" ] || continue
+		t=$(cat "$h/temp1_input" 2>/dev/null) || continue
+		[ -n "$t" ] || continue
+		dev=$(readlink -f "$h/device" 2>/dev/null)
+		phy=$(printf '%s' "$dev" | grep -o 'phy[0-9]*' | head -1)
+		node=$(printf '%s' "$dev" | grep -oE '[0-9a-f]+\.wifi' | head -1)
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"phy":"%s","node":"%s","temp":%s}' "$phy" "$node" "$t"
+	done
+}
+
+# "Min\tAvg\tMax" then a row of percentages, one block per NSS core.
+nss_load() {
+	[ -r "$nss_stats" ] || return 1
+	awk '/Min/ { getline; gsub(/%/, ""); print $1 " " $2 " " $3; exit }' "$nss_stats"
+}
+
+emit_status() {
+	local model cores freq gov ctemp nss wt
+	model=$(cpu_model)
+	cores=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
+	freq=$(read1 /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
+	gov=$(read1 /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+	ctemp=$(cpu_temp)
+	wt=$(wifi_temps)
+
+	printf '{'
+	printf '"cpu":{"model":"%s","cores":%s' "$model" "${cores:-0}"
+	[ -n "$freq" ] && printf ',"freq":%s' "$freq"
+	[ -n "$gov" ]  && printf ',"governor":"%s"' "$gov"
+	printf '}'
+
+	# Raw jiffies. The caller keeps the previous sample and does the division;
+	# sleeping here would block every other rpcd request.
+	printf ',"stat":"%s"' "$(head -1 /proc/stat)"
+
+	printf ',"temp":{'
+	[ -n "$ctemp" ] && printf '"cpu":%s' "$ctemp"
+	[ -n "$ctemp" ] && [ -n "$wt" ] && printf ','
+	[ -n "$wt" ] && printf '"wifi":[%s]' "$wt"
+	printf '}'
+
+	nss=$(nss_load)
+	if [ -n "$nss" ]; then
+		set -- $nss
+		printf ',"nss":{"min":%s,"avg":%s,"max":%s}' "${1:-0}" "${2:-0}" "${3:-0}"
+	fi
+
+	printf '}\n'
+}
+
+case "$1" in
+	list)
+		printf '{"status":{}}\n'
+		;;
+	call)
+		case "$2" in
+			status) emit_status ;;
+			*)      printf '{}\n' ;;
+		esac
+		;;
+esac

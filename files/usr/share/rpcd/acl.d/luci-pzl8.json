@@ -1,0 +1,10 @@
+{
+	"luci-pzl8-hardware": {
+		"description": "Grant access to the PZ-L8 hardware readouts",
+		"read": {
+			"ubus": {
+				"luci.pzl8": [ "status" ]
+			}
+		}
+	}
+}
