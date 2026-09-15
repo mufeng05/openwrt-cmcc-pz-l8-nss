@@ -81,15 +81,40 @@ nss_load() {
 }
 
 nss_confirm() {
-	# Runs detached.  eth0 carrying again is the thing that actually broke
-	# when the data plane handover failed, and unlike an uplink ping it does
-	# not depend on anything outside the box.
+	# Runs detached.  What this has to catch is the data-plane handover taking
+	# the network with it: qca-nss-drv closes and reopens eth0/eth1 through
+	# NSS, and a failure there leaves the box unreachable.
+	#
+	# It used to confirm on eth0's carrier, which is a cable and not a working
+	# data plane.  A box with nothing in any LAN socket - WiFi-only, which is
+	# an ordinary way to run this - never confirmed, so the flag stayed armed
+	# and the next boot disabled the offload outright.  One reboot was enough
+	# to turn the feature off silently.
+	#
+	# These signals need no cable: this code running at all means the load did
+	# not hang, the debugfs directory means the NSS core answered, and the UP
+	# flag is netifd's doing rather than a link partner's.  Carrier is still
+	# logged when present - it is the stronger signal - but its absence is no
+	# longer a verdict.
 	( sleep 25
-	  if [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "1" ]; then
+	  ok=1; why=""
+	  [ -d /sys/kernel/debug/qca-nss-drv/stats ] || { ok=0; why="the NSS core never answered"; }
+	  [ -e /sys/class/net/eth0 ] || { ok=0; why="eth0 is gone"; }
+	  flags=$(ip link show eth0 2>/dev/null | head -1 | sed -n 's/.*<\([^>]*\)>.*/\1/p')
+	  case ",$flags," in
+		*,UP,*) : ;;
+		*) ok=0; why="eth0 is not administratively up" ;;
+	  esac
+
+	  if [ "$ok" = 1 ]; then
 		rm -f "$FLAG" /etc/nss-wifi-pending; sync
-		nss_log "confirmed: eth0 has carrier, offload kept"
+		if [ "$(cat /sys/class/net/eth0/carrier 2>/dev/null)" = "1" ]; then
+			nss_log "confirmed: NSS core up, eth0 up with carrier - offload kept"
+		else
+			nss_log "confirmed: NSS core up, eth0 up, no LAN cable - offload kept"
+		fi
 	  else
-		nss_log "eth0 has no carrier after loading NSS - leaving the flag armed, next boot will disarm"
+		nss_log "$why - leaving the flag armed, next boot will disarm"
 	  fi ) &
 }
 
