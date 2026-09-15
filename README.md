@@ -179,12 +179,14 @@ QSDK 源码属于高通，来自
 
 打包骨架和大量 kernel 6.x 修复来自社区 NSS feed，均为 GPL：
 
-- Stanislaw Pal（kuncy7）—— <https://github.com/kuncy7/nss-packages>
+- Julius Bairaktaris —— <https://github.com/JuliusBairaktaris>。`nss-packages`
+  源头在他这里；而 `openwrt-nss-edma`——本项目在 `docs/WIFILI.md` 全程对照的
+  那棵树——也是他的。`openwrt/tree/` 里的 iproute2 NSS qdisc、nssmirred
+  补丁以及多个 qualcommax 内核补丁同样带着他的 Signed-off-by。
+- Stanislaw Pal（kuncy7）—— <https://github.com/kuncy7>。本项目对这两棵树的
+  checkout 用的是他的 fork。
 - Sean K（qosmio），NSS 固件 blob 的重新打包者 ——
   <https://github.com/qosmio/qca-sdk-nss-fw>
-- Julius Bairaktaris，`openwrt/tree/` 里的 iproute2 NSS qdisc、nssmirred
-  补丁以及多个 qualcommax 内核补丁都带着他的 Signed-off-by。本仓库里没有
-  记录它们的上游地址，所以这里不猬一个。
 
 ath11k 缩环的做法参考了
 <https://github.com/openwrt/openwrt/pull/21495>，该 PR 未被合并。

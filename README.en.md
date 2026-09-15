@@ -197,13 +197,15 @@ QSDK sources are Qualcomm's, from
 Packaging skeletons and many kernel-6.x fixes derive from community NSS feeds,
 all GPL:
 
-- Stanislaw Pal (kuncy7) — <https://github.com/kuncy7/nss-packages>
+- Julius Bairaktaris — <https://github.com/JuliusBairaktaris>. `nss-packages`
+  originates with him, and `openwrt-nss-edma` — the tree this project compares
+  against all through `docs/WIFILI.md` — is his. His Signed-off-by is also on
+  the iproute2 NSS qdisc and nssmirred patches and several of the qualcommax
+  kernel patches carried in `openwrt/tree/`.
+- Stanislaw Pal (kuncy7) — <https://github.com/kuncy7>. This project's
+  checkouts of both trees are of his forks.
 - Sean K (qosmio), who repackages the NSS firmware blobs —
   <https://github.com/qosmio/qca-sdk-nss-fw>
-- Julius Bairaktaris, whose Signed-off-by is on the iproute2 NSS qdisc and
-  nssmirred patches and several of the qualcommax kernel patches carried in
-  `openwrt/tree/`. Nothing in this tree records an upstream URL for them, so
-  none is guessed at here.
 
 The ath11k ring-size reduction follows the approach of
 <https://github.com/openwrt/openwrt/pull/21495>, which was not merged.
