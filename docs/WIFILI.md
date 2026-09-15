@@ -807,6 +807,120 @@ assumed:
 Worth writing down because it is the shape of thing that looks like a gap and
 is not.
 
+## Memory
+
+A 256 MB board reports 173 MB of MemTotal, and 55 MB of that goes to ath11k.
+The starting point was 16 MB of MemAvailable, which is what a user sees; the
+finishing point is 42 MB. Neither number moved because anything was made
+smaller - both came from defaults that were sized for a different machine.
+
+### Where the 256 MB is before Linux starts
+
+| | | |
+|---|---|---|
+| `wcss@4b000000` | 49 MB | the Q6 firmware for both radios. **Not reducible**: `0819` widened it from 27 MB on purpose, because ath11k hands the firmware raw physical addresses (`qcom,bdf-addr`, `qcom,m3-dump-addr`) that fall outside the narrower span and both radios then fail BDF download with -12. The span matches what the vendor firmware reserves for this board. |
+| `memory@40000000` | 8 MB | the NSS core's own DDR; `0818` already trimmed this to what the vendor uses |
+| tz, tz_apps, bootloader, smem | 9 MB | |
+| kernel image and dynamic | ~20 MB | |
+
+That is 86 MB, and it is the same layout the vendor firmware uses, so it is
+not where a difference against the vendor comes from.
+
+### What ath11k costs
+
+Measured by unloading it:
+
+| | MemFree | SUnreclaim |
+|---|---|---|
+| loaded, interfaces up | 31,964 kB | 48,760 kB |
+| `wifi down` | 29,504 kB | 48,704 kB |
+| module unloaded | 86,964 kB | 37,632 kB |
+
+55 MB, of which only 11 MB is slab. `wifi down` returns nothing, because it
+is all allocated at probe and QMI, not at interface up.
+
+Two things were checked here and are already right: the firmware memory mode
+is already 1 (`qcom,ath11k-fw-memory-mode` in the board DTS - 8 vdevs and 128
+peers, against three vdevs actually in use), and the DP rings were already
+shrunk by `990`.
+
+### The two defaults
+
+**OpenWrt's `min_free_kbytes`.** `/etc/init.d/sysctl` sets a flat 16384 for
+every board with more than 64 MB of RAM, whether it has 128 MB or 8 GB. On
+173 MB that is 9.5 % parked below the low watermark, and it is the entire gap
+between MemFree and MemAvailable:
+
+| `min_free_kbytes` | MemAvailable |
+|---|---|
+| 16384 | 16,172 kB |
+| **8192** | **31,252 kB** |
+| 4096 | 42,584 kB |
+
+8192 is still 4.7 %, and a router whose datapath runs on the NSS cores does
+fewer atomic allocations in softirq than an ordinary one, not more.
+`/etc/sysctl.d/30-pzl8-min-free.conf` sets it; `start()` in that init script
+runs `apply_defaults` and then reads `/etc/sysctl.d`, so the drop-in wins.
+
+**The NSS empty buffer pool.** `n2h_empty_pool_buf_core0` is how many empty
+skbs the NSS core keeps pooled, and the driver derives it from the compiled
+memory profile. This build is `NSS_MEM_PROFILE_MEDIUM`, which leaves it at
+8704. `NSS_MEM_PROFILE_LOW` caps it at 4096
+(`NSS_LOW_MEM_EMPTY_POOL_BUF_SZ`), and lowering it at runtime freed 10.1 MB:
+
+```
+pool 8704:  MemFree 24,044 kB
+pool 4096:  MemFree 34,160 kB
+```
+
+Set from `nss-offload` alongside the existing pbuf tuning rather than by
+building the LOW profile, because LOW also cuts the connection tables from
+2048 to 512 per family and the 10 MB is in the pool, not the tables.
+
+**And the high water mark has to come with it.** Writing the pool size makes
+the firmware recompute the water marks, so the pool must be set *before*
+`n2h_high_water_core0` or it overwrites it - but more importantly, the mark is
+what the firmware grows the pool *towards*, so leaving it at the 16336 this
+build used to carry simply undoes the cap:
+
+| | MemFree |
+|---|---|
+| pool 4096, high water 16336 | 28.5 MB |
+| pool 4096, high water 4096 | **35.3 MB** |
+
+`PBUF_HIGH_WATER` was derived against the old 8704 pool and is now 4096, which
+is the pairing `NSS_MEM_PROFILE_LOW` uses.
+
+This was nearly got wrong twice. Setting the pool last left the mark at 4096 by
+accident, which looked like a bug; a four-round comparison then read 489 Mbit/s
+at 16336 against 431 at 4096 and looked like 13 % in favour of the larger mark.
+Neither survived. Eight rounds at 4096 median 425 Mbit/s against ten rounds at
+16336 median 383, so the larger sample reverses the small one, and the
+difference is run-to-run spread - the same configuration spans 264 to 525
+Mbit/s across a session. The memory-saving pairing is not slower, so it is the
+one shipped.
+
+### Together
+
+MemFree and MemAvailable both move with page cache, so single readings are
+worth little; these are taken idle a few minutes after boot, and again under
+load.
+
+| | before | after |
+|---|---|---|
+| MemAvailable, idle | 16.2 MB | **40.4 MB** |
+| MemFree, idle | 30.7 MB | 22.5 MB |
+| Cached, idle | 14.3 MB | 37.3 MB |
+
+MemFree barely moves and can read lower, because what the watermark change
+frees is not free pages but the reserve held below them - the page cache takes
+up the slack, which is what it is for. MemAvailable is the figure that answers
+"how much can something else have", and it is the one that nearly tripled.
+
+Eight rounds of saturating Wi-Fi on the final configuration: 368 to 479
+Mbit/s, median 425, which is the session's normal band. Zero page-allocation
+failures, zero `rx_desc_alloc_fail`, zero `tx_enqueue_drop`, zero call traces.
+
 ## Known limitations
 
 - **`tx failed` reads zero.** `tx retries` is real - 24566 over a run - but it

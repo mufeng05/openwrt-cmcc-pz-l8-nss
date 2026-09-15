@@ -23,7 +23,21 @@ STOP=10
 FLAG=/etc/nss-boot-pending
 DISABLED=/etc/nss-disabled
 PBUF_EXTRA=800000        # vendor MP_256 value; 256 MB board
-PBUF_HIGH_WATER=16336    # (high_water - 11720 NSS+OCM buffers) * 160 B/pbuf
+# Matched to PBUF_EMPTY_POOL below: the firmware grows the pool towards the
+# high water mark, so a mark above the cap simply undoes the cap.  This was
+# 16336, derived when the pool was 8704.
+PBUF_HIGH_WATER=4096
+
+# How many empty skbs the NSS core keeps pooled.  The driver derives this from
+# the compiled memory profile and this build is NSS_MEM_PROFILE_MEDIUM, which
+# leaves it at 8704 - measured at 10.1 MB more than the 4096 that
+# NSS_MEM_PROFILE_LOW caps it to (nss_core.c, NSS_LOW_MEM_EMPTY_POOL_BUF_SZ).
+#
+# Set here rather than by building the LOW profile, because LOW also cuts the
+# connection tables from 2048 to 512 per family, and the 10 MB is in the pool,
+# not the tables.  Verified under four rounds of saturating Wi-Fi: no
+# rx_desc_alloc_fail, no tx_enqueue_drop, no page-allocation failure.
+PBUF_EMPTY_POOL=4096
 
 nss_log() { logger -t nss-offload "$@"; }
 
@@ -47,8 +61,14 @@ nss_load() {
 	sleep 8
 
 	echo $PBUF_EXTRA > /proc/sys/dev/nss/n2hcfg/extra_pbuf_core0 2>/dev/null
+
+	# Order matters: writing the empty pool size makes the firmware recompute
+	# the water marks and report the pool size back as the high water mark, so
+	# the pool goes first and the mark is set explicitly after it.
+	echo $PBUF_EMPTY_POOL > /proc/sys/dev/nss/n2hcfg/n2h_empty_pool_buf_core0 2>/dev/null
+	sleep 1
 	echo $PBUF_HIGH_WATER > /proc/sys/dev/nss/n2hcfg/n2h_high_water_core0 2>/dev/null
-	nss_log "pbuf: extra=$(cat /proc/sys/dev/nss/n2hcfg/extra_pbuf_core0 2>/dev/null) high_water=$(cat /proc/sys/dev/nss/n2hcfg/n2h_high_water_core0 2>/dev/null)"
+	nss_log "pbuf: extra=$(cat /proc/sys/dev/nss/n2hcfg/extra_pbuf_core0 2>/dev/null) high_water=$(cat /proc/sys/dev/nss/n2hcfg/n2h_high_water_core0 2>/dev/null) empty_pool=$(cat /proc/sys/dev/nss/n2hcfg/n2h_empty_pool_buf_core0 2>/dev/null)"
 
 	# qca-mcs must be in place before ecm: ecm's multicast front end binds to
 	# it at init and silently loses multicast acceleration otherwise.
