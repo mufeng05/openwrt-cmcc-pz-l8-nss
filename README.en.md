@@ -323,14 +323,22 @@ build tree. The server merges **every** `.lmo` for the requested language in
 - Multiple SSIDs per radio, `option isolate`, and per-station receive rates in
   `iw station dump` — each needed a driver change, see
   [docs/WIFILI.md](docs/WIFILI.md)
-- SQM that actually shapes, through `sqm-scripts-nss` and the NSS qdiscs
+- SQM that actually shapes (`sqm-scripts-nss` plus the NSS qdiscs), though
+  it is **not installed by default** - see below
 - Status LEDs, WAN DHCP, LuCI (in Chinese), sysupgrade
 
 ## Known limitations
 
-- QoS must use the `nss-edma` SQM script: the data path is inside the NSS cores,
-  Linux qdiscs never see the traffic, and cake or fq_codel **silently do
-  nothing**. See [docs/WIFILI.md](docs/WIFILI.md).
+- **SQM is not installed by default.** Ticking `sqm-scripts` drags in eighteen
+  packages - cake, ifb, tc and the whole legacy xtables compatibility stack
+  behind `iptables-nft` - none of which this image needs otherwise, because fw4
+  is nftables-native here and the data path is in NSS. To have it, tick the one
+  package **`sqm-scripts-nss`** in menuconfig and the dependencies follow,
+  including the two NSS kernel modules (`kmod-qca-nss-drv-qdisc` and
+  `kmod-qca-nss-drv-igs`).
+- Once installed, **QoS must use the `nss-edma` script**: the data path is
+  inside the NSS cores, Linux qdiscs never see the traffic, and cake or
+  fq_codel **silently do nothing**. See [docs/WIFILI.md](docs/WIFILI.md).
 - **Memory is tight.** A 256 MB board reports 173 MB of MemTotal — 48 MB of the
   reservation is Q6 wireless firmware and cannot be reduced — and ath11k takes
   46 MB of what is left. Its data-path rings are already smaller than upstream's,

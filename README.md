@@ -279,13 +279,18 @@ po2lmo po/pzl8.zh-cn.po files/usr/lib/lua/luci/i18n/pzl8.zh-cn.lmo
 - ath11k 双频 WiFi，**两个射频都已卸载**；5 GHz 默认 160 MHz
 - 每个射频多个 SSID、`option isolate`、以及 `iw station dump` 里的每站点接收
   速率——这几项都需要改驱动，见 [docs/WIFILI.md](docs/WIFILI.md)
-- 真正能整形的 SQM，通过 `sqm-scripts-nss` 和 NSS qdisc 实现
+- SQM 能真正整形（`sqm-scripts-nss` + NSS qdisc），但**默认不装**，见下
 - 状态 LED、WAN DHCP、LuCI（中文）、sysupgrade
 
 ## 已知限制
 
-- QoS 必须用 `nss-edma` 这个 SQM 脚本：数据路径在 NSS 核里，Linux 的 qdisc 根本
-  看不到流量，cake 或 fq_codel **会静静地什么都不做**。见
+- **SQM 默认不装。** 勾一个 `sqm-scripts` 会拖进 18 个包——cake、ifb、tc，以及
+  `iptables-nft` 那一整套 xtables 兼容层——而这台机器上 fw4 是 nftables 原生、
+  数据面又在 NSS 里，那些包除了伺候 SQM 别无用处。要用就在 menuconfig 里勾
+  **`sqm-scripts-nss` 一个包**，依赖会自动补齐，包括两个 NSS 内核模块
+  （`kmod-qca-nss-drv-qdisc`、`kmod-qca-nss-drv-igs`）。
+- 装上之后，**QoS 必须选 `nss-edma` 这个脚本**：数据路径在 NSS 核里，Linux 的
+  qdisc 根本看不到流量，cake 或 fq_codel **会静静地什么都不做**。见
   [docs/WIFILI.md](docs/WIFILI.md)。
 - **内存紧张。** 256 MB 的板子，MemTotal 只有 173 MB——预留里有 48 MB 是 Q6 无线
   固件，无法缩减——剩下的里 ath11k 又占 46 MB。ath11k 的数据路径环已经从上游
