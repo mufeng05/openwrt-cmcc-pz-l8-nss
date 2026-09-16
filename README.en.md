@@ -178,7 +178,7 @@ to put them, so this build adds a section:
 | Wi-Fi temperature | the `/sys/class/hwmon/` entries named `ath11k_hwmon`, one per radio |
 | NSS utilisation | `/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi` |
 | Accelerated connections | `/sys/kernel/debug/ecm/ecm_db/connection_count` |
-| WAN / LAN throughput | netdev byte counters on the `nss-dp` ports, differenced |
+| Port throughput | netdev byte counters on the `nss-dp` ports, differenced |
 
 **NSS, not NSS/PPE.** The packet processing engine is an IPQ807x / IPQ60xx /
 IPQ95xx block; **IPQ5018 does not have one**, so the label should not claim it.
@@ -193,6 +193,37 @@ A rate needs two samples and the real interval between them. The poll interval
 is not fixed, so the interval is **measured** in the browser (`Date.now()`
 difference) rather than assumed, and a negative delta - an interface that went
 down - reads as unknown rather than as a negative rate.
+
+#### Ports are resolved by asking netifd, not by guessing
+
+This first derived WAN from whichever port carried the default route. That only
+holds when the uplink sits directly on a physical port: with PPPoE the route is
+on `pppoe-wan` and with a tagged uplink on `eth1.2`, neither of which is an
+nss-dp port, so every port fell back to LAN - and a dumb AP has no default
+route at all.
+
+netifd answers it properly. A port is claimed by an interface when it is:
+
+1. that interface's `device`, or
+2. a VLAN of it (`eth1` under `eth1.2`), or
+3. a member of the bridge that is (`eth0` in `br-lan`)
+
+The point is that **netifd's `device` stays the layer-2 device**. Verified on
+the board by standing up a PPPoE interface over a dummy: netifd reported
+
+```
+device    = pppdummy      <- the underlying device, which is what to match on
+l3_device =               <- empty, because PPPoE never came up
+```
+
+So matching on `device` finds the physical port, where matching on `l3_device`
+would find nothing while the link is down. netifd also reports `device` when
+that device does not exist yet, so a configured-but-down port still resolves.
+
+**Nothing is assumed to be called wan or lan, and nothing is assumed to
+exist.** A port no interface claims is still shown, under its own name. The
+label is netifd's name plus the device: `Port throughput (wan / eth1)`, or just
+`Port throughput (eth1)` when unclaimed.
 
 Three files, and nothing LuCI ships is modified:
 

@@ -167,13 +167,15 @@ return baseclass.extend({
 			    rx = was ? rate(iface.rx - was.rx, ms) : null,
 			    tx = was ? rate(iface.tx - was.tx, ms) : null;
 
-			rows.push(
-				(iface.role == 'wan' ? _('WAN throughput')
-				                     : _('LAN throughput'))
-					+ ' (' + iface.dev + ')',
+			/* Labelled by whatever netifd calls the port, with the device name as
+			 * the fallback. Nothing here assumes a box has a wan, or a lan, or
+			 * exactly two ports. */
+			var tag = iface.iface ? iface.iface + ' / ' + iface.dev : iface.dev;
+
+			rows.push(_('Port throughput') + ' (' + tag + ')',
 				(rx == null && tx == null)
 					? _('Collecting data...')
-					: '\u2193 ' + bits(rx) + '\u2003\u2191 ' + bits(tx));
+					: '↓ ' + bits(rx) + ' ↑ ' + bits(tx));
 		});
 
 		var table = E('table', { 'class': 'table' });

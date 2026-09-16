@@ -67,23 +67,54 @@ nss_load() {
 # while br-lan saw 52, because accelerated traffic never reaches the Linux
 # bridge - so the bridge is deliberately not a source here.
 #
-# Ports are found by driver rather than by name, and WAN is whichever one
-# carries the default route.
+# Ports are found by driver, never by name. Which network a port belongs to
+# comes from netifd rather than from the default route: with PPPoE that route
+# is on pppoe-wan and with a tagged uplink on eth1.2, and neither is an nss-dp
+# port. netifd's `device` stays the L2 device in both cases.
+#
+# A port no interface claims is still reported, under its own name - nothing
+# here assumes a box has a wan, or a lan, or exactly two ports.
 net_stats() {
-	local wan i n drv rx tx role first=1
-	wan=$(awk '$2 == "00000000" && $8 == "00000000" { print $1; exit }' \
-		/proc/net/route 2>/dev/null)
+	local dump names ifdevs n d p drv rx tx owner pair b first=1
+
+	dump=$(ubus call network.interface dump 2>/dev/null)
+	names=$(printf '%s' "$dump" | jsonfilter -e '@.interface[*].interface' 2>/dev/null)
+
+	# Resolve each interface's L2 device once, not once per port.
+	for n in $names; do
+		[ "$n" = "loopback" ] && continue
+		d=$(printf '%s' "$dump" \
+			| jsonfilter -e "@.interface[@.interface='$n'].device" 2>/dev/null)
+		[ -n "$d" ] && ifdevs="$ifdevs $n=$d"
+	done
+
 	for i in /sys/class/net/*; do
-		n=$(basename "$i")
+		p=$(basename "$i")
 		drv=$(readlink -f "$i/device/driver" 2>/dev/null)
 		[ "$(basename "$drv" 2>/dev/null)" = "nss-dp" ] || continue
 		rx=$(cat "$i/statistics/rx_bytes" 2>/dev/null) || continue
 		tx=$(cat "$i/statistics/tx_bytes" 2>/dev/null) || continue
 		[ -n "$rx" ] && [ -n "$tx" ] || continue
-		if [ "$n" = "$wan" ]; then role=wan; else role=lan; fi
+
+		owner=
+		for pair in $ifdevs; do
+			n=${pair%%=*}
+			d=${pair#*=}
+			# the port itself, or a VLAN on it
+			case "$d" in
+				"$p"|"$p".*) owner=$n; break ;;
+			esac
+			# the port, or a VLAN of it, bridged into this interface
+			[ -e "/sys/class/net/$d/brif/$p" ] && { owner=$n; break; }
+			for b in "/sys/class/net/$d/brif/$p".*; do
+				[ -e "$b" ] && { owner=$n; break 2; }
+			done
+		done
+
 		[ "$first" = 1 ] || printf ','
 		first=0
-		printf '{"dev":"%s","role":"%s","rx":%s,"tx":%s}' "$n" "$role" "$rx" "$tx"
+		printf '{"dev":"%s","iface":"%s","rx":%s,"tx":%s}' \
+			"$p" "$owner" "$rx" "$tx"
 	done
 }
 

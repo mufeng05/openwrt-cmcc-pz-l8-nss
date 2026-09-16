@@ -156,7 +156,7 @@ uci commit wireless && wifi reload
 | Wi-Fi 温度 | `/sys/class/hwmon/` 里名为 `ath11k_hwmon` 的项，每个 radio 一个 |
 | NSS 占用 | `/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi` |
 | 加速连接数 | `/sys/kernel/debug/ecm/ecm_db/connection_count` |
-| WAN / LAN 速率 | `nss-dp` 网口的 netdev 字节计数，两次采样求差 |
+| 端口吞吐 | `nss-dp` 网口的 netdev 字节计数，两次采样求差 |
 
 **是 NSS 不是 NSS/PPE。** PPE（包处理引擎）是 IPQ807x / IPQ60xx / IPQ95xx
 那条线的硬件块，**IPQ5018 上没有**，所以标签里不该出现它。
@@ -169,6 +169,33 @@ uci commit wireless && wifi reload
 速率需要两次采样和两次之间的真实间隔。轮询间隔不是固定值，所以间隔是在
 浏览器侧**实测**的（`Date.now()` 之差），不是假设的。计数器出现负增量
 （接口 down 过）时显示为未知，而不是负数。
+
+#### 端口归属是问 netifd，不是猜的
+
+最初这里是用「默认路由在哪个口」来判定 WAN 的。那样**只在 WAN 直接挂在物理口
+上时成立**：PPPoE 拨号时默认路由在 `pppoe-wan` 上，VLAN 拨号时在 `eth1.2` 上，
+两者都不是 nss-dp 口，结果所有口都会落回 LAN；而纯 AP 模式下压根没有默认路由。
+
+现在改成问 netifd。一个口被某个接口认领，当它是：
+
+1. 该接口的 `device` 本身，或
+2. 该接口 `device` 的一个 VLAN（`eth1` ← `eth1.2`），或
+3. 该接口 `device` 那个网桥的成员（`eth0` ∈ `br-lan`）
+
+关键点在于 **netifd 的 `device` 始终是二层设备**。在设备上实测过：建一个挂在
+dummy 上的 PPPoE 接口，netifd 报的是
+
+```
+device    = pppdummy      ← 底层设备，正是要匹配的
+l3_device =               ← 空，因为 PPPoE 没拨上
+```
+
+所以按 `device` 匹配能找到物理口，按 `l3_device` 匹配在没拨通时会一无所获。
+而且 netifd 即使那个设备当时不存在也照报，所以配置了但没起来的口一样能解析。
+
+**没有任何东西被假定叫 wan 或 lan，也没有假定它们存在。** 没被任何接口认领的
+口照样显示，用自己的设备名。标签就是 netifd 给的名字加设备名：
+`端口吞吐 (wan / eth1)`，认领不到时是 `端口吞吐 (eth1)`。
 
 三个文件，不改 LuCI 自带的任何东西：
 

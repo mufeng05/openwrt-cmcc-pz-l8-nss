@@ -24,8 +24,5 @@ msgstr "NSS 占用（平均 / 峰值）"
 msgid "Accelerated connections"
 msgstr "加速连接数"
 
-msgid "WAN throughput"
-msgstr "WAN 速率"
-
-msgid "LAN throughput"
-msgstr "LAN 速率"
+msgid "Port throughput"
+msgstr "端口吞吐"
