@@ -233,13 +233,14 @@ default.**
 
 ### Hardware readouts on the status page
 
-![The Hardware section on the overview page](docs/img/overview-hardware.png)
+![The status overview page while routing 986 Mbit/s](docs/img/overview.png)
 
-Read while **routing 988 Mbit/s**: 15 % CPU, 14 % NSS, 25 accelerated
-connections, and both ports at line rate in opposite directions. The data path
-is inside the NSS cores and the main CPU is largely idle — making that visible
-is what this section is for. (The interface is in Chinese by default; see
-below.)
+The whole page, read while **routing 986 Mbit/s**. What this build adds is the
+Hardware section in it: 14 % CPU, 14 % NSS, fourteen accelerated connections,
+and both ports at line rate in opposite directions. The data path is inside the
+NSS cores and the main CPU is largely idle — making that visible is what the
+section is for. The client's hostname, MAC, DUID and addresses are smudged out,
+and the interface is in Chinese by default; see below.
 
 Stock LuCI's overview shows no CPU model, no temperatures and no acceleration
 engine load. The data sources were always there; what was missing was somewhere
