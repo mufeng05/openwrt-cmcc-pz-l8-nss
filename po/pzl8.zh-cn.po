@@ -1,0 +1,22 @@
+msgid ""
+msgstr ""
+"Content-Type: text/plain; charset=UTF-8\n"
+"Language: zh_Hans\n"
+
+msgid "Hardware"
+msgstr "硬件"
+
+msgid "Processor"
+msgstr "处理器"
+
+msgid "CPU load"
+msgstr "CPU 占用"
+
+msgid "CPU temperature"
+msgstr "CPU 温度"
+
+msgid "Wi-Fi temperature"
+msgstr "Wi-Fi 温度"
+
+msgid "NSS/PPE utilisation (average / peak)"
+msgstr "NSS/PPE 占用（平均 / 峰值）"

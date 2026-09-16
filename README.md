@@ -175,6 +175,31 @@ files/www/luci-static/resources/view/status/include/15_pzl8_hardware.js
 `wifi reload` 就能让 2.4G 从 phy0 变成 phy1（本机实测过），而
 `c000000.wifi` / `b00a040.wifi` 不会动。
 
+### 界面语言
+
+镜像内置中文：`luci-i18n-base-zh-cn` 等四个包，加上本构建自己的
+`pzl8.zh-cn.lmo`（上面那一节的六条标签）。首次启动时
+`/etc/uci-defaults/96-pzl8-luci-lang` 把 `luci.main.lang` 设为 `zh_cn`，
+**只在它还是出厂默认值 `auto` 时才设**——你在「系统 → 语言」里改过之后，
+sysupgrade 保留配置时这个脚本会再跑一遍，但不会把你的选择改回去。
+
+想跟随浏览器语言：`uci set luci.main.lang=auto`。
+
+msgid 保持英文，中文放在 catalog 里，所以英文界面下这一节仍然是英文，
+不是写死的中文。翻译源是 `po/pzl8.zh-cn.po`；仓库里同时放了编译好的 `.lmo`，
+因为构建过程只是拷贝 `files/`，没有编译 `.po` 的环节。改完 `.po` 后：
+
+```sh
+po2lmo po/pzl8.zh-cn.po files/usr/lib/lua/luci/i18n/pzl8.zh-cn.lmo
+```
+
+`po2lmo` 是 luci-base 的宿主工具，在 OpenWrt 构建树的
+`staging_dir/hostpkg/bin/` 下。
+
+服务端把 `/usr/lib/lua/luci/i18n/` 里**该语言的所有 `.lmo` 合并**后，通过
+`/cgi-bin/luci/admin/translations/<lang>` 一次性下发给浏览器，所以放一个
+文件进去就够了。
+
 ## 已经可用的部分
 
 - NSS 核正常启动，ECM 卸载栈每次开机自动加载，带一个会自行解除的安全网

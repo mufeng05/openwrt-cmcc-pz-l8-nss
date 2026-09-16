@@ -113,9 +113,12 @@ return baseclass.extend({
 				celsius(radio.temp));
 		});
 
+		/* Both numbers in one cell rather than a sentence. A bare "peak" as a
+		 * msgid would translate that word everywhere else in LuCI too, which
+		 * is not this file's business. */
 		if (data.nss)
-			rows.push(_('NSS/PPE utilisation'),
-				data.nss.avg + ' % (' + _('peak') + ' ' + data.nss.max + ' %)');
+			rows.push(_('NSS/PPE utilisation (average / peak)'),
+				data.nss.avg + ' % / ' + data.nss.max + ' %');
 
 		var table = E('table', { 'class': 'table' });
 

@@ -200,6 +200,34 @@ phy numbering is not stable: one `wifi reload` moved the 2.4 GHz radio from
 phy0 to phy1 on this board, while `c000000.wifi` and `b00a040.wifi` do not
 move.
 
+### Interface language
+
+The image carries Chinese: four `luci-i18n-*-zh-cn` packages plus this build's
+own `pzl8.zh-cn.lmo` for the six labels above. On first boot
+`/etc/uci-defaults/96-pzl8-luci-lang` sets `luci.main.lang` to `zh_cn`, **only
+while it is still LuCI's own default of `auto`** - after a choice made in
+System > Language, the script runs again from a new image on sysupgrade but
+leaves that choice alone.
+
+To follow the browser instead: `uci set luci.main.lang=auto`.
+
+The msgids stay English and the Chinese lives in a catalogue, so an English
+interface still reads English here rather than hardcoded Chinese. The source is
+`po/pzl8.zh-cn.po`; the compiled `.lmo` is committed alongside it because the
+build only copies `files/` and has no step that compiles a `.po`. After editing
+the source:
+
+```sh
+po2lmo po/pzl8.zh-cn.po files/usr/lib/lua/luci/i18n/pzl8.zh-cn.lmo
+```
+
+`po2lmo` is a luci-base host tool, found under `staging_dir/hostpkg/bin/` in an
+OpenWrt build tree.
+
+The server merges **every `.lmo` for the requested language** in
+`/usr/lib/lua/luci/i18n/` and ships them to the browser in one response from
+`/cgi-bin/luci/admin/translations/<lang>`, so dropping one file in is enough.
+
 ## What works
 
 - NSS core boots, ECM offload stack loads automatically at every boot, with a

@@ -1,0 +1,17 @@
+#!/bin/sh
+# Default the web interface to Chinese. The catalogues are in the image
+# (luci-i18n-*-zh-cn plus this build's own pzl8.zh-cn.lmo); LuCI's own default
+# is "auto", which follows the browser's Accept-Language instead.
+#
+# Only set while the value is still LuCI's default, so a choice made in
+# System > Language survives a sysupgrade that kept configuration - this script
+# runs again from the new image.
+#
+# To follow the browser instead:  uci set luci.main.lang=auto
+
+[ "$(uci -q get luci.main.lang)" = "auto" ] || exit 0
+
+uci set luci.main.lang='zh_cn'
+uci commit luci
+
+exit 0
