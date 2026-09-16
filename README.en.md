@@ -1,124 +1,186 @@
-# CMCC PZ-L8 — OpenWrt with QSDK NSS offload
+# CMCC PZ-L8 — OpenWrt with QSDK NSS hardware offload
 
 [中文](README.md) | **English**
 
-Qualcomm NSS hardware offload on an **unmodified OpenWrt 25.12.5 baseline**
-(kernel 6.12.94, aarch64) for the CMCC PZ-L8 (IPQ5018 + QCA8337 + QCN6122),
-built from Qualcomm's own QSDK 14.0 sources rather than a vendor SDK fork.
+Qualcomm NSS hardware offload for the CMCC PZ-L8 (IPQ5018 + QCA8337 + QCN6122)
+on an **unmodified OpenWrt 25.12.5 baseline** (kernel 6.12.94, aarch64). Every
+driver comes straight from Qualcomm's own QSDK 14.0 sources rather than a
+vendor SDK fork.
 
-Built images for every commit on `main` are on the
-[Releases](../../releases) page - `sysupgrade.bin` to upgrade a router already
-running OpenWrt, `factory.ubi` for a first install from U-Boot.
+Wired forwarding and **both radios** run inside the NSS cores; the packets never
+reach Linux.
+
+Every green build of `main` publishes a [Release](../../releases) with four
+files:
+
+| file | use |
+|---|---|
+| `*-squashfs-sysupgrade.bin` | upgrading a router already running OpenWrt: `sysupgrade -n` |
+| `*-uboot-recovery.fit` | the U-Boot web recovery at `192.168.10.10` — **the only file that page accepts** |
+| `*-squashfs-factory.ubi` | a forced `sysupgrade -n -F` from a vendor image, which writes it with `ubiformat` |
+| `*-initramfs-uImage.itb` | boots from RAM without touching flash |
+
+---
 
 ## Measured on hardware
 
-Forwarding is LAN/WiFi → router → WAN, iperf3 `-P 4`, 15 s per direction.
-CPU is the two Cortex-A53 host cores; the NSS UBI32 core is separate.
+### Why this exists
 
-| Path | This build | nwrt (vendor stack) | Stock OpenWrt |
+Stock OpenWrt forwards through Linux with DSA on this board. With NSS:
+
+| iperf3 `-P 4`, 15 s per direction | this build | nwrt (closed stack) | stock OpenWrt |
 |---|---|---|---|
-| **Wired ↔ WAN** | **949 up / 949 down Mbps, +0 % CPU** | 924 / 926 @ 4 % | 502 @ 100 % (DSA) |
-| WiFi link itself (HE80 2×2) | 641 / 470 Mbps | — | — |
-| **WiFi 5 GHz ↔ WAN** | **510 up / 438 down Mbps, +0.3 % CPU** | ~624 Mbps @ 25–35 % | 308 Mbps |
-| **WiFi 2.4 GHz ↔ WAN** | **58 up / 61 down Mbps, +0.3 % CPU** | – | – |
-| MemAvailable, everything up | **40 MB** | 36 MB | — |
+| **wired ↔ WAN** | **949 up / 949 down Mbps, +0 % CPU** | 924 / 926 @ 4 % | **502 @ 100 % CPU** |
+| **5 GHz ↔ WAN** | 510 up / 438 down Mbps, +0.3 % CPU | ~624 @ 25–35 % | 308 |
+| **2.4 GHz ↔ WAN** | 58 up / 61 down Mbps, +0.3 % CPU | — | — |
 
-The CPU column is incremental: `/proc/stat` is sampled once a second through
-the run and the idle baseline of the same capture is subtracted, because the
-sampler itself costs 2–5 % on these cores. Wired lands at or below its own
-baseline — 949 Mbps costs nothing the measurement can resolve. nwrt's WiFi
-figure is about 20 % faster than this build and carries 25–35 % host CPU with
-it.
+CPU means the two Cortex-A53 host cores — the NSS UBI32 core is separate and not
+counted — and the figures are **increments**: `/proc/stat` sampled once a second
+throughout, minus an idle baseline from the same session, because the sampler
+alone costs 2–5 %. The wired row lands on or below its own baseline: whatever
+949 Mbps costs is smaller than this method can resolve.
 
-The 5 GHz row predates the NSS firmware moving from 12.2 to 12.5.
+> This table is the older batch, taken with iperf3, and its 5 GHz row predates
+> the NSS firmware moving from 12.2 to 12.5. The table below was measured later
+> by a different method — **the two cannot be read across**.
 
-That column has gaps because the reference images were not measured for every
-row at the time. Both v1.6 and nwrt have since been flashed onto this board and
-measured properly - same client, same server, same afternoon - but with four
-parallel HTTP streams rather than iperf3, so those numbers go in their own
-table instead of into the empty cells above:
+### Three-way, same method
+
+Both reference images were later flashed back onto this board and measured
+properly: same board, same client (one Intel AX201), same server, same
+afternoon, same method — four parallel HTTP streams of 20 s, with a host `/32`
+route forcing the traffic through the router.
 
 | four parallel HTTP streams, 20 s | v1.6 | nwrt | this build |
 |---|---|---|---|
 | wired LAN → WAN | 912.1 | 901.8 | **912.6** |
-| 5 GHz at 80 MHz | - | - | 462 |
 | **5 GHz at 160 MHz** | **730** | **722** | **697** |
+| 5 GHz at 80 MHz | — | — | 462 |
 | 2.4 GHz at 20 MHz | 98.8 | **119.4** | 75.0 |
-| 2.4 GHz at 40 MHz | - | - | **112.5** |
+| 2.4 GHz at 40 MHz (`noscan`) | — | — | **112.5** |
 | host CPU during 5 GHz | not measurable, see below | 16.1 % at 537 | **2.9 % at 441** |
 
-**At matched width this build lands within 3.5-4.6 % of both references.** The
-5 GHz gap was attributed to channel width on an arithmetic argument (722/425 is
-1.70 against a bandwidth ratio of 2.0); running this build at 160 MHz turns
-that into a measurement - 461.6 to 696.9, worth +51 %, leaving a remainder too
-small to need its own explanation.
+Neither reference is an unmodified OEM image: **v1.6** is a community build on
+the vendor's 4.4 SDK, **nwrt** one on 5.4, both with the closed qca-wifi driver.
 
-The CPU cell is a like-for-like comparison for the first time - same band, same
-width, same method, each with its own idle control. nwrt spends 5.6x the CPU to
-move 22 % more data.
+**Wired is a three-way tie** at the client NIC's line rate, so it measures the
+client rather than the router.
 
-160 MHz needs a country code set: under the default `country 00` the 5 GHz band
-is split into two 80 MHz regulatory blocks and no 160 MHz channel exists. The
-resulting channel covers DFS spectrum, so hostapd runs a 62 s CAC before it
-beacons, on every start. That is why this is not the shipped default - and a
-regulatory domain is not something an image should choose for its user.
+**At matched width, 5 GHz is within 3.5–4.6 %.** Attributing the gap to channel
+width used to be inference (722 / 425 ≈ 1.70 against a bandwidth ratio of 2.0);
+running this build at 160 MHz made it a measurement — 462 to 697, worth +51 %,
+leaving a remainder too small to need its own explanation.
 
-This build's column was re-measured after flashing back onto the board, with
-`n2h_high_water_core0` restored to the vendor's 16336. The CPU cell has an idle
-control behind it: 3.1 % with no traffic, 5.9 % during the transfer, so the
-traffic costs +2.8 points. Per Mbit/s that is 0.017 % against nwrt's 0.030 % -
-but nwrt moves those bits over 160 MHz and this build over 80, so it is not a
-like-for-like radio.
+**The CPU cell is a like-for-like comparison for the first time** (same band,
+same width, same method, each with its own idle control): nwrt spends 5.6× the
+CPU to move 22 % more data. v1.6's cell is empty because that box has no idle
+time to begin with — four hung `hostapd_cli` processes pin both cores, load
+average 7.5, 0 % idle. Which argues the same point from the other side: it still
+reaches 730 Mbit/s with both cores saturated, so the forwarding is not going
+through the host CPU.
 
-Neither reference is an unmodified OEM image: v1.6 is a community build on the
-vendor's 4.4 SDK, nwrt one on 5.4, both with the closed qca-wifi driver.
+**2.4 GHz is the one row where this build clearly trails.** Not for want of
+configuration: the AP advertises two streams MCS 0-11 and the firmware really
+does use two streams, 20 MHz and a 0.8 µs guard interval — the rate control just
+settles at MCS 6–7. The firmware's own statistics say why: 13.5 % of MPDUs are
+never acknowledged, 22 % are requeued, and the channel measures 44–58 % busy
+with almost none of it ours. The same rate control puts 13 % of its PPDUs at
+MCS 9–11 on the much quieter 5 GHz radio, so it is not broken — it is answering
+a link that drops one frame in seven. Full working in
+[docs/WIFILI.md](docs/WIFILI.md).
 
-The 5 GHz gap is mostly channel width: both references run **160 MHz** and the
-client associates at 1922-2162 Mbit/s, ath11k runs 80 MHz and the same client
-associates at 1201. v1.6 associates 12 % above nwrt and delivers 1 % more, so
-both have hit the same ceiling.
+---
 
-v1.6's CPU cell is empty because that box has no idle time to begin with - four
-hung `hostapd_cli` processes pin both cores (load average 7.5, 0 % idle). Which
-turns out to prove the point: it still reaches 730 Mbit/s with both cores
-saturated, so the forwarding is not going through the host CPU.
+## Flashing
 
-[docs/WIFILI.md](docs/WIFILI.md) has the rest, including the configuration
-differences and the places this build diverges from both references on purpose.
+The default LAN address is **192.168.10.1**.
 
-Wired forwarding runs at line rate with the host CPU **completely idle** — the
-packets never enter Linux. **WiFi forwarding now does too**, on both radios and
-in both directions: the host sees about a hundred frames per gigabyte and the
-rest is forwarded inside the NSS core.
+**Already running OpenWrt** — `sysupgrade -n <image>-squashfs-sysupgrade.bin`
 
-An earlier version of this file said WiFi offload was a structural consequence
-of ath11k not being an NSS-managed interface and could not be fixed by tuning.
-That was wrong. It is fixed; [docs/WIFILI.md](docs/WIFILI.md) is what it took
-and what is still open. The numbers above are the forwarded path only — a client
-on WiFi, through the router with NAT, to a wired host — because traffic sourced
-on the router itself measures its own userspace and says nothing about the
-offload.
+**From a vendor image such as v1.6** — its `platform_do_upgrade` never reads the
+sysupgrade tar; it calls `do_flash_ubi`, which is `ubiformat`. So feed it the
+**`.ubi`** with `-F`:
+
+```sh
+sysupgrade -n -F <image>-squashfs-factory.ubi
+```
+
+**Recovery / U-Boot web page (`192.168.10.10`, hold the button at power-on)** —
+that page runs `imgaddr=$fileaddr && source $imgaddr:script`, so it accepts
+**only a FIT carrying a flashing script**. Upload a `.ubi` and it reports success
+and writes nothing.
+
+```sh
+curl -F "firmware=@<image>-uboot-recovery.fit" http://192.168.10.10/
+```
+
+Both routes, the flash layout and what the bootloader actually checks are in
+[docs/RECOVERY.md](docs/RECOVERY.md). Stock `platform.sh` aborts sysupgrade on
+this board — it calls `elecom_upgrade_prepare()`, which expects an A/B rootfs
+pair that the PZ-L8 does not have — and is patched here.
+
+### V2 units: the Fudan flash
+
+One batch of this model (V2) ships the Fudan Micro **FM25LS01** SPI-NAND in
+place of the earlier ESMT F50D1G41LB. Neither mainline nor OpenWrt 25.12.5 knows
+that ID — `fmsh.c` carries only FM25S01A (`0xE4`) and FM25S01BI3 (`0xd4`) — so
+the flash is not detected at all on a V2 board.
+
+This build carries the entry:
+`openwrt/tree/target/linux/generic/pending-6.12/440-mtd-spinand-add-support-for-FudanMicro-FM25LS01.patch`
+(ID `0xA5`, 2048-byte pages, 128-byte OOB, 64 pages per block, 1024 blocks). It
+lives in `pending-` rather than `backport-` because it is not upstream. Worth
+knowing: `fmsh.c` is not a stock kernel file either — OpenWrt adds it through
+two generic backports, 401 and 435.
+
+The patch comes from
+[CrazyBoyFeng/openwrt-pz-l8](https://github.com/CrazyBoyFeng/openwrt-pz-l8), by
+way of ImmortalWrt's `400-mtd-spinand-Support-fmsh.patch` and originally
+Rockchip BSP.
+
+**About that ECC figure.** The patch declares `NAND_ECCREQ(8, 512)` where the
+datasheet specifies 1 bit per 512 on-die. That is not a typo: the QPIC
+controller does **not** use the chip's on-die ECC, it configures its own
+hardware ECC from the declared requirement. This board's own dmesg shows the
+mechanism — our chip is the ESMT, declared at 1 bit:
+
+```
+qcom_snand 79b0000.spi: ECC strength requirement of 1-bit(s) is unsupported, trying 4-bits
+```
+
+So the declared figure decides what Linux uses, and it must match what U-Boot
+wrote with, or UBI written by the bootloader reads back `-74 EUCLEAN`. The 8 is
+what the patch author measured on their own V2 board. **If a V2 unit does not
+boot after flashing and reports EUCLEAN, that line is the first thing to look
+at.**
+
+**What was not verified:** this board is a V1 — its dmesg reads `ESMT SPI NAND
+was found` with a 64-byte OOB — so the path was verified only as far as *the
+patch applies cleanly and builds*. It has never run on real FM25LS01 hardware
+here, and the chip ID, geometry and ooblayout are taken from the upstream patch
+without an independent check against the datasheet. The risk to a V1 board is
+one row in a chip table, reached only on ID `0xA5`.
+
+---
 
 ## Wi-Fi defaults, which come up on their own
 
-A fresh flash is connectable without going through LuCI first:
+A fresh flash is connectable without going through LuCI first.
 
 | | SSID | channel | width |
 |---|---|---|---|
 | 2.4 GHz | `PZ-L8-2G-XXXX` | auto (ACS) | asks for HE40, usually settles at 20 MHz |
 | 5 GHz | `PZ-L8-5G-XXXX` | 36 | **HE160 (160 MHz)** |
 
-Encryption `psk2+ccmp`, key `pzl8test2026`.
-
-`XXXX` is the last two bytes of this board's MAC, uppercase and unseparated,
-appended on first boot by `/etc/uci-defaults/97-pzl8-wifi-ssid` - the same
-naming the vendor image uses, so two boards running this image do not collide.
-Rename them to anything; that script only touches a name it still recognises as
-the shipped one.
+Encryption `psk2+ccmp`, key `pzl8test2026`. `XXXX` is the last two bytes of this
+board's MAC, uppercase and unseparated, appended on first boot by
+`/etc/uci-defaults/97-pzl8-wifi-ssid` — the same naming the vendor image uses, so
+two boards running this image do not collide. Rename them to anything; that
+script only touches a name it still recognises as the shipped one.
 
 ### Two things to change
 
-**The key.** This image is published, so this key is public - anyone who reads
+**The key.** This image is published, so this key is public — anyone who reads
 the repository can join a router still using it. **Change it first.**
 
 ```sh
@@ -136,7 +198,7 @@ Set it to where the board actually is.
 ### Two behaviours that follow
 
 **5 GHz takes about a minute to appear on every boot.** Under CN the only
-160 MHz segment is 5170-5330 centred on 5250, and it covers DFS spectrum, so
+160 MHz segment is 5170–5330 centred on 5250, and it covers DFS spectrum, so
 hostapd must finish a channel-availability check before the first beacon:
 
 ```
@@ -146,14 +208,15 @@ hostapd: phy0-ap0: interface state DFS->ENABLED
 ```
 
 5 GHz is invisible until it finishes; 2.4 GHz is unaffected and comes up first.
-Radar can also move the channel later. Both are the price of 160 MHz on this
-board - `HE80` removes them and costs about a third of the throughput
-(697 to 462 Mbit/s measured).
+Radar can also move the channel later. This is inherent to 160 MHz on this
+board — **every** contiguous 160 MHz channel in 5 GHz reaches into DFS spectrum,
+because the two non-DFS blocks are 100 MHz and 125 MHz wide and neither can hold
+one. `HE80` removes it and costs about a third of the throughput (697 to 462).
 
 **2.4 GHz usually runs at 20 MHz, not 40.** The config asks for `HE40` but does
 not set `noscan`, so the 802.11 coexistence scan drops it to 20 MHz where
-neighbouring BSSs are dense - which is exactly what both reference images
-(v1.6 and nwrt) do. To hold 40 MHz regardless:
+neighbouring BSSs are dense — which is exactly what both reference images do. To
+hold 40 MHz regardless:
 
 ```sh
 uci set wireless.radio0.noscan='1'
@@ -164,7 +227,11 @@ Worth about +50 % here (75.0 to 112.5 Mbit/s), at the cost of ignoring what 25
 other networks are asking for; the airtime it gains comes from them. **Off by
 default.**
 
-## Hardware readouts on the status page
+---
+
+## The web interface
+
+### Hardware readouts on the status page
 
 Stock LuCI's overview shows no CPU model, no temperatures and no acceleration
 engine load. The data sources were always there; what was missing was somewhere
@@ -172,58 +239,13 @@ to put them, so this build adds a section:
 
 | row | source |
 |---|---|
-| Processor | `/proc/device-tree/cpus/cpu@0/compatible` plus cpufreq - aarch64's `/proc/cpuinfo` has no `model name` |
+| Processor | `/proc/device-tree/cpus/cpu@0/compatible` plus cpufreq — aarch64's `/proc/cpuinfo` has no `model name` |
 | CPU load | two `/proc/stat` samples, differenced in the browser |
 | CPU temperature | the `/sys/class/thermal/` zone whose type contains `cpu` |
 | Wi-Fi temperature | the `/sys/class/hwmon/` entries named `ath11k_hwmon`, one per radio |
 | NSS utilisation | `/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi` |
 | Accelerated connections | `/sys/kernel/debug/ecm/ecm_db/connection_count` |
 | Port throughput | netdev byte counters on the `nss-dp` ports, differenced |
-
-**NSS, not NSS/PPE.** The packet processing engine is an IPQ807x / IPQ60xx /
-IPQ95xx block; **IPQ5018 does not have one**, so the label should not claim it.
-
-**Throughput comes from `eth0` / `eth1`, not from `br-lan`.** Measured: during
-one transfer both ports moved 989 Mbit/s while `br-lan` saw 52, because
-accelerated traffic never reaches the Linux bridge. The ports are found by
-driver name (`nss-dp`) rather than hardcoded, and WAN is whichever one carries
-the default route, read from `/proc/net/route`.
-
-A rate needs two samples and the real interval between them. The poll interval
-is not fixed, so the interval is **measured** in the browser (`Date.now()`
-difference) rather than assumed, and a negative delta - an interface that went
-down - reads as unknown rather than as a negative rate.
-
-#### Ports are resolved by asking netifd, not by guessing
-
-This first derived WAN from whichever port carried the default route. That only
-holds when the uplink sits directly on a physical port: with PPPoE the route is
-on `pppoe-wan` and with a tagged uplink on `eth1.2`, neither of which is an
-nss-dp port, so every port fell back to LAN - and a dumb AP has no default
-route at all.
-
-netifd answers it properly. A port is claimed by an interface when it is:
-
-1. that interface's `device`, or
-2. a VLAN of it (`eth1` under `eth1.2`), or
-3. a member of the bridge that is (`eth0` in `br-lan`)
-
-The point is that **netifd's `device` stays the layer-2 device**. Verified on
-the board by standing up a PPPoE interface over a dummy: netifd reported
-
-```
-device    = pppdummy      <- the underlying device, which is what to match on
-l3_device =               <- empty, because PPPoE never came up
-```
-
-So matching on `device` finds the physical port, where matching on `l3_device`
-would find nothing while the link is down. netifd also reports `device` when
-that device does not exist yet, so a configured-but-down port still resolves.
-
-**Nothing is assumed to be called wan or lan, and nothing is assumed to
-exist.** A port no interface claims is still shown, under its own name. The
-label is netifd's name plus the device: `Port throughput (wan / eth1)`, or just
-`Port throughput (eth1)` when unclaimed.
 
 Three files, and nothing LuCI ships is modified:
 
@@ -234,88 +256,110 @@ files/www/luci-static/resources/view/status/include/15_pzl8_hardware.js
 ```
 
 The status page's `index.js` builds its section list with `fs.list()` over the
-include directory, so **dropping a file in is enough** - no need to rewrite
-`10_system.js` the way nwrt does.
+include directory, so **dropping a file in is enough** — no need to rewrite
+upstream's `10_system.js` the way nwrt does. An rpcd plugin rather than a handful
+of front-end `fs.read` calls, because the page polls every few seconds and each
+read is its own ubus round trip — and because `cpu_load_ubi` lives in debugfs,
+readable only by root, which rpcd already is.
 
-An rpcd plugin rather than a handful of front-end `fs.read` calls, because the
-page polls every few seconds and each read is its own ubus round trip - and
-because `cpu_load_ubi` lives in debugfs, readable only by root, which rpcd
-already is.
+A few choices that are not obvious:
 
-**The Wi-Fi temperature rows are labelled by device-tree node, not phy index.**
-phy numbering is not stable: one `wifi reload` moved the 2.4 GHz radio from
-phy0 to phy1 on this board, while `c000000.wifi` and `b00a040.wifi` do not
-move.
+- **NSS, not NSS/PPE.** The packet processing engine is an IPQ807x / IPQ60xx /
+  IPQ95xx block; **IPQ5018 does not have one**.
+- **Throughput comes from `eth0` / `eth1`, not `br-lan`.** Measured: during one
+  transfer both ports moved 989 Mbit/s while `br-lan` saw 52, because
+  accelerated traffic never reaches the Linux bridge.
+- **Wi-Fi temperature rows are keyed on the device-tree node, not the phy
+  index.** phy numbering is not stable — one `wifi reload` moved the 2.4 GHz
+  radio from phy0 to phy1 here — while `c000000.wifi` and `b00a040.wifi` do not
+  move.
+- **The rate interval is measured** (`Date.now()` difference) rather than assumed
+  from the poll period, and a negative delta from an interface that went down
+  reads as unknown rather than as a negative rate.
+
+**Ports are resolved by asking netifd, not by guessing.** This first derived WAN
+from whichever port carried the default route, which only holds when the uplink
+sits directly on a physical port: with PPPoE the route is on `pppoe-wan` and with
+a tagged uplink on `eth1.2`, neither of which is an nss-dp port, so every port
+fell back to LAN — and a dumb AP has no default route at all. A port is now
+claimed by the interface whose `device` it is, whose `device` is a VLAN of it, or
+whose `device` is the bridge it belongs to. The point is that **netifd's
+`device` stays the layer-2 device** — verified on the board, where a PPPoE
+interface over a dummy reported `device = pppdummy` with `l3_device` empty.
+**Nothing is assumed to be called wan or lan, and nothing is assumed to exist**;
+a port no interface claims is still shown, under its own name.
 
 ### Interface language
 
 The image carries Chinese: four `luci-i18n-*-zh-cn` packages plus this build's
-own `pzl8.zh-cn.lmo` for the six labels above. On first boot
+own `pzl8.zh-cn.lmo` for the labels above. On first boot
 `/etc/uci-defaults/96-pzl8-luci-lang` sets `luci.main.lang` to `zh_cn`, **only
-while it is still LuCI's own default of `auto`** - after a choice made in
+while it is still LuCI's own default of `auto`** — after a choice made in
 System > Language, the script runs again from a new image on sysupgrade but
-leaves that choice alone.
-
-To follow the browser instead: `uci set luci.main.lang=auto`.
+leaves that choice alone. To follow the browser instead:
+`uci set luci.main.lang=auto`.
 
 The msgids stay English and the Chinese lives in a catalogue, so an English
 interface still reads English here rather than hardcoded Chinese. The source is
 `po/pzl8.zh-cn.po`; the compiled `.lmo` is committed alongside it because the
-build only copies `files/` and has no step that compiles a `.po`. After editing
-the source:
+build only copies `files/` and has no step that compiles a `.po`:
 
 ```sh
 po2lmo po/pzl8.zh-cn.po files/usr/lib/lua/luci/i18n/pzl8.zh-cn.lmo
 ```
 
-`po2lmo` is a luci-base host tool, found under `staging_dir/hostpkg/bin/` in an
-OpenWrt build tree.
+`po2lmo` is a luci-base host tool, under `staging_dir/hostpkg/bin/` in an OpenWrt
+build tree. The server merges **every** `.lmo` for the requested language in
+`/usr/lib/lua/luci/i18n/` and ships them in one response, so one file is enough.
 
-The server merges **every `.lmo` for the requested language** in
-`/usr/lib/lua/luci/i18n/` and ships them to the browser in one response from
-`/cgi-bin/luci/admin/translations/<lang>`, so dropping one file in is enough.
+---
 
 ## What works
 
-- NSS core boots, ECM offload stack loads automatically at every boot, with a
-  self-disarming safety net
-- External QCA8337 driven by `qca-ssdk`/swconfig instead of DSA — two
+- The NSS cores come up, and the ECM offload stack loads on every boot
+- The external QCA8337 is driven by `qca-ssdk`/swconfig rather than DSA — two
   independent GMACs, MTU 1500, no DSA tag
-- Dual-band WiFi (2.4 GHz + 5 GHz HE80) on ath11k, offloaded on both radios
-- Several SSIDs per radio, `option isolate`, and per-station rx rate in
-  `iw station dump` - all of which needed driver work, see
+- ath11k on both bands, **both radios offloaded**; 5 GHz at 160 MHz by default
+- Multiple SSIDs per radio, `option isolate`, and per-station receive rates in
+  `iw station dump` — each needed a driver change, see
   [docs/WIFILI.md](docs/WIFILI.md)
 - SQM that actually shapes, through `sqm-scripts-nss` and the NSS qdiscs
-- Status LED, WAN DHCP, LuCI, sysupgrade
+- Status LEDs, WAN DHCP, LuCI (in Chinese), sysupgrade
 
 ## Known limitations
 
-- QoS must use the `nss-edma` SQM script: the data path is in the NSS
-  cores, so Linux qdiscs never see the traffic and cake or fq_codel
-  silently do nothing. See [docs/WIFILI.md](docs/WIFILI.md).
-- **Memory is tight.** A 256 MB board reports 173 MB of MemTotal - 48 MB of
-  the reservation is the Q6 wireless firmware and cannot shrink - and ath11k
-  takes 46 MB of what is left. ath11k's data-path rings are patched down from
-  the upstream sizes or nothing fits alongside NSS. MemAvailable lands at
-  40 MB; `docs/WIFILI.md` has where the rest goes.
+- QoS must use the `nss-edma` SQM script: the data path is inside the NSS cores,
+  Linux qdiscs never see the traffic, and cake or fq_codel **silently do
+  nothing**. See [docs/WIFILI.md](docs/WIFILI.md).
+- **Memory is tight.** A 256 MB board reports 173 MB of MemTotal — 48 MB of the
+  reservation is Q6 wireless firmware and cannot be reduced — and ath11k takes
+  46 MB of what is left. Its data-path rings are already smaller than upstream's,
+  or it would not fit alongside NSS.
 - Monitor-mode capture on the radios is effectively disabled by those ring sizes.
-- The firewall's flow-offload switches do nothing here. Hardware offload is
-  `[fixed]` off - `qca-nss-dp` has no flowtable support - and software offload
-  is inert because ECM hands connections to NSS before the netfilter forward
-  path sees them. Measured: with it on, the flowtable took zero connections
-  while NSS kept accelerating. Leave both off.
-- `qca-ssdk-shell` (`ssdk_sh`) does not build — `-fPIC` does not reach
-  `src/sal/sd` through its recursive make.
+- **The firewall's flow offloading switches do nothing here.** Hardware
+  offloading is `[fixed]` off — `qca-nss-dp` has no flowtable support — and
+  software offloading spins idle, because ECM takes the connection before
+  netfilter's forward path sees it. Measured: with it on, the flowtable received
+  zero connections while NSS accelerated as usual. Both stay off.
+- 2.4 GHz throughput trails both reference images; see the three-way comparison
+  above.
+- `qca-ssdk-shell` (`ssdk_sh`) does not build — `-fPIC` does not survive its
+  recursive make into `src/sal/sd`.
+
+---
 
 ## Building
 
 ### GitHub Actions
 
-Every green build of `main` publishes a [release](../../releases) with the
-sysupgrade, factory and initramfs images, their sha256sums and the manifest.
-The images are also attached to the run as artifacts, which expire; the
-release does not. Pull requests build but do not publish, and a manual
-**Build CMCC PZ-L8 (NSS)** run can opt out by unticking `make_release`.
+Every green build of `main` publishes a [release](../../releases). The images are
+also attached to the run as artifacts, but artifacts expire and releases do not.
+Pull requests build without publishing; a manual run of **Build CMCC PZ-L8
+(NSS)** can opt out by unticking `make_release`.
+
+The U-Boot recovery FIT is built by CI from the same factory image it publishes,
+and **the build fails if it grows past the bootloader's 32 MiB limit** — better a
+failed build than a file that is rejected at the one moment it is needed.
 
 ### Locally
 
@@ -326,11 +370,11 @@ pzl8-nss/scripts/setup.sh ./openwrt
 cd openwrt && make -j$(nproc)
 ```
 
-`setup.sh` is idempotent and prints what it touches.
+`setup.sh` is idempotent and prints everything it touches.
 
 ### Choosing your own packages
 
-After `setup.sh`, the tree is an ordinary OpenWrt tree:
+After `setup.sh` this is an ordinary OpenWrt tree:
 
 ```sh
 cd openwrt
@@ -338,153 +382,90 @@ make menuconfig        # add LuCI apps, tools, whatever you want
 make -j$(nproc)
 ```
 
-`setup.sh` seeds `.config` only when there is not one already, so re-running it
-to pick up new commits will not discard your selection. `RESEED=1
-pzl8-nss/scripts/setup.sh ./openwrt` goes back to the shipped config on
-purpose. Either way it finishes with `make defconfig`, so packages added
-upstream since your config was written get their defaults filled in.
+`setup.sh` seeds the configuration only when there is **no** `.config`, so
+re-running it to pick up new commits will not discard your selection.
+`RESEED=1 pzl8-nss/scripts/setup.sh ./openwrt` asks for the repository's own
+configuration back. Either way it ends with `make defconfig`, so packages added
+upstream get their defaults.
 
-Four symbols must stay on, and menuconfig will not stop you turning them off
-because two of them are not packages. `setup.sh` checks them on every run and
-warns:
+A few symbols have to stay on, and menuconfig will not stop you turning them off
+— two of them are not packages at all:
 
 | | |
 |---|---|
-| `CONFIG_NSS_DRV_WIFIOFFLOAD_ENABLE` | builds the wifili and wifi_vdev half of qca-nss-drv. Without it `ath11k.ko` does not link - ten undefined `nss_wifili_*` symbols at modpost |
-| `CONFIG_NSS_FIRMWARE_VERSION_12_5` | picks the firmware blob **and**, through qca-nss-drv's patch 0022, the wifili message ABI. Turning it off does not fail the build; it leaves the peer-stats array stride 16 bytes short of what the firmware sends |
+| `CONFIG_NSS_DRV_WIFIOFFLOAD_ENABLE` | builds the wifili and wifi_vdev half of qca-nss-drv. Without it `ath11k.ko` **will not link** — modpost reports ten undefined `nss_wifili_*` symbols |
+| `CONFIG_NSS_FIRMWARE_VERSION_12_5` | picks the firmware blob **and**, through qca-nss-drv's patch 0022, the wifili message ABI. Turning it off still **builds**, but the peer-stats array stride ends up 16 bytes shorter than what the firmware sends |
 | `CONFIG_PACKAGE_kmod-qca-nss-drv` | the NSS driver itself |
-| `CONFIG_PACKAGE_nss-firmware-ipq50xx` | the blob |
+| `CONFIG_PACKAGE_nss-firmware-ipq50xx` | the firmware blob |
+| `CONFIG_LUCI_LANG_zh_Hans` | the Chinese interface. Note that `CONFIG_PACKAGE_luci-i18n-*-zh-cn=y` does **not** work: those are `HIDDEN` symbols, cannot hold a value from a seed file, and defconfig discards them and recomputes from their default |
 
-To keep a selection in the repo, write it back over the seed:
+To freeze your selection into the repository, write it back to the seed:
 
 ```sh
 cd openwrt
 ./scripts/diffconfig.sh > ../pzl8-nss/config/cmcc_pz-l8.config
 ```
 
-The workflow re-checks the same four symbols after `defconfig`, so a seed that
-loses one fails in seconds with `MISS <symbol>` instead of forty minutes later
-in modpost.
+The workflow re-checks those symbols after `defconfig`, so a seed that lost one
+reports `MISS <symbol>` within seconds rather than dying in modpost forty minutes
+later — or shipping an image that built fine and came up in English.
 
-## The Fudan flash in V2 units
-
-One batch of this model (V2) ships the Fudan Micro **FM25LS01** SPI-NAND in
-place of the earlier ESMT F50D1G41LB. Neither mainline nor OpenWrt 25.12.5
-knows that ID - `fmsh.c` carries only FM25S01A (0xE4) and FM25S01BI3 (0xd4) -
-so the flash is not detected at all on a V2 board.
-
-`openwrt/tree/target/linux/generic/pending-6.12/440-mtd-spinand-add-support-for-FudanMicro-FM25LS01.patch`
-adds the entry: ID `0xA5`, 2048-byte pages, 128-byte OOB, 64 pages per block,
-1024 blocks. It lives in `pending-` rather than `backport-` because it is not
-upstream. Worth knowing: `fmsh.c` is not a stock kernel file either - OpenWrt
-adds it through two generic backports, 401 and 435.
-
-The patch comes from
-[CrazyBoyFeng/openwrt-pz-l8](https://github.com/CrazyBoyFeng/openwrt-pz-l8),
-by way of ImmortalWrt's `400-mtd-spinand-Support-fmsh.patch` and originally
-Rockchip BSP.
-
-### About that ECC figure
-
-The patch declares `NAND_ECCREQ(8, 512)` where the datasheet specifies 1 bit
-per 512 on-die. That is not a typo.
-
-The QPIC controller does **not** use the chip's on-die ECC; it configures its
-own hardware ECC from the declared requirement. This board's own dmesg shows
-the mechanism directly - our chip is the ESMT, declared at 1 bit:
-
-```
-qcom_snand 79b0000.spi: ECC strength requirement of 1-bit(s) is unsupported, trying 4-bits
-```
-
-So the declared figure decides what Linux actually uses, and it has to match
-whatever U-Boot wrote with, or UBI written by the bootloader cannot be read
-(-74 EUCLEAN). The 8 is what the patch author measured on their own V2 board.
-**If a V2 unit does not boot after flashing and reports EUCLEAN, that line is
-the first thing to look at.**
-
-### What was not verified
-
-**This board is a V1** - its dmesg reads `ESMT SPI NAND was found` with a
-64-byte OOB. So this path was verified only as far as *the patch applies
-cleanly and builds*; it has never been run on real FM25LS01 hardware here. The
-chip ID, geometry and ooblayout are taken from the upstream patch and were not
-independently checked against the datasheet.
-
-The risk to a V1 board is close to zero: it adds one row to a chip table, which
-takes effect only when ID `0xA5` is read.
-
-## Flashing
-
-Releases carry **`*-uboot-recovery.fit`**, which is the only file the
-U-Boot web recovery at `192.168.10.10` accepts. That page runs
-`source $imgaddr:script` on the upload, so a `.ubi` reports success and writes
-nothing.
-
-`sysupgrade -n` from a running OpenWrt, or the U-Boot web recovery at
-`192.168.10.10`. Default LAN address is **192.168.10.1**.
-
-The two want different image formats and neither is obvious - the web recovery
-runs `source $imgaddr:script` and therefore needs a FIT with a flashing script
-in it, not a `.ubi`. [docs/RECOVERY.md](docs/RECOVERY.md) has both paths, the
-flash layout, and what the bootloader checks.
-
-The stock `platform.sh` aborts sysupgrade on this board — it calls
-`elecom_upgrade_prepare()`, which expects an A/B rootfs pair that PZ-L8 does not
-have, and the flash silently does nothing. Patched here.
+---
 
 ## Layout
 
 ```
 config/          .config seed (diffconfig output)
-docs/            engineering notes - read FINDINGS.md first
-feed/            our packages: qca-nss-drv, -ecm, -clients, qca-mcs,
+docs/            engineering notes — start with FINDINGS.md
+feed/            this project's packages: qca-nss-drv, -ecm, -clients, qca-mcs,
                  nss-firmware, ipq-wifi, qca-ssdk-shell
-files/           rootfs overlay: the nss-offload init script
-manifest/        QSDK 14.0 revisions these sources are pinned to
+files/           rootfs overlay: nss-offload init scripts, the LuCI readouts,
+                 the Chinese catalogue
+manifest/        the QSDK 14.0 revisions these sources are pinned to
+po/              LuCI translation source (compiled into the .lmo under files/)
 openwrt/
-  0001-*.patch   edits to files OpenWrt already ships
-  tree/          files OpenWrt does not have, copied in verbatim
-scripts/setup.sh applies all of the above to a clean checkout
+  0001-*.patch   changes to files OpenWrt already ships
+  tree/          files OpenWrt does not have, copied in place
+scripts/setup.sh applies all of the above to a clean tree
+scripts/mkrecovery.py  builds the U-Boot recovery FIT from a factory.ubi
 ```
 
 ## Why the sources are pinned where they are
 
-- **NSS driver / ECM / mcs**: QSDK 14.0 (`NHSS.QSDK.14.0.r9-00040-O`) from
+- **NSS driver / ECM / mcs**: QSDK 14.0 (`NHSS.QSDK.14.0.r9-00040-O`), from
   git.codelinaro.org.
-- **NSS clients** (pppoe, qdisc, vlan-mgr): QSDK **12.5.5**. QSDK 14's client
-  feed is PPE-only and IPQ5018 has no PPE block — Qualcomm's own
-  `nss-ppe/Makefile` lists only ipq52xx/53xx/54xx/95xx/96xx.
-- **NSS firmware**: `NSS.FW.12.5-210-MP.R`, and the matching wifili ABI. An
-  earlier version of this file said 12.2-156 because 12.5 was believed not to
-  work on this SoC; it does, and it is about 65 % faster on Wi-Fi across two
-  A/B cycles. The catch is that the blob cannot be swapped on its own -
-  qca-nss-drv's patch 0022 puts four `uint32_t` behind
-  `NSS_FIRMWARE_VERSION_12_5`, all of them inside the per-peer array of the
-  peer-stats message, so choosing the firmware has to choose the ABI with it or
-  every peer after the first is read at the wrong offset. 11.4 is still the
-  only line that accepts mesh.
-- **Data plane**: OpenWrt's own `qca-nss-dp` (`syn_gmac_dp`), the same driver
-  the vendor firmware uses. No `qca-dwmac-nss` shim: that exists for trees where
-  ipq50xx was moved to upstream stmmac, which is not the case here.
+- **NSS clients** (pppoe, qdisc, vlan-mgr): QSDK **12.5.5**. The QSDK 14 client
+  feed is PPE-only, and IPQ5018 has no PPE block — Qualcomm's own
+  `nss-ppe/Makefile` lists ipq52xx/53xx/54xx/95xx/96xx and nothing else.
+- **NSS firmware**: `NSS.FW.12.5-210-MP.R` with the matching wifili ABI. The trap
+  is that **the blob cannot be swapped on its own** — qca-nss-drv's patch 0022
+  hides four `uint32_t` behind `NSS_FIRMWARE_VERSION_12_5`, and all four sit
+  **inside the per-peer array** of the peer-stats message, so choosing the
+  firmware means choosing the ABI with it or every peer after the first reads at
+  the wrong offset. 12.5 was chosen on measurement: two A/B cycles, Wi-Fi median
+  253 to 417 Mbit/s, non-overlapping. Only the 11.4 line still supports mesh.
+- **Data plane**: OpenWrt's own `qca-nss-dp` (`syn_gmac_dp`), the same driver the
+  vendor image uses. Not the `qca-dwmac-nss` shim, which is for trees that move
+  ipq50xx onto upstream stmmac; this is not one of those.
 
 ## Credits
 
-QSDK sources are Qualcomm's, from
-<https://git.codelinaro.org/clo/qsdk>.
+The QSDK sources are Qualcomm's, from <https://git.codelinaro.org/clo/qsdk>.
 
-Packaging skeletons and many kernel-6.x fixes derive from community NSS feeds,
-all GPL:
+The packaging skeleton and a great many kernel 6.x fixes come from the community
+NSS feeds, all GPL:
 
 - Julius Bairaktaris — <https://github.com/JuliusBairaktaris>. `nss-packages`
-  originates with him, and `openwrt-nss-edma` — the tree this project compares
-  against all through `docs/WIFILI.md` — is his. His Signed-off-by is also on
-  the iproute2 NSS qdisc and nssmirred patches and several of the qualcommax
-  kernel patches carried in `openwrt/tree/`.
-- Stanislaw Pal (kuncy7) — <https://github.com/kuncy7>. This project's
-  checkouts of both trees are of his forks.
+  originates there, and so does `openwrt-nss-edma`, the tree this project reads
+  against throughout `docs/WIFILI.md`. The iproute2 NSS qdisc and nssmirred
+  patches in `openwrt/tree/`, and several qualcommax kernel patches, carry his
+  Signed-off-by too.
+- Stanislaw Pal (kuncy7) — <https://github.com/kuncy7>. This project checks both
+  trees out from his forks.
 - Sean K (qosmio), who repackages the NSS firmware blobs —
   <https://github.com/qosmio/qca-sdk-nss-fw>
+- CrazyBoyFeng — <https://github.com/CrazyBoyFeng/openwrt-pz-l8>, where the
+  FM25LS01 flash patch comes from.
 
-The ath11k ring-size reduction follows the approach of
+The ath11k ring-shrinking approach follows
 <https://github.com/openwrt/openwrt/pull/21495>, which was not merged.
