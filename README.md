@@ -312,6 +312,31 @@ artifact 附在构建上，但 artifact 会过期，release 不会。Pull reques
 U-Boot 恢复 FIT 由 CI 用同一次构建出的 factory 镜像现做，并且**超过 bootloader
 的 32 MiB 上限就让构建失败**——与其发布一个到用的时候才被拒的文件，不如当场报错。
 
+CI 还会 clone [luci-theme-argon](https://github.com/jerrykuku/luci-theme-argon)
+到 `package/` 并编进镜像。它**不在** OpenWrt 的 luci 源里——v25.12.5 锁定的那个
+revision 只有 bootstrap / material / openwrt / openwrt-2020——所以在种子配置里写
+`CONFIG_PACKAGE_luci-theme-argon=y` 没有用：任何没有这个包的树上，defconfig 都会
+**静默丢掉**它，镜像照样编出来，只是没有主题。
+
+这一步**只在 CI 里做，不在 `setup.sh`**：那个脚本的职责是把本项目应用到一棵树上，
+本地构建不该去联网 clone 一个你没要求的第三方仓库。本地也想要就自己来：
+
+```sh
+git clone --depth 1 https://github.com/jerrykuku/luci-theme-argon \
+    openwrt/package/luci-theme-argon
+cd openwrt && make menuconfig     # LuCI → Themes 里勾上
+```
+
+跟的是 master、不锁 commit，所以每次构建实际用的那个提交记在 `build-info.txt`
+的 `argon_commit` 里——「最新」回答不了「这个镜像里装的是哪个」。
+
+装上之后主题不会自动切换，在「系统 → 语言和界面」里选，或者：
+
+```sh
+uci set luci.main.mediaurlbase='/luci-static/argon'
+uci commit luci
+```
+
 ### 本地
 
 ```sh

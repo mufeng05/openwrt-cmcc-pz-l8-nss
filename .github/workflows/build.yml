@@ -83,6 +83,28 @@ jobs:
         run: |
           pzl8-nss/scripts/setup.sh "$GITHUB_WORKSPACE/openwrt"
 
+      # Argon is not in OpenWrt's luci feed, so it is cloned here rather than by
+      # setup.sh - a local build should not depend on a network fetch it did not
+      # ask for, and the seed config stays free of a symbol that only resolves
+      # in CI.  The package lives in package/ and needs no feed machinery.
+      - name: Add the Argon theme
+        env:
+          ARGON_REPO: https://github.com/jerrykuku/luci-theme-argon.git
+        run: |
+          set -eu
+          git clone --depth 1 "$ARGON_REPO" openwrt/package/luci-theme-argon
+
+          # Tracking master, so record what that actually was for this image.
+          ARGON_COMMIT=$(git -C openwrt/package/luci-theme-argon \
+                             rev-parse --short HEAD)
+          git -C openwrt/package/luci-theme-argon --no-pager log -1 \
+              --format='argon %h  %ci  %s'
+          echo "ARGON_COMMIT=$ARGON_COMMIT" >> "$GITHUB_ENV"
+
+          cd openwrt
+          echo 'CONFIG_PACKAGE_luci-theme-argon=y' >> .config
+          make defconfig
+
       - name: Verify the expected packages are selected
         run: |
           cd openwrt
@@ -97,7 +119,8 @@ jobs:
             CONFIG_NSS_DRV_WIFIOFFLOAD_ENABLE \
             CONFIG_NSS_FIRMWARE_VERSION_12_5 \
             CONFIG_LUCI_LANG_zh_Hans \
-            CONFIG_PACKAGE_luci-i18n-base-zh-cn
+            CONFIG_PACKAGE_luci-i18n-base-zh-cn \
+            CONFIG_PACKAGE_luci-theme-argon
           do
             if grep -q "^${sym}=y" .config; then
               echo "  ok   $sym"
@@ -131,6 +154,7 @@ jobs:
             echo "openwrt_ref=$OPENWRT_REF"
             echo "openwrt_commit=$(git rev-parse --short HEAD)"
             echo "project_commit=$(git -C "$GITHUB_WORKSPACE/pzl8-nss" rev-parse --short HEAD)"
+            echo "argon_commit=${ARGON_COMMIT:-none}"
             echo "date=$(date -u '+%Y-%m-%d %H:%M UTC')"
           } | tee "$GITHUB_WORKSPACE/build-info.txt"
           # Seconds, because this is the tag: at minute resolution two runs

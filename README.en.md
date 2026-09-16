@@ -361,6 +361,35 @@ The U-Boot recovery FIT is built by CI from the same factory image it publishes,
 and **the build fails if it grows past the bootloader's 32 MiB limit** — better a
 failed build than a file that is rejected at the one moment it is needed.
 
+CI also clones [luci-theme-argon](https://github.com/jerrykuku/luci-theme-argon)
+into `package/` and builds it in. It is **not** in OpenWrt's luci feed — at the
+v25.12.5 pin that feed carries bootstrap, material, openwrt and openwrt-2020 and
+nothing else — so putting `CONFIG_PACKAGE_luci-theme-argon=y` in the seed
+achieves nothing on its own: any tree without the package has defconfig
+**silently drop it**, and the image builds fine without the theme.
+
+This happens **in CI only, not in `setup.sh`**: that script's job is applying
+this project to a tree, and a local build should not reach out to a third-party
+repository it was never asked about. To have it locally, fetch it yourself:
+
+```sh
+git clone --depth 1 https://github.com/jerrykuku/luci-theme-argon \
+    openwrt/package/luci-theme-argon
+cd openwrt && make menuconfig     # tick it under LuCI → Themes
+```
+
+It tracks master rather than a pinned commit, so the commit each build actually
+used is recorded in `build-info.txt` as `argon_commit` — "latest" is not an
+answer to "which one is in this image".
+
+Installing it does not switch to it. Pick it under System → Language and
+Interface, or:
+
+```sh
+uci set luci.main.mediaurlbase='/luci-static/argon'
+uci commit luci
+```
+
 ### Locally
 
 ```sh
