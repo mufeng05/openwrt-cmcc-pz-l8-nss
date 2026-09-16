@@ -132,18 +132,9 @@ ECM_MAKE_OPTS+=ECM_INTERFACE_OVS_BRIDGE_ENABLE=y \
 EXTRA_CFLAGS+= -I$(STAGING_DIR)/usr/include/qca-ovsmgr
 endif
 
-# Deliberately not enabled with kmod-macvlan.  ECM's macvlan support calls
-# macvlan_get_mode() and macvlan_offload_stats_update(), which QSDK adds to the
-# kernel and OpenWrt does not have anywhere in 6.12 - ecm_interface.c then fails
-# to compile with two implicit-declaration errors and takes the build with it.
-#
-# kmod-macvlan is an ordinary module someone may select for its own sake, so the
-# coupling goes rather than the package: macvlan works, ECM does not accelerate
-# it. Restoring this needs drivers/net/macvlan.c patched with the two helpers.
-#
-# ifneq ($(CONFIG_PACKAGE_kmod-macvlan),)
-# ECM_MAKE_OPTS+=ECM_INTERFACE_MACVLAN_ENABLE=y
-# endif
+ifneq ($(CONFIG_PACKAGE_kmod-macvlan),)
+ECM_MAKE_OPTS+=ECM_INTERFACE_MACVLAN_ENABLE=y
+endif
 
 ifneq ($(CONFIG_PACKAGE_kmod-qca-mcs),)
 ECM_MAKE_OPTS+=ECM_MULTICAST_ENABLE=y
