@@ -325,6 +325,9 @@ build tree. The server merges **every** `.lmo` for the requested language in
   [docs/WIFILI.md](docs/WIFILI.md)
 - SQM that actually shapes (`sqm-scripts-nss` plus the NSS qdiscs), though
   it is **not installed by default** - see below
+- macvlan for WAN multi-dial, **accelerated** — the interfaces must be
+  `option mode 'private'`, which is the only mode ECM takes; see
+  [docs/FINDINGS.md](docs/FINDINGS.md)
 - Status LEDs, WAN DHCP, LuCI (in Chinese), sysupgrade
 
 ## Known limitations
@@ -351,6 +354,25 @@ build tree. The server merges **every** `.lmo` for the requested language in
   zero connections while NSS accelerated as usual. Both stay off.
 - 2.4 GHz throughput trails both reference images; see the three-way comparison
   above.
+- **Channel analysis does not work on 5 GHz at 160 MHz.** No 160 MHz block in
+  5 GHz avoids DFS channels, and mac80211 refuses a scan while the channel
+  context has radar detection enabled (`iw scan` returns `Resource busy`), so
+  LuCI's channel analysis sees nothing but the local AP there. To survey the
+  band, drop radio1 to HE80 on 36–48 or 149–161, scan, and put it back. 2.4 GHz
+  has no DFS and is unaffected.
+- **Radar drops 5 GHz to 80 MHz and it does not come back by itself.** Neither
+  the 30-minute non-occupancy period expiring, nor `wifi reload`, nor a runtime
+  channel switch restores it; only `wifi down radio1 && wifi up radio1`, which
+  re-runs CAC (64 s measured, 5 GHz alone down). **Restarting the radio while
+  the NOP is still running leaves 5 GHz down entirely**, so do not. A watchdog
+  to automate the recovery was written and dropped: a minute without 5 GHz costs
+  more than sitting at 80 MHz.
+- **Phy Rate under Realtime Graphs → Wireless is wrong at modern rates.** Its
+  source, `luci-bwc`, keeps the rate in a `uint16_t` of kbit/s, so anything
+  above 65.5 Mbit/s wraps — 1921.5 Mbit/s reads as 20 Mbit/s — and noise below
+  -100 dBm always displays as -100. Both are upstream LuCI. The page also plots
+  the *associated client's* signal and rate, so with no client connected it is
+  all zeroes by design.
 - `qca-ssdk-shell` (`ssdk_sh`) does not build — `-fPIC` does not survive its
   recursive make into `src/sal/sd`.
 

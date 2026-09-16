@@ -280,6 +280,8 @@ po2lmo po/pzl8.zh-cn.po files/usr/lib/lua/luci/i18n/pzl8.zh-cn.lmo
 - 每个射频多个 SSID、`option isolate`、以及 `iw station dump` 里的每站点接收
   速率——这几项都需要改驱动，见 [docs/WIFILI.md](docs/WIFILI.md)
 - SQM 能真正整形（`sqm-scripts-nss` + NSS qdisc），但**默认不装**，见下
+- macvlan 做 WAN 口多拨，并且**被 NSS 加速**——必须 `option mode 'private'`，
+  ECM 只认这一种模式，见 [docs/FINDINGS.md](docs/FINDINGS.md)
 - 状态 LED、WAN DHCP、LuCI（中文）、sysupgrade
 
 ## 已知限制
@@ -301,6 +303,20 @@ po2lmo po/pzl8.zh-cn.po files/usr/lib/lua/luci/i18n/pzl8.zh-cn.lmo
   路径看到连接之前就把它交给了 NSS。实测：开启后 flowtable 接到零条连接，而 NSS
   照常加速。两个都保持关闭。
 - 2.4 GHz 吞吐低于两个参照固件，原因见上文「三方同法对比」。
+- **5 GHz 的信道分析在 160 MHz 下用不了。** 5 GHz 里不存在不含 DFS 的 160 MHz
+  块，而 mac80211 在信道上下文启用了雷达检测时会拒绝扫描（`iw scan` 直接
+  `Resource busy`），所以 LuCI 的「信道分析」在 5 GHz 上只看得到自己。要扫全频段，
+  先把 radio1 降到 HE80（36–48 或 149–161），扫完再切回去。2.4 GHz 没有 DFS，
+  不受影响。
+- **雷达会把 5 GHz 打回 80 MHz，而且不会自己回来。** 30 分钟静默期到期、
+  `wifi reload`、运行时信道切换都不行，只有 `wifi down radio1 && wifi up radio1`
+  能重新跑 CAC（实测 64 秒，期间只有 5 GHz 断）。**静默期内重启射频会让 5 GHz
+  完全起不来**，别在那时候动它。自动恢复的看门狗写过，因为一分钟断线的代价比停在
+  80 MHz 更大而弃用。
+- **「实时信息 → 无线」的 Phy Rate 在高速率下是错的。** 数据源 `luci-bwc` 把速率
+  存在一个 `uint16_t` 里（单位 kbit/s，上限 65.5 Mbit/s），1921.5 Mbit/s 会回绕成
+  20 Mbit/s；噪声低于 -100 dBm 也一律显示 -100。两个都是 LuCI 上游的问题。另外
+  这一页画的是**关联客户端**的信号和速率，没有客户端时全是 0 属于正常。
 - `qca-ssdk-shell`（`ssdk_sh`）编译不过——`-fPIC` 穿不过它的递归 make 传不到
   `src/sal/sd`。
 

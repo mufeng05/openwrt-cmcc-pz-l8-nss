@@ -205,7 +205,131 @@ the ring descriptions map (ath11k's `struct hal_srng` carries the same
 but mac80211 coexistence and debugging against a firmware blob are the hard
 parts.
 
-## 7. Traps worth remembering
+## 7. Every accelerated connection's statistics were being discarded
+
+Noticed on a macvlan: 436 MB through `eth1` moved the counter on the macvlan
+over it by 2.9 MB. The offload helper that folds an accelerator's counts into a
+macvlan was the obvious suspect and was not at fault — it adds exactly what ECM
+hands it, and ECM had nothing to hand it. ECM's own database agreed:
+`adv_stats.to_data_total` read **197 bytes** for a flow that had moved half a
+gigabyte.
+
+NSS reports per-connection counters only when polled. ECM polls once a second,
+walking the firmware's connection table in chunks — `nss_ipv4_conn_sync_many_msg`,
+`index` in, `count` and `next` out — and feeds each returned record to
+`ecm_interface_stats_update()`, which is what advances conntrack, the ECM
+database, and the counters of every virtual interface in the path. Instrumented,
+546 polls across twelve seconds of gigabit traffic returned ACK with
+**`count = 0` every time**, `next` stepping 0, 40 … 2040 and round again: the
+whole table, ten times over, reporting nothing.
+
+The count was not zero on the wire. `qca-nss-drv` clamped it before ECM saw it.
+Patch 0112 bounds `count` by `ncm->len`, and the firmware leaves `ncm->len` at
+the request length, so the capacity computes to zero and every count clamps to
+zero — silently, because `nss_warning` is compiled out unless the debug level is
+raised. `ncm->len` cannot be made to work either: the length check above that
+switch rejects any message longer than `struct nss_ipv4_msg`, which has no room
+for the array.
+
+`size` is the field that describes the buffer. It is a *request* field, filled
+in by the host and returned untouched, and `nss_core_send_cmd()` shows why it is
+the right one: the request is an skb of `max(size, buf_size)` — ECM asks for
+`PAGE_SIZE` — sent with `H2N_BIT_FLAG_BUFFER_REUSABLE`, so the response comes
+back in that same buffer. Capping at `PAGE_SIZE` makes the bound the allocation
+itself, since `nss_core_send_cmd()` refuses to send anything larger.
+
+Measured on the fixed build, 500 MB through the macvlan, idle to idle:
+
+| | before | after |
+|---|---|---|
+| macvlan bytes vs `eth1` bytes | 2.9 MB of 436 MB (0.7 %) | 538.7 MB of 545.2 MB (98.8 %) |
+| macvlan packets vs `eth1` packets | — | 359 164 of 359 276 (99.97 %) |
+| ECM `adv_stats.to_data_total` | 197 B | 1.11 GB |
+| conntrack on an accelerated flow | frozen | advancing |
+
+The remaining 1.2 % is the Ethernet header: ECM's counts are L3 bytes, and
+folding them into an L2 device loses 14 bytes a packet — `eth1` averages 1517
+bytes/packet over the same traffic, the macvlan 1500.
+
+None of this was macvlan-specific. Anything whose counters ECM has to fold in by
+hand — conntrack accounting, PPPoE, VLAN, bridge — read near zero for
+accelerated traffic.
+
+## 8. 160 MHz means DFS, and DFS costs more than the CAC
+
+No 160 MHz block in 5 GHz avoids radar channels: 36–64 contains 52–64, 100–128
+is entirely DFS, and 149–165 tops out at 80 MHz here. Running the default HE160
+therefore means running with radar detection enabled, and two things follow that
+are not the 60-second CAC everybody expects.
+
+**A radar event drops the radio to 80 MHz and nothing puts it back.** hostapd
+announces a switch to the non-DFS half and stays there. Measured with
+`dfs_simulate_radar` in ath11k's debugfs:
+
+- the 30-minute non-occupancy period expiring does **not** bring it back;
+- `wifi reload` does not either — the log shows only "Reloaded settings", it
+  never re-selects a channel and never starts a CAC;
+- a runtime channel switch is refused: `switch_chan` to 160 MHz returns
+  "(extension) channel is disabled", because after the NOP those channels are
+  *usable* again but not *available* until another CAC, and a channel switch
+  announcement cannot run one.
+
+What works is restarting that one radio, which re-runs CAC: 64 s measured from
+`DFS-CAC-START` to `DFS->ENABLED`, with only that band down. **Do not try it
+while the NOP is still running** — hostapd then fails to start rather than
+falling back, and 5 GHz is left down entirely.
+
+A watchdog that waited out the NOP and then restarted the radio was written and
+deliberately dropped: a minute without 5 GHz is worse than sitting at 80 MHz for
+anyone with traffic on it, and where radar is genuinely present, retrying every
+half hour is worse still.
+
+**Scanning is blocked outright.** mac80211 refuses a scan while the channel
+context has radar detection enabled — the radio cannot leave a channel it has
+passed CAC on without having to redo it:
+
+| radio1 | `iw dev phy1-ap0 scan` |
+|---|---|
+| ch36 HE160, centre 50, block 36–64 (DFS) | `Resource busy (-16)`; `iwinfo`: "No event received" |
+| ch36 HE80, centre 42, block 36–48 (no DFS) | returns neighbours normally |
+
+That is why LuCI's channel analysis shows nothing but the local AP on 5 GHz
+while 2.4 GHz lists everything in range. It is not a LuCI fault and there is no
+fix short of not using 160 MHz. To survey the band, drop radio1 to HE80 on
+36–48 or 149–161, scan, and put it back.
+
+## 9. macvlan for WAN multi-dial
+
+Several dial-up sessions over one WAN port means one macvlan per session, and
+without acceleration that traffic falls back to software forwarding. It works
+here, under two conditions.
+
+**The kernel needs two helpers QSDK has and OpenWrt does not.** ECM calls
+`macvlan_get_mode()` and `macvlan_offload_stats_update()`; neither exists
+anywhere in 6.12, so selecting `kmod-macvlan` made `ecm_interface.c` fail with
+two implicit-declaration errors and stopped the build. Both are small enough to
+live in `include/linux/if_macvlan.h` beside `macvlan_count_rx()` — `struct
+macvlan_dev` already exposes the mode and the per-CPU stats — and are added by
+`620-macvlan-add-offload-helpers.patch`.
+
+**ECM accelerates `mode private` and nothing else.**
+`ecm_interface_macvlan_mode_is_valid()` returns true for `MACVLAN_MODE_PRIVATE`
+and false for bridge, vepa and passthru, with no knob anywhere:
+
+```
+config device
+	option type    'macvlan'
+	option name    'wan2'
+	option ifname  'eth1'
+	option mode    'private'
+```
+
+Measured: the macvlan takes its own DHCP lease, the server on the far side sees
+every connection sourced from the macvlan's address rather than the parent's,
+and a single stream runs at 988 Mbit/s with 2.17 % host CPU and the connections
+present in ECM's database — accelerated, not falling back.
+
+## 10. Traps worth remembering
 
 - **Backup files inside `base-files/` ship to the device.** A stray
   `01_leds.pristine` was executed by `/bin/board_detect`, which globs
@@ -220,4 +344,21 @@ parts.
   wedged filesystem and `ping` hangs on a wedged network; both defeated a
   deadman timer that then never fired. `echo b > /proc/sysrq-trigger` only.
 - **`pgrep -f <pattern>` matches the script's own command line** when the script
-  is passed to `sh -c`, so `kill` becomes suicide. Use a PID file.
+  is passed to `sh -c`, so `kill` becomes suicide. Use a PID file. The same
+  self-match makes `pgrep -f 'make -j8'` report a build as still running long
+  after it finished.
+- **Do not drop a locally built kernel module into a released image.** A
+  `qca-nss-drv.ko` built here and copied over the one in a running release
+  rebooted the board the moment traffic was accelerated — reproducibly, with two
+  different variants of the change under test, and again with that change
+  reverted, so it was not the change. The stock modules never did it, and a
+  whole image built from the same tree never did it either. The one concrete
+  difference found is that the module in `build_dir` is unstripped, 6.1 MB
+  against the packaged 410 KB; the mechanism was never established, because the
+  oops cannot get out — the network is what dies, and this image has no
+  `netconsole`. Build the image. It takes eight minutes on a warm tree.
+- **Once `nss-offload` has self-disabled, `/etc/init.d/nss-offload start` will
+  not bring it back.** `nss_load()` returns early when `qca_nss_drv` is already
+  present, and ath11k pulls it in at boot whatever the flag says, so `start`
+  quietly does nothing but re-apply the pbuf tuning. Remove `/etc/nss-disabled`
+  *and* `/etc/nss-boot-pending`, then reboot.
