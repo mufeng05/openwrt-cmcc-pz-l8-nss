@@ -366,6 +366,54 @@ The workflow re-checks the same four symbols after `defconfig`, so a seed that
 loses one fails in seconds with `MISS <symbol>` instead of forty minutes later
 in modpost.
 
+## The Fudan flash in V2 units
+
+One batch of this model (V2) ships the Fudan Micro **FM25LS01** SPI-NAND in
+place of the earlier ESMT F50D1G41LB. Neither mainline nor OpenWrt 25.12.5
+knows that ID - `fmsh.c` carries only FM25S01A (0xE4) and FM25S01BI3 (0xd4) -
+so the flash is not detected at all on a V2 board.
+
+`openwrt/tree/target/linux/generic/pending-6.12/440-mtd-spinand-add-support-for-FudanMicro-FM25LS01.patch`
+adds the entry: ID `0xA5`, 2048-byte pages, 128-byte OOB, 64 pages per block,
+1024 blocks. It lives in `pending-` rather than `backport-` because it is not
+upstream. Worth knowing: `fmsh.c` is not a stock kernel file either - OpenWrt
+adds it through two generic backports, 401 and 435.
+
+The patch comes from
+[CrazyBoyFeng/openwrt-pz-l8](https://github.com/CrazyBoyFeng/openwrt-pz-l8),
+by way of ImmortalWrt's `400-mtd-spinand-Support-fmsh.patch` and originally
+Rockchip BSP.
+
+### About that ECC figure
+
+The patch declares `NAND_ECCREQ(8, 512)` where the datasheet specifies 1 bit
+per 512 on-die. That is not a typo.
+
+The QPIC controller does **not** use the chip's on-die ECC; it configures its
+own hardware ECC from the declared requirement. This board's own dmesg shows
+the mechanism directly - our chip is the ESMT, declared at 1 bit:
+
+```
+qcom_snand 79b0000.spi: ECC strength requirement of 1-bit(s) is unsupported, trying 4-bits
+```
+
+So the declared figure decides what Linux actually uses, and it has to match
+whatever U-Boot wrote with, or UBI written by the bootloader cannot be read
+(-74 EUCLEAN). The 8 is what the patch author measured on their own V2 board.
+**If a V2 unit does not boot after flashing and reports EUCLEAN, that line is
+the first thing to look at.**
+
+### What was not verified
+
+**This board is a V1** - its dmesg reads `ESMT SPI NAND was found` with a
+64-byte OOB. So this path was verified only as far as *the patch applies
+cleanly and builds*; it has never been run on real FM25LS01 hardware here. The
+chip ID, geometry and ooblayout are taken from the upstream patch and were not
+independently checked against the datasheet.
+
+The risk to a V1 board is close to zero: it adds one row to a chip table, which
+takes effect only when ID `0xA5` is read.
+
 ## Flashing
 
 Releases carry **`*-uboot-recovery.fit`**, which is the only file the

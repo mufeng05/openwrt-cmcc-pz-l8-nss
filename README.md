@@ -324,6 +324,43 @@ cd openwrt
 workflow 在 `defconfig` 之后会重新校验同样这四个符号，所以种子配置要是丢了哪个，
 会在几秒内报 `MISS <symbol>`，而不是四十分钟后死在 modpost。
 
+## V2 批次的复旦闪存
+
+这个型号有一批（V2）用的是复旦微 **FM25LS01** SPI-NAND，替代早期的 ESMT
+F50D1G41LB。主线内核和 OpenWrt 25.12.5 都还没有这颗的 ID——`fmsh.c` 里只有
+FM25S01A（0xE4）和 FM25S01BI3（0xd4），所以 V2 板子上闪存认不出来。
+
+`openwrt/tree/target/linux/generic/pending-6.12/440-mtd-spinand-add-support-for-FudanMicro-FM25LS01.patch`
+补上这一条（ID `0xA5`，2048 字节页 / 128 字节 OOB / 64 页每块 / 1024 块）。
+放在 `pending-` 而不是 `backport-`，因为它还没进主线。顺带说明：`fmsh.c` 本身
+也不是内核自带的，是 OpenWrt 的 generic backport 加进去的（401 和 435 两个补丁）。
+
+补丁来自 [CrazyBoyFeng/openwrt-pz-l8](https://github.com/CrazyBoyFeng/openwrt-pz-l8)，
+原始出处是 ImmortalWrt 的 `400-mtd-spinand-Support-fmsh.patch`（再往前是 Rockchip BSP）。
+
+### 关于那个 ECC 数值
+
+补丁声明 `NAND_ECCREQ(8, 512)`，而数据手册写的是片上 1-bit/512。这不是笔误。
+
+QPIC 控制器**不使用片上 ECC**，它按声明的强度去配自己的硬件 ECC。本机 dmesg
+就是这个机制的直接证据（我们这块是 ESMT，声明 1-bit）：
+
+```
+qcom_snand 79b0000.spi: ECC strength requirement of 1-bit(s) is unsupported, trying 4-bits
+```
+
+所以声明值决定 Linux 侧实际用几 bit，**必须和 U-Boot 写入时用的一致**，否则读
+不出 bootloader 写的 UBI（-74 EUCLEAN）。8 是补丁作者在自己的 V2 板子上定的
+经验值。**如果你的 V2 刷完起不来并报 EUCLEAN，第一个要看的就是这一行。**
+
+### 没有验证的部分
+
+**我手上这块是 V1**，dmesg 报 `ESMT SPI NAND was found`、OOB 64 字节。所以这条
+路径我**只验证到「补丁能干净应用、能编过」**，没有在真实 FM25LS01 硬件上跑过。
+chip ID、几何参数、ooblayout 都是照搬上游那份补丁，没有独立核对过数据手册。
+
+对 V1 板子的风险接近零：它只是往芯片表里加一条，只有读到 ID `0xA5` 时才生效。
+
 ## 刷机
 
 Releases 里带 **`*-uboot-recovery.fit`**，那是 `192.168.10.10` 的 U-Boot
