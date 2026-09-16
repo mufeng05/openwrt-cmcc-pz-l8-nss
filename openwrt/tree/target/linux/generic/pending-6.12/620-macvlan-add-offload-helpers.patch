@@ -1,0 +1,67 @@
+From: CMCC PZ-L8 NSS project
+Subject: [PATCH] macvlan: add the offload helpers QSDK's ECM expects
+
+qca-nss-ecm's macvlan support calls macvlan_get_mode() and
+macvlan_offload_stats_update(). QSDK carries both in its own kernel; neither
+exists in mainline, so selecting kmod-macvlan makes ecm_interface.c fail with
+two implicit-declaration errors and stops the build.
+
+Both are small enough to live in the header beside macvlan_count_rx(), and
+neither needs a change to drivers/net/macvlan.c - struct macvlan_dev already
+exposes the mode and the per-CPU stats this needs.
+
+Wanted here for WAN multi-session dialling, where each PPPoE session runs on
+its own macvlan over the WAN port: without acceleration that traffic falls back
+to software forwarding.
+
+--- a/include/linux/if_macvlan.h	2026-09-16 16:22:18.019221939 +0800
++++ b/include/linux/if_macvlan.h	2026-09-16 16:22:18.019221939 +0800
+@@ -57,6 +57,48 @@
+ 	}
+ }
+ 
++/*
++ * macvlan_get_mode()
++ *	The mode a macvlan device was created with.
++ *
++ * For an accelerator deciding whether it may take the traffic: only private
++ * mode has no peer-to-peer path through the parent that bypassing the stack
++ * would break. Caller must already know dev is a macvlan.
++ */
++static inline enum macvlan_mode macvlan_get_mode(struct net_device *dev)
++{
++	struct macvlan_dev *vlan = netdev_priv(dev);
++
++	return vlan->mode;
++}
++
++/*
++ * macvlan_offload_stats_update()
++ *	Fold counters for traffic an accelerator carried into the per-CPU stats.
++ *
++ * Offloaded frames never pass through macvlan_count_rx() or the xmit path, so
++ * without this `ip -s link` on the macvlan reads zero however much it moved.
++ * Locking follows macvlan_count_rx() above.
++ */
++static inline void macvlan_offload_stats_update(struct net_device *dev,
++						struct rtnl_link_stats64 *stats,
++						bool update_mcast_rx_stats)
++{
++	struct macvlan_dev *vlan = netdev_priv(dev);
++	struct vlan_pcpu_stats *pcpu_stats;
++
++	pcpu_stats = get_cpu_ptr(vlan->pcpu_stats);
++	u64_stats_update_begin(&pcpu_stats->syncp);
++	u64_stats_add(&pcpu_stats->rx_packets, stats->rx_packets);
++	u64_stats_add(&pcpu_stats->rx_bytes, stats->rx_bytes);
++	if (update_mcast_rx_stats)
++		u64_stats_add(&pcpu_stats->rx_multicast, stats->rx_packets);
++	u64_stats_add(&pcpu_stats->tx_packets, stats->tx_packets);
++	u64_stats_add(&pcpu_stats->tx_bytes, stats->tx_bytes);
++	u64_stats_update_end(&pcpu_stats->syncp);
++	put_cpu_ptr(vlan->pcpu_stats);
++}
++
+ extern void macvlan_common_setup(struct net_device *dev);
+ 
+ extern int macvlan_common_newlink(struct net *src_net, struct net_device *dev,
