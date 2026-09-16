@@ -152,9 +152,11 @@ which that PR misses) recovers ~36 MB:
 | stock rings + NSS + both radios | 1.6 MB — reboot loop |
 | reduced rings, same load | 18–20 MB |
 
-## 6. Why WiFi forwarding is slow with NSS
+## 6. Why WiFi needed an offload of its own
 
-This is the one significant thing that is **not** fixed, and it is structural.
+Accelerating the wired path does not carry WiFi with it. The reason is worth
+keeping, because it is what forced the `nss-wifili` work, and because the
+numbers below are what that work has to be measured against.
 
 NSS acceleration works by taking `eth0`/`eth1` away from the kernel
 (`nss_dp_override_data_plane`). For traffic NSS forwards itself, the packet
@@ -162,7 +164,8 @@ never enters Linux: ~78 000 pps, 944 Mbps, 0 % host CPU.
 
 A packet the *host* injects takes a different route — descriptor write, DMA
 sync, doorbell, UBI32 transmit, buffer returned through the empty-buffer queue,
-**interrupt back to the host**. Measured during a wifi transfer:
+**interrupt back to the host**. Measured during a wifi transfer, before the
+radios were offloaded:
 
 ```
 tx packets          +108 468 over 14.2 s   ->  7 660 pps
@@ -172,38 +175,54 @@ nss_queue0           +47 569                ->  3 359 /s
 ```
 
 That per-packet round trip caps host-injected traffic at ~7 700 pps ≈ 92 Mbps,
-which is exactly where wifi forwarding lands. It is *worse* than no NSS at all
-(308 Mbps) because the native `syn_gmac` path batches completions through NAPI
+which is exactly where wifi forwarding landed. It was *worse* than no NSS at all
+(308 Mbps), because the native `syn_gmac` path batches completions through NAPI
 while the NSS handoff does not.
 
 ECM cannot rescue it: its NSS front end needs an NSS interface number for every
 interface in the path, `phy1-ap0` has none, so ECM never even attempts
 acceleration (`pending_accel = 0`, not a failed attempt).
 
-Two things were tried and are worth recording:
+Two things were tried against that ceiling. Both are obsolete now and are kept
+because they say where the cost was:
 
 - **ECM redirect off** (`dev.nss.general.redirect=0`): 72 vs 70 Mbps. Not ECM.
 - **GRO off** on the wifi netdevs: 70.8 → 92.1 Mbps. The non-linear skbs were
   100 % GRO-produced (`nr_frags` +8232 → +10), and NSS spends a descriptor and
-  a DMA map per fragment. This does not beat the ceiling, it just stops wasting
-  the round-trip budget on 515 giant skbs/s instead of 7 983 normal ones. It
-  costs ~30 % of local wifi throughput (641 → 449 Mbps), so it is left off by
-  default.
+  a DMA map per fragment. That did not beat the ceiling, it only stopped wasting
+  the round-trip budget on 515 giant skbs/s instead of 7 983 normal ones, and it
+  cost ~30 % of local wifi throughput (641 → 449 Mbps).
 
-The vendor avoids all of this because its wifi driver registers the radios with
-NSS (`nss-wifili`): wifi Rx happens *inside* NSS and the packet goes
+The only way past it is the one the vendor takes: register the radios with NSS
+(`nss-wifili`), so wifi Rx happens *inside* NSS and the packet goes
 WLAN ring → NSS → eth1 without touching the host, structurally identical to the
-wired path. nwrt measured on this same hardware: **~624 Mbps at 25–35 % CPU**
-(from `eth1_tx` deltas, ~78 MB/s).
+wired path. nwrt, measured on this same hardware, gets **~624 Mbps at 25–35 %
+CPU** that way (from `eth1_tx` deltas, ~78 MB/s).
 
-`nss_wifili`'s NSS-side API is fully open in `qca-nss-drv`. The driver-side glue
-is not: `qca-wifi-oss` in the QSDK 14 manifest is 75 files of crypto/qal/wmi
-headers with no `osif_nss` or `wifili` anywhere, and QSDK 14's `nss-clients` is
-entirely PPE-oriented. Writing that glue against ath11k is a research project —
-the ring descriptions map (ath11k's `struct hal_srng` carries the same
-`ring_base_paddr`/`entry_size`/register bases `nss_wifili_hal_srng_info` wants),
-but mac80211 coexistence and debugging against a firmware blob are the hard
-parts.
+**That is what this build now does**, and it is the single largest thing in it.
+`nss-wifili-probe` hands each radio's data path to NSS once ath11k has brought
+it up — both radios, at boot, with nothing to run by hand:
+
+```
+nss: handing the data path of slot 0 over
+nss: slot 0 data path is NSS-owned        c000000.wifi  (2.4 GHz)
+nss: slot 1 data path is NSS-owned        b00a040.wifi  (5 GHz)
+```
+
+Measured after: **697 Mbit/s on 5 GHz at 160 MHz with 2.9 % host CPU**, against
+the 92 Mbps ceiling above. The full derivation — what had to be right, the
+per-radio handover, the Rx descriptor pool, and the firmware ABI it is tied to —
+is in [WIFILI.md](WIFILI.md).
+
+The source situation that made this look impossible was real, and is why it took
+what it did: `nss_wifili`'s NSS-side API is fully open in `qca-nss-drv`, but the
+driver-side glue is not. `qca-wifi-oss` in the QSDK 14 manifest is 75 files of
+crypto/qal/wmi headers with no `osif_nss` or `wifili` anywhere, and QSDK 14's
+`nss-clients` is entirely PPE-oriented. What made it tractable is that the ring
+descriptions map: ath11k's `struct hal_srng` carries the same
+`ring_base_paddr`/`entry_size`/register bases that `nss_wifili_hal_srng_info`
+wants. mac80211 coexistence and debugging against a firmware blob were the hard
+parts, as expected.
 
 ## 7. Every accelerated connection's statistics were being discarded
 

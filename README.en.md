@@ -557,3 +557,28 @@ NSS feeds, all GPL:
 
 The ath11k ring-shrinking approach follows
 <https://github.com/openwrt/openwrt/pull/21495>, which was not merged.
+
+---
+
+## Licence
+
+The top-level [LICENSE](LICENSE) is GPL-2.0-only, which is the licence of this
+project's own code. The repository is mixed, though, and the
+`SPDX-License-Identifier` at the head of each file is what governs:
+
+| | licence |
+|---|---|
+| this project's own code (`feed/nss-wifili-probe/src/`, `ipq5018-nss.dtsi`) | `GPL-2.0-only` |
+| the ath11k NSS offload patch (`991-ath11k-nss-wifili-offload.patch`) | `BSD-3-Clause-Clear`, following QSDK and mainline ath11k |
+| patches to files OpenWrt or Linux already ship | whatever the patched work is under |
+| package Makefiles under `feed/` | GPL-2.0, as OpenWrt's packages are |
+
+Two things worth stating:
+
+- **Qualcomm's QSDK sources are not in this repository.** `feed/` carries
+  Makefiles and patches; the sources are fetched at build time from
+  git.codelinaro.org, pinned to the commits listed in the previous section.
+- **The NSS firmware is a binary blob and is likewise not in this repository.**
+  It is downloaded at build time from
+  [qosmio/qca-sdk-nss-fw](https://github.com/qosmio/qca-sdk-nss-fw) and carries
+  its own distribution terms.

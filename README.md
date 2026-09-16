@@ -482,3 +482,25 @@ QSDK 源码属于高通，来自 <https://git.codelinaro.org/clo/qsdk>。
 
 ath11k 缩环的做法参考了 <https://github.com/openwrt/openwrt/pull/21495>，
 该 PR 未被合并。
+
+---
+
+## 许可
+
+顶层的 [LICENSE](LICENSE) 是 GPL-2.0-only，那是本项目自有代码的许可。但这个仓库
+是混合许可的，**以各文件头部的 `SPDX-License-Identifier` 为准**：
+
+| | 许可 |
+|---|---|
+| 本项目自有代码（`feed/nss-wifili-probe/src/`、`ipq5018-nss.dtsi`） | `GPL-2.0-only` |
+| ath11k 的 NSS 卸载补丁（`991-ath11k-nss-wifili-offload.patch`） | `BSD-3-Clause-Clear`，沿用 QSDK 与 mainline ath11k |
+| 对 OpenWrt / Linux 已有文件的补丁 | 沿用被修改作品本身的许可 |
+| `feed/` 下各包的 Makefile | 与 OpenWrt 的包一致，GPL-2.0 |
+
+两点需要说明：
+
+- **高通 QSDK 的源码不在本仓库内。** `feed/` 里只有 Makefile 和补丁，源码在构建时
+  从 git.codelinaro.org 拉取，锁定到具体 commit（见上一节）。
+- **NSS 固件是二进制 blob，同样不在仓库内**，构建时从
+  [qosmio/qca-sdk-nss-fw](https://github.com/qosmio/qca-sdk-nss-fw) 下载，
+  有其自己的分发条款。
