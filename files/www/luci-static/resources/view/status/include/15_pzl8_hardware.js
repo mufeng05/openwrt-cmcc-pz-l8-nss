@@ -30,6 +30,29 @@ function celsius(mdeg) {
 	return isNaN(v) ? '-' : (v / 1000).toFixed(1) + ' °C';
 }
 
+/* Bytes per interval to bits per second. A negative delta means the counter
+ * was reset - an interface going down - so the rate is unknown, not negative.
+ */
+function rate(deltaBytes, deltaMs) {
+	if (deltaBytes == null || deltaBytes < 0 || !(deltaMs > 0))
+		return null;
+
+	return deltaBytes * 8000 / deltaMs;
+}
+
+function bits(v) {
+	if (v == null)
+		return '-';
+	if (v >= 1e9)
+		return (v / 1e9).toFixed(2) + ' Gbit/s';
+	if (v >= 1e6)
+		return (v / 1e6).toFixed(1) + ' Mbit/s';
+	if (v >= 1e3)
+		return (v / 1e3).toFixed(1) + ' kbit/s';
+
+	return Math.round(v) + ' bit/s';
+}
+
 function parseStat(line) {
 	if (typeof line != 'string')
 		return null;
@@ -115,10 +138,43 @@ return baseclass.extend({
 
 		/* Both numbers in one cell rather than a sentence. A bare "peak" as a
 		 * msgid would translate that word everywhere else in LuCI too, which
-		 * is not this file's business. */
+		 * is not this file's business.
+		 *
+		 * NSS, not NSS/PPE: the packet processing engine is an IPQ807x /
+		 * IPQ60xx / IPQ95xx block. IPQ5018 does not have one. */
 		if (data.nss)
-			rows.push(_('NSS/PPE utilisation (average / peak)'),
+			rows.push(_('NSS utilisation (average / peak)'),
 				data.nss.avg + ' % / ' + data.nss.max + ' %');
+
+		if (data.ecm != null)
+			rows.push(_('Accelerated connections'), String(data.ecm));
+
+		/* Throughput needs two samples and the wall time between them. The
+		 * poll interval is not fixed, so it is measured rather than assumed. */
+		var now = Date.now(),
+		    prevNet = this.prevNet,
+		    nowNet = {};
+
+		(data.net || []).forEach(function(iface) {
+			nowNet[iface.dev] = iface;
+		});
+
+		this.prevNet = { t: now, dev: nowNet };
+
+		(data.net || []).forEach(function(iface) {
+			var was = prevNet ? prevNet.dev[iface.dev] : null,
+			    ms = prevNet ? now - prevNet.t : 0,
+			    rx = was ? rate(iface.rx - was.rx, ms) : null,
+			    tx = was ? rate(iface.tx - was.tx, ms) : null;
+
+			rows.push(
+				(iface.role == 'wan' ? _('WAN throughput')
+				                     : _('LAN throughput'))
+					+ ' (' + iface.dev + ')',
+				(rx == null && tx == null)
+					? _('Collecting data...')
+					: '\u2193 ' + bits(rx) + '\u2003\u2191 ' + bits(tx));
+		});
 
 		var table = E('table', { 'class': 'table' });
 

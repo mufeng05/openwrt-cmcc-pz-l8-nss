@@ -62,8 +62,33 @@ nss_load() {
 	awk '/Min/ { getline; gsub(/%/, ""); print $1 " " $2 " " $3; exit }' "$nss_stats"
 }
 
+# Byte counters come from the netdev, which nss-dp fills from the NSS's own
+# accounting. Measured during a transfer: eth0 and eth1 both moved 989 Mbit/s
+# while br-lan saw 52, because accelerated traffic never reaches the Linux
+# bridge - so the bridge is deliberately not a source here.
+#
+# Ports are found by driver rather than by name, and WAN is whichever one
+# carries the default route.
+net_stats() {
+	local wan i n drv rx tx role first=1
+	wan=$(awk '$2 == "00000000" && $8 == "00000000" { print $1; exit }' \
+		/proc/net/route 2>/dev/null)
+	for i in /sys/class/net/*; do
+		n=$(basename "$i")
+		drv=$(readlink -f "$i/device/driver" 2>/dev/null)
+		[ "$(basename "$drv" 2>/dev/null)" = "nss-dp" ] || continue
+		rx=$(cat "$i/statistics/rx_bytes" 2>/dev/null) || continue
+		tx=$(cat "$i/statistics/tx_bytes" 2>/dev/null) || continue
+		[ -n "$rx" ] && [ -n "$tx" ] || continue
+		if [ "$n" = "$wan" ]; then role=wan; else role=lan; fi
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"dev":"%s","role":"%s","rx":%s,"tx":%s}' "$n" "$role" "$rx" "$tx"
+	done
+}
+
 emit_status() {
-	local model cores freq gov ctemp nss wt
+	local model cores freq gov ctemp nss wt ecm net
 	model=$(cpu_model)
 	cores=$(grep -c '^processor' /proc/cpuinfo 2>/dev/null)
 	freq=$(read1 /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
@@ -92,6 +117,12 @@ emit_status() {
 		set -- $nss
 		printf ',"nss":{"min":%s,"avg":%s,"max":%s}' "${1:-0}" "${2:-0}" "${3:-0}"
 	fi
+
+	ecm=$(read1 /sys/kernel/debug/ecm/ecm_db/connection_count)
+	case "$ecm" in ''|*[!0-9]*) ;; *) printf ',"ecm":%s' "$ecm" ;; esac
+
+	net=$(net_stats)
+	[ -n "$net" ] && printf ',"net":[%s]' "$net"
 
 	printf '}\n'
 }

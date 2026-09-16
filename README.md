@@ -154,7 +154,21 @@ uci commit wireless && wifi reload
 | CPU 占用 | `/proc/stat` 两次采样求差，在浏览器侧算 |
 | CPU 温度 | `/sys/class/thermal/` 里 type 含 `cpu` 的热区 |
 | Wi-Fi 温度 | `/sys/class/hwmon/` 里名为 `ath11k_hwmon` 的项，每个 radio 一个 |
-| NSS/PPE 占用 | `/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi` |
+| NSS 占用 | `/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi` |
+| 加速连接数 | `/sys/kernel/debug/ecm/ecm_db/connection_count` |
+| WAN / LAN 速率 | `nss-dp` 网口的 netdev 字节计数，两次采样求差 |
+
+**是 NSS 不是 NSS/PPE。** PPE（包处理引擎）是 IPQ807x / IPQ60xx / IPQ95xx
+那条线的硬件块，**IPQ5018 上没有**，所以标签里不该出现它。
+
+**速率取自 `eth0` / `eth1` 的 netdev 计数，不取 `br-lan`。** 实测过：一次传输中
+`eth0`/`eth1` 各走了 989 Mbit/s，而同一时间 `br-lan` 只看到 52 Mbit/s——
+被加速的流量根本不经过 Linux 网桥。网口是按驱动名 `nss-dp` 找的，不是写死
+接口名；WAN 是承载默认路由的那一个（读 `/proc/net/route`）。
+
+速率需要两次采样和两次之间的真实间隔。轮询间隔不是固定值，所以间隔是在
+浏览器侧**实测**的（`Date.now()` 之差），不是假设的。计数器出现负增量
+（接口 down 过）时显示为未知，而不是负数。
 
 三个文件，不改 LuCI 自带的任何东西：
 

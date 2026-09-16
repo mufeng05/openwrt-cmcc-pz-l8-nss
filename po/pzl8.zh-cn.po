@@ -18,5 +18,14 @@ msgstr "CPU 温度"
 msgid "Wi-Fi temperature"
 msgstr "Wi-Fi 温度"
 
-msgid "NSS/PPE utilisation (average / peak)"
-msgstr "NSS/PPE 占用（平均 / 峰值）"
+msgid "NSS utilisation (average / peak)"
+msgstr "NSS 占用（平均 / 峰值）"
+
+msgid "Accelerated connections"
+msgstr "加速连接数"
+
+msgid "WAN throughput"
+msgstr "WAN 速率"
+
+msgid "LAN throughput"
+msgstr "LAN 速率"

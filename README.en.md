@@ -176,7 +176,23 @@ to put them, so this build adds a section:
 | CPU load | two `/proc/stat` samples, differenced in the browser |
 | CPU temperature | the `/sys/class/thermal/` zone whose type contains `cpu` |
 | Wi-Fi temperature | the `/sys/class/hwmon/` entries named `ath11k_hwmon`, one per radio |
-| NSS/PPE utilisation | `/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi` |
+| NSS utilisation | `/sys/kernel/debug/qca-nss-drv/stats/cpu_load_ubi` |
+| Accelerated connections | `/sys/kernel/debug/ecm/ecm_db/connection_count` |
+| WAN / LAN throughput | netdev byte counters on the `nss-dp` ports, differenced |
+
+**NSS, not NSS/PPE.** The packet processing engine is an IPQ807x / IPQ60xx /
+IPQ95xx block; **IPQ5018 does not have one**, so the label should not claim it.
+
+**Throughput comes from `eth0` / `eth1`, not from `br-lan`.** Measured: during
+one transfer both ports moved 989 Mbit/s while `br-lan` saw 52, because
+accelerated traffic never reaches the Linux bridge. The ports are found by
+driver name (`nss-dp`) rather than hardcoded, and WAN is whichever one carries
+the default route, read from `/proc/net/route`.
+
+A rate needs two samples and the real interval between them. The poll interval
+is not fixed, so the interval is **measured** in the browser (`Date.now()`
+difference) rather than assumed, and a negative delta - an interface that went
+down - reads as unknown rather than as a negative rate.
 
 Three files, and nothing LuCI ships is modified:
 
