@@ -200,6 +200,12 @@ uci commit wireless && wifi reload
 
 ### 状态页上的硬件读数
 
+![概览页上的「硬件」小节](docs/img/overview-hardware.png)
+
+上图是**转发 988 Mbit/s 时**的实时读数：CPU 占用 15 %、NSS 占用 14 %、25 条加速
+连接，两个口一进一出各跑满千兆。数据面在 NSS 核里，主 CPU 基本是闲着的——这一节
+存在的意义就是让这件事看得见。
+
 原版 LuCI 的「概览」不显示 CPU 型号、温度和加速引擎占用。数据源一直都在，缺的
 只是展示层，所以这个构建补了一节：
 
@@ -248,6 +254,22 @@ files/www/luci-static/resources/view/status/include/15_pzl8_hardware.js
 `device` 始终是二层设备**——在设备上验过，一个挂在 dummy 上的 PPPoE 接口报的是
 `device = pppdummy` 而 `l3_device` 为空。**没有任何东西被假定叫 wan 或 lan，
 也没有假定它们存在**；没被认领的口照样显示，用自己的设备名。
+
+### 另外两页
+
+![网络 → 无线](docs/img/wireless.png)
+
+radio0 是 IPQ5018 内置的 2.4 GHz，radio1 是 QCN6122 —— **两个射频都在跑，都已
+卸载到 NSS**。5 GHz 停在 36 信道 160 MHz，「已连接站点」里那行 `160 MHz,
+HE-MCS 10, HE-NSS 2` 是**每站点**的协商速率，这一项需要改驱动才拿得到，见
+[docs/WIFILI.md](docs/WIFILI.md)。客户端的 MAC 和主机名做了涂抹处理。
+
+![网络 → 交换机](docs/img/switch.png)
+
+这一页是「把 DSA 换成 `qca-ssdk` + swconfig」之后的样子：**`CPU (eth0)` 和
+`CPU (eth1)` 两列并存**，也就是两个独立的 GMAC 各自成为一个 CPU 口，而不是 DSA
+那样只绑一个上行、另一个白白浪费。端口 MTU 是 1500，没有 DSA tag。理由见
+[docs/FINDINGS.md](docs/FINDINGS.md) 第 1 节。
 
 ### 界面语言
 
@@ -410,7 +432,7 @@ workflow 在 `defconfig` 之后会重新校验这些符号，所以种子要是�
 
 ```
 config/          .config 种子（diffconfig 输出）
-docs/            工程笔记——先看 FINDINGS.md
+docs/            工程笔记——先看 FINDINGS.md；img/ 是 README 里的截图
 feed/            本项目的包：qca-nss-drv、-ecm、-clients、qca-mcs、
                  nss-firmware、ipq-wifi、qca-ssdk-shell
 files/           rootfs 覆盖层：nss-offload 启动脚本、LuCI 硬件读数、中文 catalog

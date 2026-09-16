@@ -233,6 +233,14 @@ default.**
 
 ### Hardware readouts on the status page
 
+![The Hardware section on the overview page](docs/img/overview-hardware.png)
+
+Read while **routing 988 Mbit/s**: 15 % CPU, 14 % NSS, 25 accelerated
+connections, and both ports at line rate in opposite directions. The data path
+is inside the NSS cores and the main CPU is largely idle — making that visible
+is what this section is for. (The interface is in Chinese by default; see
+below.)
+
 Stock LuCI's overview shows no CPU model, no temperatures and no acceleration
 engine load. The data sources were always there; what was missing was somewhere
 to put them, so this build adds a section:
@@ -288,6 +296,24 @@ whose `device` is the bridge it belongs to. The point is that **netifd's
 interface over a dummy reported `device = pppdummy` with `l3_device` empty.
 **Nothing is assumed to be called wan or lan, and nothing is assumed to exist**;
 a port no interface claims is still shown, under its own name.
+
+### Two more pages
+
+![Network → Wireless](docs/img/wireless.png)
+
+radio0 is the IPQ5018's own 2.4 GHz, radio1 is the QCN6122 — **both radios run,
+both offloaded to NSS**. 5 GHz sits on channel 36 at 160 MHz, and the
+`160 MHz, HE-MCS 10, HE-NSS 2` line under the associated station is the
+**per-station** negotiated rate, which needed a driver change to obtain; see
+[docs/WIFILI.md](docs/WIFILI.md). The client's MAC and hostname are smudged out.
+
+![Network → Switch](docs/img/switch.png)
+
+This is what replacing DSA with `qca-ssdk` and swconfig looks like: **a
+`CPU (eth0)` column and a `CPU (eth1)` column side by side**, two independent
+GMACs each acting as a CPU port, rather than DSA binding one conduit and wasting
+the other. Ports are MTU 1500 with no DSA tag. The reasoning is in
+[docs/FINDINGS.md](docs/FINDINGS.md), section 1.
 
 ### Interface language
 
@@ -475,7 +501,8 @@ later — or shipping an image that built fine and came up in English.
 
 ```
 config/          .config seed (diffconfig output)
-docs/            engineering notes — start with FINDINGS.md
+docs/            engineering notes — start with FINDINGS.md; img/ holds the
+                 screenshots the READMEs use
 feed/            this project's packages: qca-nss-drv, -ecm, -clients, qca-mcs,
                  nss-firmware, ipq-wifi, qca-ssdk-shell
 files/           rootfs overlay: nss-offload init scripts, the LuCI readouts,
