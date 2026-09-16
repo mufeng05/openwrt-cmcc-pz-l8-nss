@@ -87,6 +87,11 @@ and wrote nothing.
 
 `scripts/mkrecovery.py` builds the right thing:
 
+Every release carries one already, as `*-uboot-recovery.fit`; CI builds it
+from the same factory image it publishes and fails the build if it grows past
+the bootloader's 32 MiB limit. Build one by hand only for an image that was not
+released:
+
 ```sh
 python3 scripts/mkrecovery.py <image>-squashfs-factory.ubi recovery.fit
 curl -F "firmware=@recovery.fit" http://192.168.10.10/

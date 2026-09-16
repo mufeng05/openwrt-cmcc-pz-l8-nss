@@ -64,7 +64,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
             gettext git libncurses-dev libssl-dev python3-setuptools rsync swig \
-            unzip zlib1g-dev file wget zstd libelf-dev
+            unzip zlib1g-dev file wget zstd libelf-dev \
+            u-boot-tools device-tree-compiler
           sudo timedatectl set-timezone "$TZ" || true
 
       - name: Checkout OpenWrt ${{ env.OPENWRT_REF }}
@@ -140,6 +141,36 @@ jobs:
         if: success()
         run: ls -lh "$FIRMWARE" && cat openwrt/bin/targets/qualcommax/ipq50xx/*.manifest | head -40
 
+      # The bootloader's web recovery page does not take a .ubi.  It runs
+      # `imgaddr=$fileaddr && source $imgaddr:script` on the upload, so the
+      # payload has to be a FIT carrying its own flashing script; a raw ubinized
+      # image reports success and writes nothing.  See docs/RECOVERY.md.
+      - name: Build the U-Boot recovery image
+        if: success()
+        run: |
+          set -eu
+          UBI=$(ls "$FIRMWARE"/*-squashfs-factory.ubi)
+          BASE=$(basename "$UBI" -squashfs-factory.ubi)
+          OUT="$FIRMWARE/$BASE-uboot-recovery.fit"
+
+          # OW first so a build tree's own mkimage wins; the apt ones are the
+          # fallback and work equally well.
+          OW="$GITHUB_WORKSPACE/openwrt" \
+            python3 "$GITHUB_WORKSPACE/pzl8-nss/scripts/mkrecovery.py" "$UBI" "$OUT"
+
+          # The bootloader refuses anything over 32 MiB, so a FIT that grew past
+          # it would be published and then rejected at the one moment it is
+          # needed.  Fail the build instead.
+          SIZE=$(stat -c %s "$OUT")
+          echo "recovery FIT: $SIZE bytes"
+          if [ "$SIZE" -gt 33554432 ]; then
+            echo "::error::recovery FIT is $SIZE bytes; U-Boot refuses over 0x2000000"
+            exit 1
+          fi
+
+          ( cd "$FIRMWARE" && sha256sum -b "$(basename "$OUT")" >> sha256sums )
+          ls -lh "$OUT"
+
       - name: Write the release notes
         if: success()
         run: |
@@ -151,11 +182,16 @@ jobs:
             echo "| file | use |"
             echo "|---|---|"
             echo "| \`*-squashfs-sysupgrade.bin\` | upgrading a router that already runs OpenWrt - \`sysupgrade -n\` |"
-            echo "| \`*-squashfs-factory.ubi\` | writing from U-Boot / first install |"
+            echo "| \`*-uboot-recovery.fit\` | **the U-Boot web recovery at 192.168.10.10** - the only file that page accepts |"
+            echo "| \`*-squashfs-factory.ubi\` | a forced \`sysupgrade -n -F\` from a vendor image, which writes it with \`ubiformat\` |"
             echo "| \`*-initramfs-uImage.itb\` | boots from RAM without touching flash, for recovery |"
             echo
-            echo "Default LAN address is **192.168.10.1**. Flashing, including the"
-            echo "U-Boot web recovery at 192.168.10.10, is in [docs/RECOVERY.md](docs/RECOVERY.md)."
+            echo "Default LAN address is **192.168.10.1**."
+            echo
+            echo "The U-Boot page does **not** take a \`.ubi\`: it runs"
+            echo "\`source \$imgaddr:script\` on the upload, so a raw image reports"
+            echo "success and writes nothing. Use the \`.fit\`. Both routes, and the"
+            echo "flash layout, are in [docs/RECOVERY.md](docs/RECOVERY.md)."
             echo
             echo '```'
             cat build-info.txt
@@ -163,7 +199,7 @@ jobs:
             echo
             echo "sha256:"
             echo '```'
-            grep -E 'sysupgrade\.bin|factory\.ubi|initramfs-uImage\.itb' $IPQ/sha256sums || cat $IPQ/sha256sums
+            grep -E 'sysupgrade\.bin|factory\.ubi|initramfs-uImage\.itb|uboot-recovery\.fit' $IPQ/sha256sums || cat $IPQ/sha256sums
             echo '```'
           } > release-notes.md
           cat release-notes.md
@@ -176,6 +212,7 @@ jobs:
           path: |
             ${{ env.FIRMWARE }}/*.bin
             ${{ env.FIRMWARE }}/*.ubi
+            ${{ env.FIRMWARE }}/*.fit
             ${{ env.FIRMWARE }}/*.manifest
             ${{ env.FIRMWARE }}/sha256sums
             build-info.txt
@@ -199,6 +236,7 @@ jobs:
           files: |
             ${{ env.FIRMWARE }}/*-sysupgrade.bin
             ${{ env.FIRMWARE }}/*-factory.ubi
+            ${{ env.FIRMWARE }}/*-uboot-recovery.fit
             ${{ env.FIRMWARE }}/*-initramfs-uImage.itb
             ${{ env.FIRMWARE }}/*.manifest
             ${{ env.FIRMWARE }}/sha256sums

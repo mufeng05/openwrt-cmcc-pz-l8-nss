@@ -368,6 +368,11 @@ in modpost.
 
 ## Flashing
 
+Releases carry **`*-uboot-recovery.fit`**, which is the only file the
+U-Boot web recovery at `192.168.10.10` accepts. That page runs
+`source $imgaddr:script` on the upload, so a `.ubi` reports success and writes
+nothing.
+
 `sysupgrade -n` from a running OpenWrt, or the U-Boot web recovery at
 `192.168.10.10`. Default LAN address is **192.168.10.1**.
 

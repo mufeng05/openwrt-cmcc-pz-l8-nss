@@ -326,6 +326,10 @@ workflow 在 `defconfig` 之后会重新校验同样这四个符号，所以种�
 
 ## 刷机
 
+Releases 里带 **`*-uboot-recovery.fit`**，那是 `192.168.10.10` 的 U-Boot
+网页恢复**唯一接受**的文件。那个页面执行的是 `source $imgaddr:script`，
+上传 `.ubi` 会显示「成功」然后什么都不写。
+
 从正在运行的 OpenWrt 跑 `sysupgrade -n`，或者用 `192.168.10.10` 的 U-Boot
 网页恢复。默认 LAN 地址是 **192.168.10.1**。
 

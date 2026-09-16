@@ -26,17 +26,54 @@ The script erases the whole rootfs partition before writing, which is what
 ubiformat does and what stops stale PEBs from the previous UBI being attached
 alongside the new ones.
 """
+import glob
 import os
+import shutil
 import subprocess
 import sys
 
-# mkimage needs dtc on PATH.  Both come out of an OpenWrt build; point OW at
-# the tree, or set MKIMAGE and DTCDIR in the environment.
+# mkimage needs dtc on its PATH.  Both come out of an OpenWrt build, but a
+# distro's u-boot-tools and device-tree-compiler work just as well, which is
+# what CI uses.  Order: explicit environment, then a tree under OW, then PATH.
+#
+# The tree paths are globbed rather than spelled out.  They carry the kernel
+# version, and writing it down means this breaks on the next bump - quietly,
+# because the fallback would just be "not found".
 OW = os.environ.get("OW", ".")
-MKIMAGE = os.environ.get("MKIMAGE", OW + "/staging_dir/host/bin/mkimage")
-DTCDIR = os.environ.get("DTCDIR", OW +
-    "/build_dir/target-aarch64_cortex-a53_musl/linux-qualcommax_ipq50xx"
-    "/linux-6.12.94/scripts/dtc")
+
+
+def _first_existing(patterns):
+    for pattern in patterns:
+        for match in sorted(glob.glob(pattern)):
+            if os.path.exists(match):
+                return match
+    return None
+
+
+def _dirof(path):
+    if path is None:
+        return None
+    return path if os.path.isdir(path) else os.path.dirname(path)
+
+
+MKIMAGE = (os.environ.get("MKIMAGE")
+           or _first_existing([OW + "/staging_dir/host/bin/mkimage"])
+           or shutil.which("mkimage"))
+
+DTCDIR = (os.environ.get("DTCDIR")
+          or _dirof(_first_existing([
+              OW + "/build_dir/target-*/linux-*/linux-*/scripts/dtc/dtc",
+              OW + "/build_dir/target-*/linux-*/linux-*/scripts/dtc",
+              OW + "/staging_dir/host/bin/dtc",
+          ]))
+          or _dirof(shutil.which("dtc")))
+
+if not MKIMAGE:
+    sys.exit("mkimage not found.  Set MKIMAGE, or OW to an OpenWrt tree, "
+             "or install u-boot-tools.")
+if not DTCDIR:
+    sys.exit("dtc not found.  Set DTCDIR, or OW to an OpenWrt tree, "
+             "or install device-tree-compiler.")
 
 WORK = "/tmp/pzl8-recovery"
 if len(sys.argv) != 3:
@@ -100,6 +137,8 @@ its = """/dts-v1/;
 itsp = os.path.join(WORK, "recovery.its")
 open(itsp, "w", newline="\n").write(its)
 
+print("mkimage: %s" % MKIMAGE)
+print("dtc dir: %s" % DTCDIR)
 env = dict(os.environ, PATH=DTCDIR + ":" + os.environ.get("PATH", ""))
 r = subprocess.run([MKIMAGE, "-f", itsp, OUT], capture_output=True, text=True,
                    env=env)
