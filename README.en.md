@@ -253,6 +253,36 @@ default.**
 
 ---
 
+## Full cone NAT
+
+Images built by CI carry
+[openwrt-sonic-fullcone](https://github.com/mufeng05/openwrt-sonic-fullcone):
+SONiC's fullcone NAT kernel patch ported to OpenWrt, with nftables, fw4 and LuCI
+support. **It is off by default**, and turning it on takes two switches:
+
+1. under Network → Firewall → General Settings, tick **Fullcone NAT** — the
+   global gate;
+2. edit the wan zone and tick **Fullcone NAT** in its General Settings (it only
+   appears while the zone masquerades).
+
+Or:
+
+```sh
+uci set firewall.@defaults[0].fullcone='1'
+uci set firewall.@zone[1].fullcone='1'
+uci commit firewall && /etc/init.d/firewall restart
+```
+
+Connections are still accelerated by NSS with it on (ECM `accel_mode=2`), and
+wired download holds at 949 Mbit/s, the same as with it off. **Connections that
+already existed when it was turned on are not affected**: NAT is decided when a
+connection is set up, and one already handed to NSS survives even a conntrack
+flush, so reboot once after enabling it. Restricting it to some protocols,
+the rules it generates and its known limitations are in that project's own
+README.
+
+---
+
 ## The web interface
 
 ### Hardware readouts on the status page
@@ -380,6 +410,7 @@ build tree. The server merges **every** `.lmo` for the requested language in
 - macvlan for WAN multi-dial, **accelerated** — the interfaces must be
   `option mode 'private'`, which is the only mode ECM takes; see
   [docs/FINDINGS.md](docs/FINDINGS.md)
+- Full cone NAT, off by default and still accelerated by NSS when on — see above
 - Status LEDs, WAN DHCP, LuCI (in Chinese), sysupgrade
 
 ## Known limitations
@@ -474,6 +505,27 @@ Interface, or:
 uci set luci.main.mediaurlbase='/luci-static/argon'
 uci commit luci
 ```
+
+CI also runs [openwrt-sonic-fullcone](https://github.com/mufeng05/openwrt-sonic-fullcone)'s
+own `add_sonic_fullcone.sh` after `setup.sh`, which puts the fullcone NAT kernel,
+libnftnl, nftables and fw4 patches and the LuCI options into the tree. It is
+CI-only like Argon and tracks master the same way, with the commit each build
+used recorded in `build-info.txt` as `fullcone_commit`. That script skips
+anything it cannot place and still exits 0, so the workflow requires it to
+report `0 skipped` and fails the build otherwise — an image that claims fullcone
+NAT and has none is worse than a failed build.
+
+To have it locally, run it after `setup.sh` and before building:
+
+```sh
+cd openwrt
+curl -sSL https://raw.githubusercontent.com/mufeng05/openwrt-sonic-fullcone/master/add_sonic_fullcone.sh | bash
+```
+
+**A tree that has been built before needs a full rebuild after adding it**
+(`make clean && make -j$(nproc)`). Patch 984 inserts a member in the middle of
+`struct nf_conn`, which moves every member after it, and an out-of-tree module
+such as ECM that is not rebuilt reads the wrong fields.
 
 ### Locally
 
@@ -583,6 +635,9 @@ NSS feeds, all GPL:
   <https://github.com/qosmio/qca-sdk-nss-fw>
 - CrazyBoyFeng — <https://github.com/CrazyBoyFeng/openwrt-pz-l8>, where the
   FM25LS01 flash patch comes from.
+- The SONiC fullcone NAT kernel patch is by Akhilesh Samineni (Broadcom), ported
+  to OpenWrt by
+  [openwrt-sonic-fullcone](https://github.com/mufeng05/openwrt-sonic-fullcone).
 
 The ath11k ring-shrinking approach follows
 <https://github.com/openwrt/openwrt/pull/21495>, which was not merged.

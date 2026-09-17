@@ -83,6 +83,38 @@ jobs:
         run: |
           pzl8-nss/scripts/setup.sh "$GITHUB_WORKSPACE/openwrt"
 
+      # SONiC fullcone NAT from openwrt-sonic-fullcone: its kernel, libnftnl,
+      # nftables and fw4 patches and the LuCI options, put in place by that
+      # project's own script.  CI-only for the same reason as Argon below.  There
+      # is nothing to select afterwards - it builds into nft_masq, xt_MASQUERADE
+      # and packages the image already has - and the image ships with it off.
+      - name: Add SONiC fullcone NAT
+        env:
+          FULLCONE_REPO: https://github.com/mufeng05/openwrt-sonic-fullcone
+        run: |
+          set -euo pipefail
+          git clone --depth 1 "$FULLCONE_REPO" fullcone
+
+          # Tracking master, so record what that actually was for this image.
+          FULLCONE_SHA=$(git -C fullcone rev-parse HEAD)
+          git -C fullcone --no-pager log -1 --format='fullcone %h  %ci  %s'
+          echo "FULLCONE_COMMIT=$(git -C fullcone rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+          # Needs the feeds installed, which setup.sh has done.
+          ( cd openwrt && bash "$GITHUB_WORKSPACE/fullcone/add_sonic_fullcone.sh" ) |
+              tee "$RUNNER_TEMP/fullcone.log"
+
+          # The script skips whatever it cannot place and still exits 0.  An
+          # image that says fullcone and has none is worse than a failed build.
+          grep -q '=== Done: [0-9]* applied, 0 skipped ===' "$RUNNER_TEMP/fullcone.log" ||
+              { echo "::error::add_sonic_fullcone.sh skipped something"; exit 1; }
+
+          # It clones master again by itself, seconds after the clone above.  If
+          # master moved in between, the commit recorded above is not the one
+          # that was applied.
+          [ "$(git ls-remote "$FULLCONE_REPO" HEAD | cut -f1)" = "$FULLCONE_SHA" ] ||
+              { echo "::error::fullcone master moved during this step, re-run it"; exit 1; }
+
       # Argon is not in OpenWrt's luci feed, so it is cloned here rather than by
       # setup.sh - a local build should not depend on a network fetch it did not
       # ask for, and the seed config stays free of a symbol that only resolves
@@ -155,6 +187,7 @@ jobs:
             echo "openwrt_commit=$(git rev-parse --short HEAD)"
             echo "project_commit=$(git -C "$GITHUB_WORKSPACE/pzl8-nss" rev-parse --short HEAD)"
             echo "argon_commit=${ARGON_COMMIT:-none}"
+            echo "fullcone_commit=${FULLCONE_COMMIT:-none}"
             echo "date=$(date -u '+%Y-%m-%d %H:%M UTC')"
           } | tee "$GITHUB_WORKSPACE/build-info.txt"
           # Seconds, because this is the tag: at minute resolution two runs
@@ -212,6 +245,10 @@ jobs:
             echo "| \`*-initramfs-uImage.itb\` | boots from RAM without touching flash, for recovery |"
             echo
             echo "Default LAN address is **192.168.10.1**."
+            echo
+            echo "Includes [SONiC fullcone NAT](https://github.com/mufeng05/openwrt-sonic-fullcone),"
+            echo "**off by default**: tick Fullcone NAT under Network > Firewall > General"
+            echo "Settings, then in the wan zone's settings."
             echo
             echo "The U-Boot page does **not** take a \`.ubi\`: it runs"
             echo "\`source \$imgaddr:script\` on the upload, so a raw image reports"
