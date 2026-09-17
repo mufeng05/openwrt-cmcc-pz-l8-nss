@@ -26,6 +26,26 @@ files:
 
 ### Why this exists
 
+There were three options for this board and each was missing something:
+
+- **The vendor-derived community builds (v1.6 / nwrt)** are fast, but both are
+  built on the closed qca-wifi driver, both sit on old kernels — `4.4.60` and
+  `5.4.250` — and both are **32-bit**: each reports `armv7l`, on an ARMv8 SoC.
+  Neither comes with a source tree you can build, so what you get is what there
+  is.
+- **The official OpenWrt image** has a current 64-bit kernel but no NSS.
+  Forwarding goes back through Linux, and the DSA path saturates both cores at
+  502 Mbit/s.
+- And **the official 25.12.x image cannot bring WiFi up at all**.
+  `Device/cmcc_pz-l8` in `target/linux/qualcommax/image/ipq50xx.mk` defines no
+  `DEVICE_PACKAGES` — the same file uses it twelve times for other devices — so
+  neither the ath11k firmware nor this board's board data is in the image and
+  the radios never probe. The snapshot branch (r31246) does carry them; this
+  project restores them with `feed/ipq-wifi-cmcc_pz-l8`.
+
+So this build aims at the intersection: **the official baseline, a current
+64-bit kernel, something you can build yourself, and NSS offload on top.**
+
 Stock OpenWrt forwards through Linux with DSA on this board. With NSS:
 
 | iperf3 `-P 4`, 15 s per direction | this build | nwrt (closed stack) | stock OpenWrt |
@@ -39,6 +59,10 @@ counted — and the figures are **increments**: `/proc/stat` sampled once a seco
 throughout, minus an idle baseline from the same session, because the sampler
 alone costs 2–5 %. The wired row lands on or below its own baseline: whatever
 949 Mbps costs is smaller than this method can resolve.
+
+The 5 GHz cell in the stock OpenWrt column cannot be the official image out of
+the box: with no firmware and no board data the radio does not probe, so that
+figure can only have been taken after putting the two missing packages back.
 
 > This table is the older batch, taken with iperf3, and its 5 GHz row predates
 > the NSS firmware moving from 12.2 to 12.5. The table below was measured later
