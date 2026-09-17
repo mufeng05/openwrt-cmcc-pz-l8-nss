@@ -1,0 +1,82 @@
+luci-bwc: keep the radio rate in 32 bits
+
+struct radio_entry stores the bitrate as a uint16_t of kbit/s, which tops out
+at 65.5 Mbit/s. iwinfo reports a modern link far above that, and the value
+wraps: a 160 MHz HE-MCS 9 link at 1921.5 Mbit/s is 1 921 500 kbit/s, which
+stores as
+
+	1 921 500 - 29 * 65 536 = 20 956
+
+and Realtime Graphs -> Wireless then shows Phy Rate as 20 Mbit/s. The width
+dates from 802.11g, where 54 Mbit/s fit.
+
+Widen it to uint32_t, along with the two function signatures that carry it,
+the local in run_daemon, and the byte-order conversions on the way in and out.
+Everything that reads or writes these files sizes itself from
+sizeof(struct radio_entry) - init_file, update_file, mmap_file and the read
+loop's stride - so the ring stays self-consistent at the new size. The ring
+lives under /var, which is tmpfs, so no file in the old layout survives a
+reboot.
+
+The load entry's uint16_t fields are left alone: load averages scaled by 100
+fit comfortably.
+
+--- a/src/luci-bwc.c
++++ b/src/luci-bwc.c
+@@ -85,7 +85,7 @@
+ 
+ struct radio_entry {
+ 	uint32_t time;
+-	uint16_t rate;
++	uint32_t rate;
+ 	uint8_t  rssi;
+ 	uint8_t  noise;
+ };
+@@ -271,7 +271,7 @@
+ }
+ 
+ static int iw_update(
+-	void *iw, const char *ifname, uint16_t *rate, uint8_t *rssi, uint8_t *noise
++	void *iw, const char *ifname, uint32_t *rate, uint8_t *rssi, uint8_t *noise
+ ) {
+ 	struct iwinfo_ops *(*probe)(const char *);
+ 	int val;
+@@ -340,7 +340,7 @@
+ }
+ 
+ static int update_radiostat(
+-	const char *ifname, uint16_t rate, uint8_t rssi, uint8_t noise
++	const char *ifname, uint32_t rate, uint8_t rssi, uint8_t noise
+ ) {
+ 	char path[1024];
+ 
+@@ -361,7 +361,7 @@
+ 	}
+ 
+ 	e.time  = htobe32(time(NULL));
+-	e.rate  = htobe16(rate);
++	e.rate  = htobe32(rate);
+ 	e.rssi  = rssi;
+ 	e.noise = noise;
+ 
+@@ -430,7 +430,7 @@
+ 	FILE *info;
+ 	uint64_t rxb, txb, rxp, txp;
+ 	uint32_t udp, tcp, other;
+-	uint16_t rate;
++	uint32_t rate;
+ 	uint8_t rssi, noise;
+ 	float lf1, lf5, lf15;
+ 	char line[1024];
+@@ -681,9 +681,9 @@
+ 		if (!e->time)
+ 			continue;
+ 
+-		printf("[ %" PRIu32 ", %" PRIu16 ", %" PRIu8 ", %" PRIu8 " ]%s\n",
++		printf("[ %" PRIu32 ", %" PRIu32 ", %" PRIu8 ", %" PRIu8 " ]%s\n",
+ 			be32toh(e->time),
+-			be16toh(e->rate), e->rssi, e->noise,
++			be32toh(e->rate), e->rssi, e->noise,
+ 			((i + sizeof(struct radio_entry)) < m.size) ? "," : "");
+ 	}
+ 

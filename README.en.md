@@ -419,12 +419,15 @@ build tree. The server merges **every** `.lmo` for the requested language in
   the NOP is still running leaves 5 GHz down entirely**, so do not. A watchdog
   to automate the recovery was written and dropped: a minute without 5 GHz costs
   more than sitting at 80 MHz.
-- **Phy Rate under Realtime Graphs → Wireless is wrong at modern rates.** Its
-  source, `luci-bwc`, keeps the rate in a `uint16_t` of kbit/s, so anything
-  above 65.5 Mbit/s wraps — 1921.5 Mbit/s reads as 20 Mbit/s — and noise below
-  -100 dBm always displays as -100. Both are upstream LuCI. The page also plots
-  the *associated client's* signal and rate, so with no client connected it is
-  all zeroes by design.
+- **Noise below -100 dBm always displays as -100 under Realtime Graphs →
+  Wireless.** That is upstream LuCI, left alone. Phy Rate on the same page is
+  wrong upstream too — its source, `luci-bwc`, keeps the rate in a `uint16_t` of
+  kbit/s, so anything above 65.5 Mbit/s wraps and 1921.5 Mbit/s reads as
+  20 Mbit/s — and this build widens it to 32 bits with the patch under
+  `openwrt/feeds/luci/modules/luci-mod-status/patches/`; measured, 2161.3 Mbit/s
+  reads correctly and matches iwinfo. The page also plots the *associated
+  client's* signal and rate, so with no client connected it is all zeroes by
+  design.
 - `qca-ssdk-shell` (`ssdk_sh`) does not build — `-fPIC` does not survive its
   recursive make into `src/sal/sd`.
 
@@ -538,6 +541,8 @@ po/              LuCI translation source (compiled into the .lmo under files/)
 openwrt/
   0001-*.patch   changes to files OpenWrt already ships
   tree/          files OpenWrt does not have, copied in place
+  feeds/         patches for packages from other feeds, copied once the feeds
+                 exist
 scripts/setup.sh applies all of the above to a clean tree
 scripts/mkrecovery.py  builds the U-Boot recovery FIT from a factory.ubi
 ```

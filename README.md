@@ -355,10 +355,12 @@ po2lmo po/pzl8.zh-cn.po files/usr/lib/lua/luci/i18n/pzl8.zh-cn.lmo
   能重新跑 CAC（实测 64 秒，期间只有 5 GHz 断）。**静默期内重启射频会让 5 GHz
   完全起不来**，别在那时候动它。自动恢复的看门狗写过，因为一分钟断线的代价比停在
   80 MHz 更大而弃用。
-- **「实时信息 → 无线」的 Phy Rate 在高速率下是错的。** 数据源 `luci-bwc` 把速率
-  存在一个 `uint16_t` 里（单位 kbit/s，上限 65.5 Mbit/s），1921.5 Mbit/s 会回绕成
-  20 Mbit/s；噪声低于 -100 dBm 也一律显示 -100。两个都是 LuCI 上游的问题。另外
-  这一页画的是**关联客户端**的信号和速率，没有客户端时全是 0 属于正常。
+- **「实时信息 → 无线」的噪声低于 -100 dBm 一律显示 -100。** 这是 LuCI 上游的问题，
+  没改。同一页的 Phy Rate 在上游也是错的——数据源 `luci-bwc` 把速率存在一个
+  `uint16_t` 里（单位 kbit/s，上限 65.5 Mbit/s），1921.5 Mbit/s 会回绕成 20 Mbit/s
+  ——本构建用 `openwrt/feeds/luci/modules/luci-mod-status/patches/` 下的补丁把它
+  改成了 32 位，实测 2161.3 Mbit/s 显示正确，与 iwinfo 一致。另外这一页画的是
+  **关联客户端**的信号和速率，没有客户端时全是 0 属于正常。
 - `qca-ssdk-shell`（`ssdk_sh`）编译不过——`-fPIC` 穿不过它的递归 make 传不到
   `src/sal/sd`。
 
@@ -461,6 +463,7 @@ po/              LuCI 翻译源（编译成 files/ 下的 .lmo）
 openwrt/
   0001-*.patch   对 OpenWrt 已有文件的修改
   tree/          OpenWrt 没有的文件，原样拷贝
+  feeds/         给其他 feed 里的包打的补丁，feeds 装好之后再拷贝
 scripts/setup.sh 把以上全部应用到一棵干净的源码树
 scripts/mkrecovery.py  从 factory.ubi 生成 U-Boot 恢复 FIT
 ```
