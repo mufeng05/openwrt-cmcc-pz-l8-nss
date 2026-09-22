@@ -3,11 +3,13 @@
 #
 # Usage:  scripts/setup.sh /path/to/openwrt
 #
-# Everything this project changes falls into four buckets:
+# Everything this project changes falls into five buckets:
 #   1. edits to files OpenWrt already ships   -> openwrt/0001-cmcc-pz-l8-nss.patch
 #   2. files OpenWrt does not have            -> openwrt/tree/, copied in place
 #   3. our own packages                       -> feed/, wired in as a feed
-#   4. rootfs overlay + config seed           -> files/, config/
+#   4. patches to packages in other feeds     -> openwrt/feeds/, copied once the
+#                                                feeds exist
+#   5. rootfs overlay + config seed           -> files/, config/
 #
 # Idempotent: re-running on an already-prepared tree is a no-op for 1 and safe
 # for the rest, including .config - an existing one is kept, so a menuconfig
@@ -60,7 +62,18 @@ grep '^src-link pzl8 ' "$FEEDS"
 ( cd "$OW" && ./scripts/feeds update -a >/dev/null && ./scripts/feeds install -a >/dev/null )
 echo "feeds updated and installed"
 
-# ---------------------------------------------------------------- 5. rootfs overlay
+# ---------------------------------------------------------------- 5. feed package patches
+# These cannot live in openwrt/tree/: that is copied before the feeds exist, and
+# scripts/feeds deletes a feed directory that is not yet a checkout before it
+# clones into it.  After an update they are simply copied again.
+say "Adding patches to packages from other feeds"
+( cd "$HERE/openwrt/feeds" && find . -type f -print0 |
+  while IFS= read -r -d '' f; do
+      install -Dm644 "$f" "$OW/feeds/${f#./}"
+      echo "  feeds/${f#./}"
+  done )
+
+# ---------------------------------------------------------------- 6. rootfs overlay
 say "Installing the rootfs overlay"
 mkdir -p "$OW/files"
 cp -a "$HERE/files/." "$OW/files/"
@@ -70,7 +83,7 @@ chmod +x "$OW"/files/etc/init.d/* 2>/dev/null || true
 # rpcd runs these as programs; a 644 plugin never registers its ubus object
 chmod +x "$OW"/files/usr/libexec/rpcd/* 2>/dev/null || true
 
-# ---------------------------------------------------------------- 6. config
+# ---------------------------------------------------------------- 7. config
 # An existing .config is someone's menuconfig session and is left alone.
 # RESEED=1 throws it away and starts from the seed again.
 if [ -f "$OW/.config" ] && [ "${RESEED:-0}" != 1 ]; then
