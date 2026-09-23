@@ -48,14 +48,21 @@ So this build aims at the intersection: **the official baseline, a current
 
 Stock OpenWrt forwards through Linux with DSA on this board. With NSS:
 
-| iperf3 `-P 4`, 15 s per direction | this build | nwrt (closed stack) | stock OpenWrt |
-|---|---|---|---|
-| **wired ↔ WAN** | **949 up / 949 down Mbps, +0 % CPU** | 924 / 926 @ 4 % | **502 @ 100 % CPU** |
-| **5 GHz ↔ WAN** | 510 up / 438 down Mbps, +0.3 % CPU | ~624 @ 25–35 % | 308 |
-| **2.4 GHz ↔ WAN** | 58 up / 61 down Mbps, +0.3 % CPU | — | — |
+| iperf3 `-P 4`, 15 s per direction | this build | OEM 501.8 | nwrt (closed stack) | stock OpenWrt |
+|---|---|---|---|---|
+| **wired ↔ WAN** | **949 up / 949 down Mbps, +0 % CPU** | 947 / 947, 9 % / 6 %※ | 924 / 926 @ 4 % | **502 @ 100 % CPU** |
+| **5 GHz ↔ WAN** | 510 up / 438 down Mbps, +0.3 % CPU (80 MHz) | 612 / 899 (160 MHz), 15–16 %※ | ~624 @ 25–35 % | 308 |
+| **2.4 GHz ↔ WAN** | 58 up / 61 down Mbps, +0.3 % CPU | 114 / 65, 8 %※ | — | — |
+
+> ※ The **OEM column** was measured 2026-09-23 with the same iperf3 `-P 4` (this
+> board's genuine factory firmware; see "The genuine OEM firmware as a baseline"
+> below). Its CPU is **raw busy%** from `/proc/stat` mid-transfer, not delta over
+> idle like this build's column, so read it only as "both cores far from
+> saturated". The OEM 5 GHz here is 160 MHz vs this build's 80 MHz — the
+> same-width comparison is the three-way table below.
 
 CPU means the two Cortex-A53 host cores — the NSS UBI32 core is separate and not
-counted — and the figures are **increments**: `/proc/stat` sampled once a second
+counted — and this build's figures are **increments**: `/proc/stat` sampled once a second
 throughout, minus an idle baseline from the same session, because the sampler
 alone costs 2–5 %. The wired row lands on or below its own baseline: whatever
 949 Mbps costs is smaller than this method can resolve.
@@ -75,17 +82,25 @@ properly: same board, same client (one Intel AX201), same server, same
 afternoon, same method — four parallel HTTP streams of 20 s, with a host `/32`
 route forcing the traffic through the router.
 
-| four parallel HTTP streams, 20 s | v1.6 | nwrt | this build |
-|---|---|---|---|
-| wired LAN → WAN | 912.1 | 901.8 | **912.6** |
-| **5 GHz at 160 MHz** | **730** | **722** | **697** |
-| 5 GHz at 80 MHz | — | — | 462 |
-| 2.4 GHz at 20 MHz | 98.8 | **119.4** | 75.0 |
-| 2.4 GHz at 40 MHz (`noscan`) | — | — | **112.5** |
-| host CPU during 5 GHz | not measurable, see below | 16.1 % at 537 | **2.9 % at 441** |
+| four parallel HTTP streams, 20 s | OEM 501.8 | v1.6 | nwrt | this build |
+|---|---|---|---|---|
+| wired LAN → WAN | 902.9 | 912.1 | 901.8 | **912.6** |
+| **5 GHz at 160 MHz** | 711 | **730** | **722** | **697** |
+| 5 GHz at 80 MHz | — | — | — | 462 |
+| 2.4 GHz at 20 MHz | ~92 (59–124)※ | 98.8 | **119.4** | 75.0 |
+| 2.4 GHz at 40 MHz (`noscan`) | — | — | — | **112.5** |
+| host CPU during 5 GHz | 17 % at 711 | not measurable, see below | 16.1 % at 537 | **2.9 % at 441** |
 
-Neither reference is an unmodified OEM image: **v1.6** is a community build on
-the vendor's 4.4 SDK, **nwrt** one on 5.4, both with the closed qca-wifi driver.
+The **OEM column is now this board's unmodified factory firmware** (501.8,
+measured 2026-09-23 by the same method; see "The genuine OEM firmware as a
+baseline" below). The other two references are still not factory: **v1.6** is a
+community build on the vendor's 4.4 SDK, **nwrt** one on 5.4, both with the closed
+qca-wifi driver.
+
+> ※ The OEM 2.4 GHz swings hard: six rounds 51.8 / 59.1 / 69.7 / 113.9 / 116 / 124,
+> flipping between a ~59 and a ~120 state with neighbour contention (this unit is
+> in a live environment with 20+ nearby networks). The good state ~116 matches the
+> iperf3 table's 114.
 
 **Wired is a three-way tie** at the client NIC's line rate, so it measures the
 client rather than the router.
@@ -115,23 +130,13 @@ a link that drops one frame in seven. Full working in
 
 ### The genuine OEM firmware, as a baseline
 
-Measured 2026-09-23. The two references above (v1.6, nwrt) are community builds,
-not this board's factory image; this row is the **genuine factory firmware** —
-OpenWrt Chaos Calmer 501.8 / SPF11.4_CSU2, kernel 4.4.60, **32-bit**. The OEM
-ships with SSH off; to take the baseline, its U-Boot web-recovery page RAM-booted
-our initramfs, which mounted the OEM overlay and enabled SSH temporarily (no boot
-partition was flashed). Full capture and a whole-NAND backup are in
-`oem-baseline/` (contains real credentials, not committed).
-
-| iperf3 `-P 4` | OEM 501.8 | this build |
-|---|---|---|
-| wired down / up | 947 / 947 Mbps, host CPU 9 % / 6 % | 949 / 949 |
-| 5 GHz down / up (160 MHz) | 612 / 899 Mbps, CPU 15–16 % | — |
-| 2.4 GHz down / up (HT20) | 114 / 65 Mbps, CPU 8 % | — |
-
-(The OEM CPU figures are raw busy% from `/proc/stat` mid-transfer, not delta over
-an idle baseline like this build's column above, so read them only as "both cores
-far from saturated"; wired is a tie at the client's gigabit line rate.)
+Measured 2026-09-23. This board's **genuine factory firmware** — OpenWrt Chaos
+Calmer 501.8 / SPF11.4_CSU2, kernel 4.4.60, **32-bit**. The OEM ships with SSH
+off; to take the baseline, its U-Boot web-recovery page RAM-booted our initramfs,
+which mounted the OEM overlay and enabled SSH temporarily (no boot partition was
+flashed). **Its throughput is folded into the "OEM" column of the two tables
+above** (iperf3 and four-parallel HTTP, one each); the full capture and a
+whole-NAND backup are in `oem-baseline/` (contains real credentials, not committed).
 
 A few things only the genuine OEM could settle:
 
