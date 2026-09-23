@@ -99,6 +99,31 @@ curl -F "firmware=@recovery.fit" http://192.168.10.10/
 
 Then power-cycle without touching the button.
 
+### The `-116m` variant: converting a genuine factory (A/B) board
+
+A genuine factory PZ-L8 is **A/B**: its MIBIB has `rootfs` (58 MiB) and
+`rootfs_1` (58 MiB), not the single 110 MiB `rootfs` this project targets. The
+plain `-uboot-recovery.fit` still boots there — our UBI is ~16 MiB and fits in
+58 MiB — but `rootfs_1` is left as dead space and the layout stays A/B.
+
+`*-uboot-recovery-116m.fit` (from `mkrecovery.py <ubi> <out> <mibib.bin>` with
+`scripts/pz-l8-116m-mibib.bin`) writes the 110 MiB partition table first, then
+the rootfs, converting an A/B board to the single-110M layout. That MIBIB's
+boot-chain entries — SBL, both U-Boot copies, BOOTCONFIG, QSEE, DEVCFG, CDT, ART,
+TRAINING — are **byte-identical** to the factory one (verified against a genuine
+unit's `mtd01`), so nothing the SBL uses to find U-Boot moves; only the rootfs
+tail becomes one 110 MiB partition. The script reads the MIBIB back and
+byte-compares it before touching rootfs, and aborts with rootfs intact on a
+mismatch.
+
+**Writing MIBIB is the one step that can hard-brick.** If power is lost during
+the ~1 s MIBIB write, the SBL finds no partition table and only USB download mode
+or JTAG brings it back. Use the plain `.fit` unless you specifically want the
+A/B → 110 MiB conversion. If you do, don't pull power during it; a serial console
+(the nwrt `tftpboot` + `flash 0:MIBIB` route) or writing MIBIB from a RAM-booted
+Linux with `nandwrite` + read-back are lower-risk only because they are
+observable step by step.
+
 ### What the bootloader checks
 
 Read from the U-Boot image in the mtd backup, not guessed:
@@ -132,7 +157,12 @@ From the board's own MIBIB (`mtd01` in `nwrt-baseline/mtd-backup/`), erase block
 rootfs        0x900000   length 0x6e00000 (110 MiB)
 ```
 
-There is **no `rootfs_1`**. The U-Boot env is
+This is the **converted / test-board layout** (single 110 MiB `rootfs`, no
+`rootfs_1`), which is what the plain recovery FIT and `platform.sh` assume. A
+**genuine factory board is A/B** instead — `rootfs` 0x900000 (58 MiB) and
+`rootfs_1` 0x4300000 (58 MiB), confirmed on a real unit — and its BOOTCONFIG can
+select the `_1` copy of the boot chain. Use `*-uboot-recovery-116m.fit` (above)
+to bring such a board to this single-110M layout. The test board's U-Boot env is
 `bootcmd=bootipq, bootdelay=1, new_rootfs0=1, sysfail=0`.
 
 The generated script erases the whole rootfs partition before writing, which is

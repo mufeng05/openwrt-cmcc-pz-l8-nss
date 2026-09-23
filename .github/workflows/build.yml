@@ -209,25 +209,38 @@ jobs:
           set -eu
           UBI=$(ls "$FIRMWARE"/*-squashfs-factory.ubi)
           BASE=$(basename "$UBI" -squashfs-factory.ubi)
-          OUT="$FIRMWARE/$BASE-uboot-recovery.fit"
+          MIBIB="$GITHUB_WORKSPACE/pzl8-nss/scripts/pz-l8-116m-mibib.bin"
 
-          # OW first so a build tree's own mkimage wins; the apt ones are the
-          # fallback and work equally well.
-          OW="$GITHUB_WORKSPACE/openwrt" \
-            python3 "$GITHUB_WORKSPACE/pzl8-nss/scripts/mkrecovery.py" "$UBI" "$OUT"
+          # Two variants, see docs/RECOVERY.md:
+          #   -uboot-recovery.fit       writes rootfs only. Correct on the single
+          #                             110M layout (this project's, and nwrt's).
+          #   -uboot-recovery-116m.fit  also writes the 110M partition table first,
+          #                             converting a genuine A/B factory board. The
+          #                             MIBIB is read back and byte-compared before
+          #                             rootfs is touched; still, writing MIBIB can
+          #                             hard-brick on power loss, which is why it is
+          #                             a separate, clearly-named file rather than
+          #                             the default.
+          build_fit() {   # <out.fit> [mibib.bin]
+            # OW first so a build tree's own mkimage wins; the apt ones are the
+            # fallback and work equally well.
+            OW="$GITHUB_WORKSPACE/openwrt" \
+              python3 "$GITHUB_WORKSPACE/pzl8-nss/scripts/mkrecovery.py" "$UBI" "$1" ${2:+"$2"}
+            # The bootloader refuses anything over 32 MiB, so a FIT that grew past
+            # it would be published and then rejected at the one moment it is
+            # needed.  Fail the build instead.
+            SIZE=$(stat -c %s "$1")
+            echo "$(basename "$1"): $SIZE bytes"
+            if [ "$SIZE" -gt 33554432 ]; then
+              echo "::error::$(basename "$1") is $SIZE bytes; U-Boot refuses over 0x2000000"
+              exit 1
+            fi
+            ( cd "$FIRMWARE" && sha256sum -b "$(basename "$1")" >> sha256sums )
+          }
 
-          # The bootloader refuses anything over 32 MiB, so a FIT that grew past
-          # it would be published and then rejected at the one moment it is
-          # needed.  Fail the build instead.
-          SIZE=$(stat -c %s "$OUT")
-          echo "recovery FIT: $SIZE bytes"
-          if [ "$SIZE" -gt 33554432 ]; then
-            echo "::error::recovery FIT is $SIZE bytes; U-Boot refuses over 0x2000000"
-            exit 1
-          fi
-
-          ( cd "$FIRMWARE" && sha256sum -b "$(basename "$OUT")" >> sha256sums )
-          ls -lh "$OUT"
+          build_fit "$FIRMWARE/$BASE-uboot-recovery.fit"
+          build_fit "$FIRMWARE/$BASE-uboot-recovery-116m.fit" "$MIBIB"
+          ls -lh "$FIRMWARE"/*-uboot-recovery*.fit
 
       - name: Write the release notes
         if: success()
@@ -241,6 +254,7 @@ jobs:
             echo "|---|---|"
             echo "| \`*-squashfs-sysupgrade.bin\` | upgrading a router that already runs OpenWrt - \`sysupgrade -n\` |"
             echo "| \`*-uboot-recovery.fit\` | **the U-Boot web recovery at 192.168.10.10** - the only file that page accepts |"
+            echo "| \`*-uboot-recovery-116m.fit\` | same page, but **also writes the 110M partition table** to convert a genuine A/B factory board (see [docs/RECOVERY.md](docs/RECOVERY.md); can brick on power loss mid-write) |"
             echo "| \`*-squashfs-factory.ubi\` | a forced \`sysupgrade -n -F\` from a vendor image, which writes it with \`ubiformat\` |"
             echo "| \`*-initramfs-uImage.itb\` | boots from RAM without touching flash, for recovery |"
             echo
@@ -261,7 +275,7 @@ jobs:
             echo
             echo "sha256:"
             echo '```'
-            grep -E 'sysupgrade\.bin|factory\.ubi|initramfs-uImage\.itb|uboot-recovery\.fit' $IPQ/sha256sums || cat $IPQ/sha256sums
+            grep -E 'sysupgrade\.bin|factory\.ubi|initramfs-uImage\.itb|uboot-recovery.*\.fit' $IPQ/sha256sums || cat $IPQ/sha256sums
             echo '```'
           } > release-notes.md
           cat release-notes.md
@@ -298,7 +312,7 @@ jobs:
           files: |
             ${{ env.FIRMWARE }}/*-sysupgrade.bin
             ${{ env.FIRMWARE }}/*-factory.ubi
-            ${{ env.FIRMWARE }}/*-uboot-recovery.fit
+            ${{ env.FIRMWARE }}/*-uboot-recovery*.fit
             ${{ env.FIRMWARE }}/*-initramfs-uImage.itb
             ${{ env.FIRMWARE }}/*.manifest
             ${{ env.FIRMWARE }}/sha256sums
