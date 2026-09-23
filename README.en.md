@@ -113,6 +113,45 @@ MCS 9–11 on the much quieter 5 GHz radio, so it is not broken — it is answer
 a link that drops one frame in seven. Full working in
 [docs/WIFILI.md](docs/WIFILI.md).
 
+### The genuine OEM firmware, as a baseline
+
+Measured 2026-09-23. The two references above (v1.6, nwrt) are community builds,
+not this board's factory image; this row is the **genuine factory firmware** —
+OpenWrt Chaos Calmer 501.8 / SPF11.4_CSU2, kernel 4.4.60, **32-bit**. The OEM
+ships with SSH off; to take the baseline, its U-Boot web-recovery page RAM-booted
+our initramfs, which mounted the OEM overlay and enabled SSH temporarily (no boot
+partition was flashed). Full capture and a whole-NAND backup are in
+`oem-baseline/` (contains real credentials, not committed).
+
+| iperf3 `-P 4` | OEM 501.8 | this build |
+|---|---|---|
+| wired down / up | 947 / 947 Mbps, host CPU 9 % / 6 % | 949 / 949 |
+| 5 GHz down / up (160 MHz) | 612 / 899 Mbps, CPU 15–16 % | — |
+| 2.4 GHz down / up (HT20) | 114 / 65 Mbps, CPU 8 % | — |
+
+(The OEM CPU figures are raw busy% from `/proc/stat` mid-transfer, not delta over
+an idle baseline like this build's column above, so read them only as "both cores
+far from saturated"; wired is a tie at the client's gigabit line rate.)
+
+A few things only the genuine OEM could settle:
+
+- **The OEM's NSS firmware is `NSS.MP.11.4-10-R`** (md5 `f4f67348…`), not 12.5.
+  This closes the earlier open question of which firmware the factory used: nwrt
+  (third-party) runs 12.5, v1.6 (community) runs 11.4-3-R, and the **factory image
+  runs 11.4-10-R** — three distinct blobs. The case for 12.5 here (self-measured
+  +65 %) is unaffected.
+- **The OEM loads both ECM and SFE (`shortcut_fe`), but SFE does nothing**: ECM is
+  built with the NSS front-end only (`ecm_nss_ipv4`, no `ecm_sfe`); under load all
+  six connections sit in `ecm_nss_ipv4/accelerated_count` while SFE's connection
+  table is empty — flows accelerated in NSS never traverse the Linux forward path
+  where SFE hooks. The OEM's 947 / 612 / 899 are all NSS. This build likewise uses
+  ECM→NSS only (the platform lacks the three kernel hooks SFE needs).
+- **Its memory carve-out matches nwrt, not this build**: the OEM hands the kernel
+  ~174 MB and reserves 11 MB (`Memory: 167140K/178176K … 11036K reserved`); this
+  build hands it the full 256 MB and reserves 86 MB.
+- **The NSS config `n2h pool 4096 + high_water 16336`** is confirmed on the genuine
+  OEM (previously seen only on nwrt).
+
 ---
 
 ## Flashing
